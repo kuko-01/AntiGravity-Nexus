@@ -1101,6 +1101,24 @@ ipcMain.handle('organizer:read-content', async (_event, filePath: string) => {
     }
 });
 
+import { githubHandlerService } from './githubHandler';
+
+// ... (existing imports)
+
+// GitHub IPC Handlers
+ipcMain.handle('github:initialize', async (_event, token: string) => {
+    await githubHandlerService.initialize(token);
+    return { success: true };
+});
+
+ipcMain.handle('github:init-repo', async (_event, localPath: string, repoName: string) => {
+    return await githubHandlerService.initRepo(localPath, repoName);
+});
+
+ipcMain.handle('github:get-status', async (_event, localPath: string) => {
+    return await githubHandlerService.getStatus(localPath);
+});
+
 app.whenReady().then(() => {
     createWindow();
 

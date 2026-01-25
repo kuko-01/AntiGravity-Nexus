@@ -222,4 +222,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     organizerReadContent: async (path: string) => {
         return await ipcRenderer.invoke('organizer:read-content', path);
     },
+
+    // ============================================
+    // GitHub Manager APIs
+    // ============================================
+    githubInitialize: async (token: string) => {
+        return await ipcRenderer.invoke('github:initialize', token);
+    },
+    githubInitRepo: async (path: string, name: string) => {
+        return await ipcRenderer.invoke('github:init-repo', path, name);
+    },
+    githubGetStatus: async (path: string) => {
+        return await ipcRenderer.invoke('github:get-status', path);
+    },
 });

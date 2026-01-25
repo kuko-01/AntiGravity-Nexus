@@ -1,7 +1,7 @@
 {
-  "name": "audio-capture-transcription",
+  "name": "antigravity-nexus",
   "version": "1.0.0",
-  "description": "音声キャプチャ・テキスト化アプリケーション",
+  "description": "AntiGravity Nexus - 統合ワークスペースアプリケーション",
   "main": "dist/main/main.js",
   "scripts": {
     "dev": "concurrently \"npm run dev:renderer\" \"npm run dev:electron\"",
@@ -12,8 +12,8 @@
     "dist": "npm run build && electron-builder"
   },
   "build": {
-    "appId": "com.gemini.audiocapture",
-    "productName": "GeminiAudioCapture",
+    "appId": "com.gemini.antigravity-nexus",
+    "productName": "AntiGravity Nexus",
     "win": {
       "target": [
         "nsis",
@@ -40,6 +40,7 @@
     "@discordjs/opus": "^0.10.0",
     "@google-cloud/speech": "^7.2.1",
     "@google/generative-ai": "^0.21.0",
+    "@octokit/rest": "^18.12.0",
     "@types/adm-zip": "^0.5.7",
     "adm-zip": "^0.5.16",
     "dotenv": "^16.4.5",
@@ -50,6 +51,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^7.13.0",
+    "simple-git": "^3.30.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {

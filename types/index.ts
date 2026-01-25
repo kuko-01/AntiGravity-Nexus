@@ -136,6 +136,10 @@ export interface ElectronAPI {
     organizerExecuteCopy: (plan: CopyPlanItem[], outputRoot: string) => Promise<CopyExecutionResult>;
     organizerOpenFolder: (path: string) => Promise<{ success: boolean; error?: string }>;
     organizerReadContent: (path: string) => Promise<{ success: boolean; text?: string; error?: string }>;
+    // GitHub Manager
+    githubInitialize: (token: string) => Promise<{ success: boolean; error?: string }>;
+    githubInitRepo: (path: string, name: string) => Promise<{ success: boolean; url?: string; error?: string }>;
+    githubGetStatus: (path: string) => Promise<{ isRepo: boolean; status?: any; error?: string }>;
 }
 
 // Whisper ステータス

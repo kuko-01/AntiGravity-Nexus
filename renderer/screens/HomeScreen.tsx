@@ -27,7 +27,7 @@ const HomeScreen: React.FC = () => {
                 WebkitTextFillColor: 'transparent',
                 fontWeight: 'bold'
             }}>
-                Gemini Tools Hub
+                AntiGravity Nexus
             </h1>
 
             <div style={{
@@ -112,6 +112,45 @@ const HomeScreen: React.FC = () => {
                     </h2>
                     <p style={{ color: 'var(--color-text-secondary)' }}>
                         AIが散らかったフォルダを解析し、整理された構造を提案します。
+                    </p>
+                </div>
+
+                {/* GitHub Manager Card */}
+                <div
+                    onClick={() => handleNavigate('/github')}
+                    style={{
+                        background: 'var(--color-surface)',
+                        borderRadius: '16px',
+                        padding: '32px',
+                        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
+                        cursor: 'pointer',
+                        transition: 'transform 0.2s, box-shadow 0.2s',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        textAlign: 'center',
+                        border: '1px solid var(--color-border)'
+                    }}
+                    onMouseEnter={e => {
+                        e.currentTarget.style.transform = 'translateY(-5px)';
+                        e.currentTarget.style.boxShadow = '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)';
+                    }}
+                    onMouseLeave={e => {
+                        e.currentTarget.style.transform = 'translateY(0)';
+                        e.currentTarget.style.boxShadow = '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)';
+                    }}
+                >
+                    <div style={{
+                        fontSize: '4rem',
+                        marginBottom: '16px'
+                    }}>
+                        🐙
+                    </div>
+                    <h2 style={{ fontSize: '1.5rem', marginBottom: '8px', color: 'var(--color-text)' }}>
+                        GitHub Manager
+                    </h2>
+                    <p style={{ color: 'var(--color-text-secondary)' }}>
+                        Visual StudioやVBAプロジェクトを安全にPrivateリポジトリで管理します。
                     </p>
                 </div>
             </div>

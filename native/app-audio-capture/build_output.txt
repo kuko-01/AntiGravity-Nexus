@@ -1,0 +1,11 @@
+gyp info it worked if it ends with ok
+gyp info using node-gyp@10.3.1
+gyp info using node@24.12.0 | win32 | x64
+gyp ERR! clean error 
+gyp ERR! stack Error: EPERM: operation not permitted, unlink 'C:\Users\skyfo\.gemini\test\native\app-audio-capture\build\Release\app_audio_capture.node'
+gyp ERR! System Windows_NT 10.0.26100
+gyp ERR! command "C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\skyfo\\.gemini\\test\\native\\app-audio-capture\\node_modules\\node-gyp\\bin\\node-gyp.js" "rebuild" "--msvs_version=2022"
+gyp ERR! cwd C:\Users\skyfo\.gemini\test\native\app-audio-capture
+gyp ERR! node -v v24.12.0
+gyp ERR! node-gyp -v v10.3.1
+gyp ERR! not ok 

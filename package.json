@@ -1,0 +1,66 @@
+{
+  "name": "audio-capture-transcription",
+  "version": "1.0.0",
+  "description": "音声キャプチャ・テキスト化アプリケーション",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:renderer\" \"npm run dev:electron\"",
+    "dev:renderer": "vite",
+    "dev:electron": "wait-on http://localhost:5173 && tsc -p tsconfig.main.json && electron .",
+    "build": "tsc -p tsconfig.main.json && vite build",
+    "start": "electron .",
+    "dist": "npm run build && electron-builder"
+  },
+  "build": {
+    "appId": "com.gemini.audiocapture",
+    "productName": "GeminiAudioCapture",
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      ".env",
+      "gcp-credentials.json",
+      {
+        "from": "native/app-audio-capture/build/Release/app_audio_capture.node",
+        "to": "native/app-audio-capture/build/Release/app_audio_capture.node"
+      }
+    ]
+  },
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@google-cloud/speech": "^7.2.1",
+    "@google/generative-ai": "^0.21.0",
+    "@types/adm-zip": "^0.5.7",
+    "adm-zip": "^0.5.16",
+    "dotenv": "^16.4.5",
+    "mammoth": "^1.11.0",
+    "nodejs-whisper": "^0.2.9",
+    "officeparser": "^6.0.4",
+    "pdf-parse": "^2.4.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.13.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "concurrently": "^9.1.0",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3",
+    "wait-on": "^8.0.1"
+  }
+}

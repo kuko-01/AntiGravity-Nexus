@@ -1,0 +1,22 @@
+{
+    "name": "app-audio-capture",
+    "version": "1.0.0",
+    "description": "Per-app audio capture using Windows WASAPI",
+    "main": "build/Release/app_audio_capture.node",
+    "types": "index.d.ts",
+    "scripts": {
+        "install": "node-gyp rebuild",
+        "build": "node-gyp rebuild",
+        "clean": "node-gyp clean"
+    },
+    "dependencies": {
+        "node-addon-api": "^7.0.0",
+        "node-gyp": "^10.0.0"
+    },
+    "os": [
+        "win32"
+    ],
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}

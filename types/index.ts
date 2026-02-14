@@ -1,9 +1,12 @@
+import { TtsError, SliceOptions, TranscribeOptions } from './tts';
+
 // 画面/ウィンドウソース情報
 export interface DesktopSource {
     id: string;
     name: string;
     thumbnailDataUrl?: string;
 }
+
 
 // オーディオデバイス情報
 export interface AudioDevice {
@@ -77,6 +80,12 @@ export const IPC_CHANNELS = {
     GET_AUDIO_PROCESSES: 'get-audio-processes',
     START_PROCESS_CAPTURE: 'start-process-capture',
     STOP_PROCESS_CAPTURE: 'stop-process-capture',
+    // TTS Training
+    TTS_SLICE_AUDIO: 'tts-slice-audio',
+    TTS_TRANSCRIBE_AUDIO: 'tts-transcribe-audio',
+    TTS_SAVE_TRANSCRIPTION: 'tts-save-transcription',
+    TTS_INIT_TRAINING_CONFIG: 'tts-init-training-config',
+    TTS_GENERATE_BERT: 'tts-generate-bert',
 } as const;
 
 // ログ保存用の型（DateをstringにシリアライズするためLogEntryとは別）
@@ -97,6 +106,7 @@ export interface ElectronAPI {
     // Per-App Audio Capture
     getAudioProcesses: () => Promise<{ success: boolean; processes?: AudioProcess[]; error?: string }>;
     startProcessCapture: (pid: number) => Promise<{ success: boolean; recordingPath?: string; error?: string }>;
+    startSystemCapture: () => Promise<{ success: boolean; recordingPath?: string; error?: string }>;
     stopProcessCapture: () => Promise<{ success: boolean; finalRecordingPath?: string; error?: string }>;
     onProcessAudioData: (callback: (data: ProcessAudioData) => void) => void;
     offProcessAudioData: () => void;
@@ -129,17 +139,85 @@ export interface ElectronAPI {
     updateLogsJson: (logs: any[]) => Promise<{ success: boolean; error?: string }>;
     openFolder: (path: string) => Promise<{ success: boolean; error?: string }>;
     getCurrentSessionPath: () => Promise<string | null>;
-    readAudioFile: (path: string) => Promise<{ success: boolean; buffer?: number[]; sampleRate?: number; channels?: number; bitsPerSample?: number; error?: string }>;
+    readAudioFile: (path: string) => Promise<{ success: boolean; base64?: string; error?: string }>;
     selectSaveFolder: () => Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }>;
     // Folder Organizer
     organizerAnalyzeFolder: (path: string) => Promise<{ success: boolean; files?: OrganizerFile[]; stats?: OrganizerStats; error?: string }>;
     organizerExecuteCopy: (plan: CopyPlanItem[], outputRoot: string) => Promise<CopyExecutionResult>;
     organizerOpenFolder: (path: string) => Promise<{ success: boolean; error?: string }>;
     organizerReadContent: (path: string) => Promise<{ success: boolean; text?: string; error?: string }>;
-    // GitHub Manager
-    githubInitialize: (token: string) => Promise<{ success: boolean; error?: string }>;
-    githubInitRepo: (path: string, name: string) => Promise<{ success: boolean; url?: string; error?: string }>;
-    githubGetStatus: (path: string) => Promise<{ isRepo: boolean; status?: any; error?: string }>;
+    // Generic invoke for vNext features
+    invoke: (channel: string, ...args: any[]) => Promise<any>;
+
+    // Nano Studio
+    selectFile: (extensions: string[], multi?: boolean) => Promise<{ success: boolean; path?: string; paths?: string[]; error?: string }>;
+    readImage: (path: string) => Promise<{ success: boolean; base64?: string; error?: string }>;
+    nanoLoadPresets: () => Promise<{ success: boolean; presets?: NanoPreset[]; error?: string }>;
+    nanoLoadPreset: (name: string) => Promise<{ success: boolean; preset?: NanoPreset; error?: string }>;
+    nanoSavePreset: (preset: NanoPreset) => Promise<{ success: boolean; error?: string }>;
+    nanoGenerate: (params: NanoGenerateParams) => Promise<{ success: boolean; imagePath?: string; imageBase64?: string; error?: string }>;
+    upscaleImage: (path: string, scale: number) => Promise<{ success: boolean; path?: string; error?: string }>;
+    smoothImage: (path: string) => Promise<{ success: boolean; path?: string; error?: string }>;
+
+    // Live2D
+    cubismSendCommand: (type: string, name: string, payload?: any) => Promise<{ success: boolean; msgId?: string; error?: string }>;
+    cubismGetStatus: () => Promise<any>;
+    cubismOnEvent: (callback: (event: any) => void) => () => void; // Returns unsubscribe function
+
+    // TTS APIs
+    ttsGetStatus: () => Promise<any>;
+    ttsInstall: (options?: any) => Promise<any>;
+    ttsRepair: () => Promise<any>;
+    ttsUninstall: () => Promise<any>;
+    ttsStartServer: (options?: { forceCpu?: boolean }) => Promise<any>;
+    ttsStopServer: () => Promise<any>;
+    ttsGetGpuInfo: () => Promise<any>;
+
+    ttsInstallTrainingDeps: () => Promise<void>;
+    ttsSliceAudio: (datasetName: string, inputDir: string, options?: SliceOptions) => Promise<{ success: boolean; error?: TtsError }>;
+    ttsTranscribeAudio: (datasetName: string, options?: TranscribeOptions) => Promise<{ success: boolean; error?: TtsError }>;
+    ttsSaveTranscription: (datasetName: string, content: string) => Promise<{ success: boolean; error?: TtsError }>;
+    ttsInitializeTrainingConfig: (datasetName: string) => Promise<{ success: boolean; error?: TtsError }>;
+    ttsGenerateBert: (datasetName: string) => Promise<{ success: boolean; error?: TtsError }>;
+    ttsTrainModel: (datasetName: string, options?: { speedup?: boolean; noProgressBar?: boolean; epochs?: number }) => Promise<{ success: boolean; error?: { code: string; message: string } }>;
+    ttsCleanAudio: (datasetName: string) => Promise<{ success: boolean; message?: string; error?: { code: string; message: string } }>;
+    ttsFilterAudio: (datasetName: string) => Promise<{ success: boolean; message?: string; error?: { code: string; message: string } }>;
+    utilSelectDirectory: () => Promise<string | null>;
+    ttsListModels: () => Promise<any[]>;
+    ttsSetModel: (modelId: string) => Promise<any>;
+    ttsAnalyzeText: (text: string) => Promise<string[] | { error: string }>;
+    ttsSynthesize: (params: any) => Promise<any>;
+    ttsGetPresets: () => Promise<any[]>;
+    ttsSavePreset: (preset: any) => Promise<any>;
+    ttsUpdatePreset: (id: string, updates: any) => Promise<any>;
+    ttsDeletePreset: (id: string) => Promise<boolean>;
+    ttsGetPathsConfig: () => Promise<{ datasetRoot: string; assetsRoot: string }>;
+    ttsSetPathsConfig: (config: { datasetRoot: string; assetsRoot: string }) => Promise<{ success: boolean; error?: string }>;
+}
+
+// Nano Studio Types
+export interface NanoPreset {
+    name: string;
+    systemPrompt: string;
+    userPrompt: string;
+    negativePrompt: string;
+    aspectRatio: string;
+}
+
+export interface NanoGenerateParams {
+    prompt: string;
+    negativePrompt?: string;
+    aspectRatio?: string;
+    resolution?: string; // '1024x1024', '2048x2048'
+    referenceImage?: string | null;
+    referenceImages?: string[];
+    modelKey?: string;
+    customModelId?: string;
+    upscaleScale?: number;
+    mode?: string;
+    upscaleMethod?: string;
+    outputFormat?: string;
+    outputQuality?: number;
 }
 
 // Whisper ステータス

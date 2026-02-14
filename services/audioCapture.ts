@@ -90,7 +90,7 @@ class AudioCaptureService {
         }
     }
 
-    async startCaptureFromSystemAudio(callbacks: AudioCaptureCallbacks, micDeviceId?: string): Promise<void> {
+    async startCaptureFromSystemAudio(callbacks: AudioCaptureCallbacks, micDeviceId?: string, includeMic: boolean = true): Promise<void> {
         if (this.isCapturing) {
             await this.stopCapture();
         }
@@ -120,25 +120,29 @@ class AudioCaptureService {
             }
             console.log('[AudioCapture] System audio tracks found:', sysAudioTracks.length);
 
-            // 2. マイク音声ストリームを取得
-            try {
-                // ユーザー指定のIDがあれば使う、なければデフォルト
-                const constraint = micDeviceId ? { deviceId: { exact: micDeviceId } } : true;
-                this.micStream = await navigator.mediaDevices.getUserMedia({
-                    audio: typeof constraint === 'object' ? {
-                        ...constraint,
-                        echoCancellation: false,
-                        noiseSuppression: false,
-                        autoGainControl: false,
-                    } : {
-                        echoCancellation: false,
-                        noiseSuppression: false,
-                        autoGainControl: false,
-                    },
-                });
-                console.log('[AudioCapture] Mic audio tracks found:', this.micStream.getAudioTracks().length);
-            } catch (micError) {
-                console.warn('[AudioCapture] Failed to get mic stream (proceeding with system audio only):', micError);
+            // 2. マイク音声ストリームを取得（includeMicがtrueの場合のみ）
+            if (includeMic) {
+                try {
+                    // ユーザー指定のIDがあれば使う、なければデフォルト
+                    const constraint = micDeviceId ? { deviceId: { exact: micDeviceId } } : true;
+                    this.micStream = await navigator.mediaDevices.getUserMedia({
+                        audio: typeof constraint === 'object' ? {
+                            ...constraint,
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false,
+                        } : {
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false,
+                        },
+                    });
+                    console.log('[AudioCapture] Mic audio tracks found:', this.micStream.getAudioTracks().length);
+                } catch (micError) {
+                    console.warn('[AudioCapture] Failed to get mic stream (proceeding with system audio only):', micError);
+                }
+            } else {
+                console.log('[AudioCapture] Mic capture disabled by user');
             }
 
             // 3. AudioContext初期化

@@ -6,11 +6,16 @@ import * as dotenv from 'dotenv';
 import { googleSpeechToTextService } from './googleSpeechToText';
 import { streamingSpeechToTextService } from './streamingSpeechToText';
 import { whisperService } from './whisperService';
+import { autoUpdater } from 'electron-updater';
+import { CubismService } from './live2d/CubismService';
+import { Sbv2Service } from './services/tts/Sbv2Service';
+import { TtsSynthesizeParams, TtsPreset } from '../types/tts';
 
 // .env ファイルを読み込み
 // .env ファイルを読み込み
-const isDevelopment = process.env.NODE_ENV === 'development' || !app.isPackaged;
+const isDevelopment = process.env.NODE_ENV === 'development' || (app && !app.isPackaged);
 const resourcesPath = isDevelopment ? path.join(__dirname, '../../') : process.resourcesPath;
+const ttsResourcesPath = isDevelopment ? path.join(__dirname, '../../resources') : process.resourcesPath;
 
 dotenv.config({ path: path.join(resourcesPath, '.env') });
 
@@ -55,6 +60,9 @@ function createWindow(): void {
         show: false,
     });
 
+    // Link Cubism Service to Window
+    CubismService.getInstance().setWebContents(mainWindow.webContents);
+
     // 権限リクエストを自動的に許可
     session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
         const allowedPermissions = ['media', 'display-capture', 'mediaKeySystem', 'audioCapture', 'videoCapture'];
@@ -86,7 +94,7 @@ function createWindow(): void {
         });
     }
     // Debug: プロダクションでもDevToolsを開く
-    mainWindow.webContents.openDevTools();
+    // mainWindow.webContents.openDevTools();
 
     mainWindow.once('ready-to-show', () => {
         mainWindow?.show();
@@ -314,6 +322,7 @@ ipcMain.handle('load-logs', async () => {
 let appAudioCapture: {
     getAudioProcesses: () => Array<{ pid: number; name: string; title: string }>;
     startCapture: (pid: number, callback: (data: { buffer: Buffer; channels: number; sampleRate: number; bytesPerSample: number }) => void) => { success: boolean; error?: string };
+    startSystemCapture: (callback: (data: { buffer: Buffer; channels: number; sampleRate: number; bytesPerSample: number }) => void) => { success: boolean; error?: string };
     stopCapture: () => void;
     isCapturing: () => boolean;
 } | null = null;
@@ -418,6 +427,54 @@ ipcMain.handle('start-process-capture', async (_event, pid: number) => {
         return { ...result, recordingPath: continuousRecordingPath };
     } catch (error) {
         console.error('Start process capture error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+// システム全体の音声キャプチャを開始 (New: Native WASAPI loopback)
+ipcMain.handle('start-system-capture', async () => {
+    try {
+        if (!appAudioCapture) {
+            return { success: false, error: 'Native module not loaded' };
+        }
+
+        // 連続録音ファイルを準備
+        if (currentSessionPath) {
+            const timestamp = Date.now();
+            continuousRecordingPath = path.join(currentSessionPath, `system_continuous_${timestamp}.raw`);
+            continuousRecordingStream = fs.createWriteStream(continuousRecordingPath);
+            continuousRecordingTotalSamples = 0;
+            lastTranscribedSamples = 0;
+            lastMetadataSendTime = 0;
+        }
+
+        const result = appAudioCapture.startSystemCapture((data: { buffer: Buffer; sampleRate: number; channels: number; bytesPerSample: number }) => {
+            // 音声データをファイルに追記
+            if (continuousRecordingStream) {
+                continuousRecordingStream.write(data.buffer);
+                continuousRecordingSampleRate = data.sampleRate;
+                continuousRecordingChannels = data.channels;
+                continuousRecordingTotalSamples += data.buffer.length / (data.bytesPerSample * data.channels);
+            }
+
+            // レンダラーにはメタデータのみ送信（1秒ごとにスロットリング）
+            const now = Date.now();
+            if (now - lastMetadataSendTime >= 1000) {
+                lastMetadataSendTime = now;
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.webContents.send('process-audio-metadata', {
+                        totalSamples: continuousRecordingTotalSamples,
+                        sampleRate: data.sampleRate,
+                        channels: data.channels,
+                    });
+                }
+            }
+        });
+
+        console.log('[Main] System capture started:', result);
+        return { ...result, recordingPath: continuousRecordingPath };
+    } catch (error) {
+        console.error('Start system capture error:', error);
         return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
 });
@@ -880,7 +937,7 @@ ipcMain.handle('open-folder', async (_event, fullPath: string) => {
 });
 
 // 音声ファイルを読み込む（WAVヘッダーを解析してPCMデータのみ返す）
-ipcMain.handle('read-audio-file', async (_event, filePath: string) => {
+ipcMain.handle('read-audio-file-deprecated', async (_event, filePath: string) => {
     try {
         console.log(`[Main] Reading audio file: ${filePath}`);
         console.log(`[Main] Current Session Path: ${currentSessionPath}`);
@@ -1101,26 +1158,1114 @@ ipcMain.handle('organizer:read-content', async (_event, filePath: string) => {
     }
 });
 
-import { githubHandlerService } from './githubHandler';
+// ============================================
+// Nano Studio IPC Handlers
+// ============================================
 
-// ... (existing imports)
+const presetsDir = isDevelopment ? path.join(__dirname, '../../presets') : path.join(process.resourcesPath, 'presets');
+const outputDir = isDevelopment ? path.join(__dirname, '../../output') : path.join(process.resourcesPath, 'output');
 
-// GitHub IPC Handlers
-ipcMain.handle('github:initialize', async (_event, token: string) => {
-    await githubHandlerService.initialize(token);
-    return { success: true };
+// Ensure directories exist
+if (!fs.existsSync(presetsDir)) fs.mkdirSync(presetsDir, { recursive: true });
+if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+ipcMain.handle('nano:select-file', async (_event, extensions: string[], multi: boolean = false) => {
+    try {
+        const properties: ('openFile' | 'multiSelections')[] = ['openFile'];
+        if (multi) properties.push('multiSelections');
+
+        const result = await dialog.showOpenDialog({
+            properties,
+            filters: [{ name: 'Images', extensions }]
+        });
+        if (result.canceled || result.filePaths.length === 0) {
+            return { success: false };
+        }
+        return { success: true, path: result.filePaths[0], paths: result.filePaths };
+    } catch (error) {
+        return { success: false, error: String(error) };
+    }
 });
 
-ipcMain.handle('github:init-repo', async (_event, localPath: string, repoName: string) => {
-    return await githubHandlerService.initRepo(localPath, repoName);
+ipcMain.handle('nano:read-image', async (_event, filePath: string) => {
+    try {
+        if (!fs.existsSync(filePath)) return { success: false, error: 'File not found' };
+        const buffer = fs.readFileSync(filePath);
+        return { success: true, base64: buffer.toString('base64') };
+    } catch (e) {
+        return { success: false, error: String(e) };
+    }
 });
 
-ipcMain.handle('github:get-status', async (_event, localPath: string) => {
-    return await githubHandlerService.getStatus(localPath);
+// --- Live2D IPC ---
+ipcMain.handle('cubism:send-command', async (_, type, name, payload) => {
+    try {
+        const msgId = CubismService.getInstance().sendCommand(type, name, payload);
+        return { success: true, msgId };
+    } catch (e: any) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('cubism:get-status', async () => {
+    return CubismService.getInstance().getStatus();
+});
+
+ipcMain.handle('nano:load-presets', async () => {
+    try {
+        const files = fs.readdirSync(presetsDir).filter(f => f.endsWith('.json'));
+        const presets = files.map(f => {
+            const content = fs.readFileSync(path.join(presetsDir, f), 'utf-8');
+            return JSON.parse(content);
+        });
+        return { success: true, presets };
+    } catch (error) {
+        return { success: true, presets: [] };
+    }
+});
+
+ipcMain.handle('nano:load-preset', async (_event, name: string) => {
+    try {
+        const filePath = path.join(presetsDir, `${name}.json`);
+        if (!fs.existsSync(filePath)) {
+            return { success: false, error: 'Preset not found' };
+        }
+        const content = fs.readFileSync(filePath, 'utf-8');
+        return { success: true, preset: JSON.parse(content) };
+    } catch (error) {
+        return { success: false, error: String(error) };
+    }
+});
+
+ipcMain.handle('nano:save-preset', async (_event, preset: any) => {
+    try {
+        const filePath = path.join(presetsDir, `${preset.name}.json`);
+        fs.writeFileSync(filePath, JSON.stringify(preset, null, 2));
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: String(error) };
+    }
+});
+
+const MODEL_MAP: Record<string, string> = {
+    gemini3pro: process.env.MODEL_ID_GEMINI3PRO || 'gemini-3-pro-image-preview',
+    imagen4ultra: process.env.MODEL_ID_IMAGEN4ULTRA || 'imagen-4.0-ultra-generate-001',
+    'imagen-3': 'imagen-3.0-generate-001',
+    'gemini-2.0-flash': 'gemini-2.0-flash-001',
+    'gemini-2.5-flash': 'gemini-2.5-flash-image-preview',
+    'gemini-3-pro-preview': 'gemini-3-pro-preview'
+};
+
+// ============================================
+// Nano Studio vNext: Cost & History Management
+// ============================================
+
+const nanoDataDir = isDevelopment ? path.join(__dirname, '../../user_data') : path.join(app.getPath('userData'), 'user_data');
+if (!fs.existsSync(nanoDataDir)) fs.mkdirSync(nanoDataDir, { recursive: true });
+
+const budgetPath = path.join(nanoDataDir, 'budget_tracker.json');
+const historyPath = path.join(nanoDataDir, 'nano_history.json');
+
+// Pricing Configuration (USD)
+const PRICING = {
+    'imagen-3.0-fast-generate-001': 0.02, // Draft
+    'imagen-3.0-generate-001': 0.04,      // Production
+    'imagen-4.0-ultra-generate-001': 0.06, // Final
+    'imagen-4-ultra': 0.06,               // Legacy/Alternative ID support
+    'gemini-3-pro-image-preview': 0.0,    // Preview (Free?)
+    'gemini-2.0-flash-001': 0.0001,       // Very cheap per request usually
+    'gemini-3-pro-preview': 0.0,
+    'cloud_upscale': 0.06                 // Per image
+};
+
+
+const DEFAULT_BUDGET = {
+    dailyLimit: 10.0,
+    monthlyLimit: 100.0
+};
+
+// --- Cost Manager Class ---
+class CostManager {
+    static getBudgetStatus() {
+        try {
+            if (!fs.existsSync(budgetPath)) return { daily: 0, monthly: 0, lastReset: new Date().toISOString() };
+            return JSON.parse(fs.readFileSync(budgetPath, 'utf-8'));
+        } catch (e) {
+            return { daily: 0, monthly: 0, lastReset: new Date().toISOString() };
+        }
+    }
+
+    static updateBudget(cost: number) {
+        const status = this.getBudgetStatus();
+        const now = new Date();
+        const last = new Date(status.lastReset);
+
+        // Reset counters if new day/month
+        if (now.getDate() !== last.getDate()) {
+            status.daily = 0;
+        }
+        if (now.getMonth() !== last.getMonth()) {
+            status.monthly = 0;
+        }
+
+        status.daily += cost;
+        status.monthly += cost;
+        status.lastReset = now.toISOString();
+
+        fs.writeFileSync(budgetPath, JSON.stringify(status, null, 2));
+        return status;
+    }
+
+    static checkBudget(estimatedCost: number): { allowed: boolean; reason?: string } {
+        const status = this.getBudgetStatus();
+        const dailyLimit = Number(process.env.BUDGET_DAILY_USD) || DEFAULT_BUDGET.dailyLimit;
+
+        if (status.daily + estimatedCost > dailyLimit) {
+            return { allowed: false, reason: `Daily budget exceeded using this generation (Current: $${status.daily.toFixed(2)} + Est: $${estimatedCost.toFixed(2)} > Limit: $${dailyLimit.toFixed(2)})` };
+        }
+        return { allowed: true };
+    }
+
+    static calculateCost(modelId: string, count: number, useCloudUpscale: boolean): number {
+        const unitPrice = PRICING[modelId as keyof typeof PRICING] || 0.0; // Default to 0 if unknown (e.g. standard Gemini)
+        let total = unitPrice * count;
+        if (useCloudUpscale) {
+            total += (PRICING['cloud_upscale'] * count);
+        }
+        return total;
+    }
+}
+
+// --- History Manager Class ---
+class HistoryManager {
+    static addRecord(record: any) {
+        try {
+            let history = [];
+            if (fs.existsSync(historyPath)) {
+                history = JSON.parse(fs.readFileSync(historyPath, 'utf-8'));
+            }
+            history.unshift(record); // Add to top
+            // Limit history size (e.g. 100 items)
+            if (history.length > 100) history = history.slice(0, 100);
+            fs.writeFileSync(historyPath, JSON.stringify(history, null, 2));
+        } catch (e) {
+            console.error('Failed to save history:', e);
+        }
+    }
+
+    static getHistory() {
+        try {
+            if (!fs.existsSync(historyPath)) return [];
+            return JSON.parse(fs.readFileSync(historyPath, 'utf-8'));
+        } catch (e) {
+            return [];
+        }
+    }
+}
+
+// --- IPC Handlers ---
+
+ipcMain.handle('nano:get-history', async () => {
+    return { success: true, history: HistoryManager.getHistory() };
+});
+
+ipcMain.handle('nano:get-budget-status', async () => {
+    const dailyLimit = Number(process.env.BUDGET_DAILY_USD) || DEFAULT_BUDGET.dailyLimit;
+    const monthlyLimit = Number(process.env.BUDGET_MONTHLY_USD) || DEFAULT_BUDGET.monthlyLimit;
+    return { success: true, status: CostManager.getBudgetStatus(), limits: { daily: dailyLimit, monthly: monthlyLimit } };
+});
+
+ipcMain.handle('nano:estimate-cost', async (_event, params: any) => {
+    // Mode routing logic for estimation
+    let modelId = 'gemini-3-pro-image-preview'; // Default/Manual
+    if (params.mode === 'draft') modelId = 'imagen-3.0-fast-generate-001';
+    else if (params.mode === 'production') modelId = 'imagen-3.0-generate-001';
+    else if (params.mode === 'final') modelId = 'imagen-4-ultra';
+    else if (params.modelKey) {
+        modelId = MODEL_MAP[params.modelKey] || params.customModelId || modelId;
+    }
+
+    const cost = CostManager.calculateCost(modelId, params.count || 1, params.upscaleMethod === 'cloud');
+    return { success: true, cost, modelId };
+});
+
+// (Moved to top of file)
+
+// ... (Existing code) ...
+
+// Helper: Get GoogleGenAI Client (Hybrid Auth)
+async function getAIClient(modelId: string) {
+    const { GoogleGenAI } = await import('@google/genai');
+    const apiKey = process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY;
+    const projectId = process.env.GCP_PROJECT_ID;
+
+    // Auth Strategy
+    const isImagen = modelId.startsWith('imagen');
+
+    if (isImagen && projectId) {
+        // Vertex AI Strategy for Imagen (Tokyo)
+        const targetLocation = process.env.GCP_LOCATION || 'asia-northeast1';
+        console.log(`[Auto] Initializing Vertex AI (Imagen) | Project: ${projectId} | Region: ${targetLocation}`);
+        return new GoogleGenAI({ vertexai: true, project: projectId, location: targetLocation });
+    } else if (apiKey) {
+        // AI Studio Strategy
+        console.log(`[Auto] Initializing AI Studio with API Key`);
+        return new GoogleGenAI({ apiKey });
+    } else {
+        // Fallback to Vertex US
+        console.log(`[Auto] Fallback to Vertex AI (US)`);
+        return new GoogleGenAI({ vertexai: true, project: projectId, location: 'us-central1' });
+    }
+}
+
+// Handler: Auto Prompt Generation
+ipcMain.handle('nano:auto-prompt', async (_event, params: { type: 'base' | 'negative', userPrompt: string }) => {
+    try {
+        const ai = await getAIClient('gemini-2.0-flash-001');
+
+        let systemPrompt = "";
+        if (params.type === 'base') {
+            systemPrompt = `You are an expert AI Art Prompt Engineer specializing in Japanese Anime Style (Niji/Midjourney/Imagen style).
+            Your task is to take a simple user concept and expand it into a detailed, high-quality prompt optimized for "Anime Painting".
+            Include keywords like: "anime illustration, cel shading, detailed lineart, 4k, masterpiece".
+            Focus on: Lighting, Composition, Color Palette (Vibrant), and Character detail.
+            Output ONLY the raw prompt text, no explanations.`;
+        } else {
+            systemPrompt = `You are an expert AI Art Prompt Engineer.
+            Generate a robust "Negative Prompt" for Anime Illustrations to prevent common artifacts.
+            Include: "photorealistic, 3d, nsfw, lowres, bad anatomy, bad hands, text, watermark, jpeg artifacts".
+            Output ONLY the raw negative prompt text.`;
+        }
+
+        const result = await ai.models.generateContent({
+            model: 'gemini-2.0-flash-001',
+            contents: [
+                { role: 'user', parts: [{ text: systemPrompt + "\n\nUser Input: " + params.userPrompt }] }
+            ]
+        });
+
+        const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        return { success: true, prompt: text.trim() };
+    } catch (e: any) {
+        console.error('Auto Prompt Error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+// Handler: Optimize Prompt
+ipcMain.handle('nano:optimize-prompt', async (_event, prompt: string) => {
+    try {
+        const ai = await getAIClient('gemini-2.0-flash-001');
+
+        const instruction = `Optimize this prompt for an Image Generation AI (Imagen 3/4).
+        - Remove contradictory terms.
+        - Enhance descriptive quality.
+        - Ensure "Anime Style" focus.
+        - Keep it concise but descriptive.
+        Output ONLY the final prompt.
+        
+        Input: "${prompt}"`;
+
+        const result = await ai.models.generateContent({
+            model: 'gemini-2.0-flash-001',
+            contents: [{ role: 'user', parts: [{ text: instruction }] }]
+        });
+        const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        return { success: true, prompt: text.trim() };
+    } catch (e: any) {
+        return { success: false, error: e.message };
+    }
+});
+
+
+// Helper: Perform Upscale
+async function performUpscale(imagePath: string, scale: number, method: string = 'auto'): Promise<{ success: boolean; path?: string; error?: string }> {
+    if (scale <= 1) return { success: true, path: imagePath };
+
+    // Logic: Auto/Local -> Python
+    // Logic: Cloud -> Not implemented yet
+
+    // For now, treat Auto/Local as same
+    const effectiveMethod = method === 'cloud' ? 'cloud' : 'local';
+
+    if (effectiveMethod === 'cloud') {
+        return { success: false, error: 'Cloud upscale is not yet available.' };
+    }
+
+    try {
+        const { spawn } = await import('child_process');
+        const scaleInt = Math.floor(scale);
+        console.log(`[Nano] Starting LOCAL upscale (${scaleInt}x) for: ${imagePath}`);
+
+        const projectRoot = isDevelopment ? path.join(__dirname, '../../') : process.resourcesPath;
+        const pythonProcess = spawn('python', ['upscale_image.py', imagePath, String(scaleInt)], {
+            cwd: projectRoot,
+            shell: true
+        });
+
+        let stdoutData = '';
+        let finalPath = imagePath;
+        let warning = '';
+
+        await new Promise<void>((resolve) => {
+            pythonProcess.stdout.on('data', (d) => stdoutData += d.toString());
+            pythonProcess.on('close', (code) => {
+                if (code === 0) {
+                    const match = stdoutData.match(/OUTPUT:(.+)/);
+                    if (match && match[1]) {
+                        finalPath = match[1].trim();
+                    }
+                } else {
+                    warning = `Local upscale failed (code ${code})`;
+                }
+                resolve();
+            });
+            pythonProcess.on('error', (e) => {
+                warning = `Script error: ${e}`;
+                resolve();
+            });
+            // Timeout 60s
+            setTimeout(() => {
+                if (pythonProcess.exitCode === null) {
+                    pythonProcess.kill();
+                    warning = 'Timeout';
+                    resolve();
+                }
+            }, 60000);
+        });
+
+        if (warning) return { success: false, error: warning };
+        return { success: true, path: finalPath };
+
+    } catch (e) {
+        return { success: false, error: String(e) };
+    }
+}
+
+ipcMain.handle('nano:upscale-image', async (_event, params: { imagePath: string, scale: number }) => {
+    return await performUpscale(params.imagePath, params.scale, 'local');
+});
+
+// Helper: Perform Smoothing
+async function performSmoothing(imagePath: string): Promise<{ success: boolean; path?: string; error?: string }> {
+    try {
+        const { spawn } = await import('child_process');
+        console.log(`[Nano] Starting Smoothing for: ${imagePath}`);
+
+        const projectRoot = isDevelopment ? path.join(__dirname, '../../') : process.resourcesPath;
+        const pythonProcess = spawn('python', ['edge_smooth.py', imagePath], {
+            cwd: projectRoot,
+            shell: true
+        });
+
+        let stdoutData = '';
+        let finalPath = imagePath;
+        let warning = '';
+
+        await new Promise<void>((resolve) => {
+            pythonProcess.stdout.on('data', (d) => stdoutData += d.toString());
+            pythonProcess.on('close', (code) => {
+                if (code === 0) {
+                    const match = stdoutData.match(/OUTPUT:(.+)/);
+                    if (match && match[1]) {
+                        finalPath = match[1].trim();
+                    }
+                } else {
+                    warning = `Smoothing script failed (code ${code})`;
+                }
+                resolve();
+            });
+            pythonProcess.on('error', (e) => {
+                warning = `Script error: ${e}`;
+                resolve();
+            });
+            setTimeout(() => {
+                if (pythonProcess.exitCode === null) {
+                    pythonProcess.kill();
+                    warning = 'Timeout';
+                    resolve();
+                }
+            }, 30000);
+        });
+
+        if (warning) return { success: false, error: warning };
+        return { success: true, path: finalPath };
+
+    } catch (e) {
+        return { success: false, error: String(e) };
+    }
+}
+
+ipcMain.handle('nano:smooth-image', async (_event, imagePath: string) => {
+    return await performSmoothing(imagePath);
+});
+
+// Helper: Format Conversion
+async function performFormatConversion(imagePath: string, format: string, quality: number = 90): Promise<{ success: boolean; path?: string; error?: string }> {
+    try {
+        const { spawn } = await import('child_process');
+        const projectRoot = isDevelopment ? path.join(__dirname, '../../') : process.resourcesPath;
+        const pythonProcess = spawn('python', ['convert_format.py', imagePath, format, String(quality)], {
+            cwd: projectRoot,
+            shell: true
+        });
+
+        let stdoutData = '';
+        let finalPath = imagePath;
+        let warning = '';
+
+        await new Promise<void>((resolve) => {
+            pythonProcess.stdout.on('data', (d) => stdoutData += d.toString());
+            pythonProcess.on('close', (code) => {
+                if (code === 0) {
+                    const match = stdoutData.match(/OUTPUT:(.+)/);
+                    if (match && match[1]) {
+                        finalPath = match[1].trim();
+                    }
+                } else {
+                    warning = `Convert script failed (code ${code})`;
+                }
+                resolve();
+            });
+            pythonProcess.on('error', (e) => {
+                warning = `Script error: ${e}`;
+                resolve();
+            });
+            setTimeout(() => {
+                if (pythonProcess.exitCode === null) {
+                    pythonProcess.kill();
+                    warning = 'Timeout';
+                    resolve();
+                }
+            }, 30000);
+        });
+
+        if (warning) return { success: false, error: warning };
+        return { success: true, path: finalPath };
+    } catch (e) {
+        return { success: false, error: String(e) };
+    }
+}
+
+ipcMain.handle('nano:convert-format', async (_event, params: { imagePath: string, format: string, quality?: number }) => {
+    return await performFormatConversion(params.imagePath, params.format, params.quality);
+});
+
+ipcMain.handle('nano:generate', async (_event, params: {
+    prompt: string;
+    negativePrompt?: string;
+    aspectRatio?: string;
+    resolution?: string;
+    referenceImage?: string | null;
+    referenceImages?: string[]; // Multiple references
+    modelKey?: string;
+    customModelId?: string;
+    upscaleScale?: number;
+    mode?: 'draft' | 'production' | 'final' | 'manual';
+    upscaleMethod?: 'local' | 'cloud' | 'auto';
+    outputFormat?: string;
+    outputQuality?: number;
+}) => {
+    let modelId = 'gemini-3-pro-image-preview'; try {
+        const { GoogleGenAI } = await import('@google/genai');
+        const apiKey = process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY;
+        const projectId = process.env.GCP_PROJECT_ID;
+
+        // Set credentials for Vertex AI if available
+        const credentialsPath = isDevelopment
+            ? path.join(__dirname, '../../gcp-credentials.json')
+            : path.join(process.resourcesPath, 'gcp-credentials.json');
+
+        if (fs.existsSync(credentialsPath)) {
+            process.env.GOOGLE_APPLICATION_CREDENTIALS = credentialsPath;
+        }
+
+        // 1. Resolve Model ID
+        if (params.mode === 'draft') modelId = 'imagen-3.0-fast-generate-001';
+        else if (params.mode === 'production') modelId = 'imagen-3.0-generate-001';
+        else if (params.mode === 'final') modelId = MODEL_MAP['imagen4ultra'];
+        else if (params.modelKey) {
+            if (params.customModelId) {
+                modelId = params.customModelId;
+            } else if (MODEL_MAP[params.modelKey]) {
+                modelId = MODEL_MAP[params.modelKey];
+            }
+        }
+
+        // 2. Auth Strategy: Hybrid
+        // Imagen models -> Vertex AI (Required)
+        // Gemini models -> AI Studio (Preferred/Previous working state) or Vertex (US)
+
+        let effectiveProjectId = projectId;
+        const isUltra = modelId.includes('ultra') || modelId.includes('imagen-4');
+
+        if (isUltra) {
+            // Ultra uses dedicated credentials
+            const ultraCredsPath = isDevelopment
+                ? path.join(__dirname, '../../gcp-credentials-ultra.json')
+                : path.join(process.resourcesPath, 'gcp-credentials-ultra.json');
+
+            if (fs.existsSync(ultraCredsPath)) {
+                process.env.GOOGLE_APPLICATION_CREDENTIALS = ultraCredsPath;
+                try {
+                    const creds = JSON.parse(fs.readFileSync(ultraCredsPath, 'utf-8'));
+                    if (creds.project_id) {
+                        effectiveProjectId = creds.project_id;
+                        // Force environment variables to update so low-level libs pick it up
+                        process.env.GCP_PROJECT_ID = effectiveProjectId;
+                        process.env.GOOGLE_CLOUD_PROJECT = effectiveProjectId;
+                        console.log(`[Nano] Ultra Credentials Loaded. Project ID switched to: ${effectiveProjectId}`);
+                    }
+                } catch (e) {
+                    console.error('Failed to parse Ultra credentials:', e);
+                }
+            } else {
+                console.warn(`[Nano] Ultra Credentials NOT FOUND at: ${ultraCredsPath}`);
+            }
+        } else {
+            // Revert/Ensure default credentials for others
+            if (fs.existsSync(credentialsPath)) {
+                process.env.GOOGLE_APPLICATION_CREDENTIALS = credentialsPath;
+            }
+        }
+
+        const isImagen = modelId.startsWith('imagen');
+
+        let ai;
+
+        if (isImagen && effectiveProjectId) {
+            // Vertex AI Strategy for Imagen
+            let targetLocation = process.env.GCP_LOCATION || 'asia-northeast1';
+
+            // Force asia-east1 for Imagen 4 Ultra (Preview Availability)
+            if (isUltra) {
+                targetLocation = 'asia-east1';
+            }
+
+            process.env.GCP_LOCATION = targetLocation;
+
+            console.log(`[Nano] Initializing Vertex AI (Imagen) | Project: ${effectiveProjectId} | Region: ${targetLocation} | Creds: ${isUltra ? 'Ultra' : 'Default'}`);
+            ai = new GoogleGenAI({ vertexai: true, project: effectiveProjectId, location: targetLocation });
+        } else if (apiKey) {
+            // AI Studio Strategy for Gemini (or fallback)
+            console.log(`[Nano] Initializing AI Studio (Gemini) with API Key`);
+            ai = new GoogleGenAI({ apiKey });
+        } else {
+            // Fallback to Vertex if no API key
+            console.log(`[Nano] Fallback to Vertex AI (US) for Gemini`);
+            ai = new GoogleGenAI({ vertexai: true, project: projectId, location: 'us-central1' });
+        }
+
+        // 3. Prepare Content (Moved from later, or we wait?)
+        // The original code constructed 'contents' *after* auth but *before* generation.
+        // We need to ensure 'contents' is available for the API call.
+        // Let's use the original flow for content construction, we just needed 'ai' initialized.
+
+        // ... (Content construction follows in original code) ...
+
+
+        // 2. Budget Guard
+        // Note: Gemini 3 Pro is currently free in preview, so cost is 0. Imagen 4 has cost.
+        // We use the PRICING table.
+        const estimatedCost = CostManager.calculateCost(modelId, 1, false); // Per image check not batch yet
+        const budgetCheck = CostManager.checkBudget(estimatedCost);
+
+        if (!budgetCheck.allowed) {
+            return { success: false, error: `Budget Limit: ${budgetCheck.reason}` };
+        }
+
+        console.log(`[Nano] Generating | Mode: ${params.mode} | Model: ${modelId} | Est: $${estimatedCost}`);
+
+        // 3. Build prompt
+        let prompt = params.prompt;
+
+        // Resolution handling
+        if (params.resolution) {
+            const qualityTags = "ultra high resolution, 4k, 8k, masterpiece, best quality, sharp detail, high fidelity";
+            prompt = `resolution: ${params.resolution}, ${qualityTags} -- ${prompt}`;
+        }
+
+        if (params.negativePrompt) {
+            prompt += `\n\nNegative: ${params.negativePrompt}`;
+        }
+        if (params.aspectRatio) {
+            prompt += `\n\nAspect Ratio: ${params.aspectRatio}`;
+        }
+
+        // Reference image handling
+        // Reference image handling (Multi + Legacy)
+        let parts: any[] = [{ text: prompt }];
+
+        const refImages = [];
+        if (params.referenceImage) refImages.push(params.referenceImage);
+        if (params.referenceImages && Array.isArray(params.referenceImages)) refImages.push(...params.referenceImages);
+
+        // Deduplicate
+        const uniqueRefImages = [...new Set(refImages)];
+
+        for (const imgPath of uniqueRefImages) {
+            if (imgPath && fs.existsSync(imgPath)) {
+                try {
+                    const imageData = fs.readFileSync(imgPath);
+                    const base64 = imageData.toString('base64');
+                    // Simple mime detection
+                    const ext = path.extname(imgPath).toLowerCase();
+                    const mimeType = ext === '.png' ? 'image/png' : (ext === '.webp' ? 'image/webp' : 'image/jpeg');
+                    parts.push({ inlineData: { mimeType, data: base64 } });
+                } catch (e) {
+                    console.warn(`Failed to read reference image: ${imgPath}`, e);
+                }
+            }
+        }
+
+        // 4. API Call
+        console.log(`[Nano] Calling generateContent with Model: ${modelId}`);
+        console.log(`[Nano] AI Config -> Project: ${process.env.GCP_PROJECT_ID}, Location: ${process.env.GCP_LOCATION}`);
+
+        // Construct request options dynamically to handle Gemini limitations
+        const requestOptions: any = {
+            model: modelId,
+            contents: [
+                {
+                    role: 'user',
+                    parts: parts
+                }
+            ]
+        };
+
+        // Only add responseModalities for Imagen (Gemini Flash fails with 400 if this is set)
+        if (isImagen) {
+            requestOptions.config = { responseModalities: ['IMAGE', 'TEXT'] };
+        }
+
+        const response = await ai.models.generateContent(requestOptions);
+
+        // 5. Process Response
+        if (response.candidates && response.candidates[0]?.content?.parts) {
+            for (const part of response.candidates[0].content.parts) {
+                if (part.inlineData && part.inlineData.data) {
+                    const imageBuffer = Buffer.from(part.inlineData.data, 'base64');
+                    const timestamp = Date.now();
+                    const filename = `nano_${timestamp}.png`;
+                    const imagePath = path.join(outputDir, filename);
+                    fs.writeFileSync(imagePath, imageBuffer);
+
+                    let finalPath = imagePath;
+                    let warning = undefined;
+                    const filesToDelete: string[] = [];
+
+                    // 6. Upscaling (Two-Tier)
+                    // Method: 'local' | 'cloud' | 'auto' (default)
+                    // Auto = Always Local first. Cloud is manual trigger via specific IPC later.
+                    // So here, if scale > 1, we basically always do Local unless 'cloud' is explicitly implemented here (future).
+                    if (params.upscaleScale && params.upscaleScale > 1) {
+                        const upscaleRes = await performUpscale(imagePath, params.upscaleScale, params.upscaleMethod);
+                        if (upscaleRes.success && upscaleRes.path) {
+                            filesToDelete.push(finalPath);
+                            finalPath = upscaleRes.path;
+                        } else if (upscaleRes.error) {
+                            warning = upscaleRes.error;
+                        }
+                    }
+
+                    // 6b. Format Conversion
+                    if (params.outputFormat && ['jpeg', 'jpg', 'webp', 'png'].includes(params.outputFormat.toLowerCase())) {
+                        // Skip if PNG and no special quality arg? (Optimization: API output is PNG)
+                        // But user might want specific compression.
+                        // We'll run it.
+                        const convertRes = await performFormatConversion(finalPath, params.outputFormat, params.outputQuality);
+                        if (convertRes.success && convertRes.path) {
+                            if (finalPath !== convertRes.path) filesToDelete.push(finalPath);
+                            finalPath = convertRes.path;
+                        } else if (convertRes.error) {
+                            warning = warning ? `${warning}; Convert failed: ${convertRes.error}` : `Convert failed: ${convertRes.error}`;
+                        }
+                    }
+
+                    // Cleanup Intermediate Files
+                    for (const f of filesToDelete) {
+                        try {
+                            if (fs.existsSync(f)) fs.unlinkSync(f);
+                        } catch (e) {
+                            console.error('Failed to cleanup file:', f, e);
+                        }
+                    }
+
+                    // 7. Data Recording
+                    CostManager.updateBudget(estimatedCost);
+
+                    const record = {
+                        id: `job_${timestamp}`,
+                        timestamp,
+                        mode: params.mode || 'manual',
+                        modelId,
+                        prompt,
+                        imagePath: finalPath,
+                        cost: estimatedCost,
+                        upscale: params.upscaleScale || 1
+                    };
+                    HistoryManager.addRecord(record);
+
+                    // Read final image for preview
+                    let finalBase64 = part.inlineData.data;
+                    if (finalPath !== imagePath && fs.existsSync(finalPath)) {
+                        finalBase64 = fs.readFileSync(finalPath).toString('base64');
+                    }
+
+                    return { success: true, imagePath: finalPath, imageBase64: finalBase64, error: warning, cost: estimatedCost };
+                }
+            }
+        }
+
+        return { success: false, error: 'No image generated in response' };
+    } catch (error: any) {
+        console.error('[Nano] Generation error:', error);
+        return { success: false, error: `Generation Failed (Model: ${modelId || 'Unknown'}): ${error.message || String(error)}` };
+    }
+});
+
+
+// ============================================
+// TTS (Style-Bert-VITS2) APIs
+// ============================================
+
+
+
+
+ipcMain.handle('read-audio-file', async (_event, filePath: string) => {
+    try {
+        if (!fs.existsSync(filePath)) {
+            return { success: false, error: 'File not found' };
+        }
+        const buffer = fs.readFileSync(filePath);
+        return { success: true, base64: buffer.toString('base64') };
+    } catch (error) {
+        console.error('Read audio file error:', error);
+        return { success: false, error: String(error) };
+    }
+});
+
+// TTS ステータス取得
+ipcMain.handle('tts-get-status', async () => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return service.getStatus();
+    } catch (error) {
+        console.error('[TTS] Get status error:', error);
+        return { installState: 'not_installed', runtimeState: 'stopped' };
+    }
+});
+
+// TTS インストール
+ipcMain.handle('tts-install', async (_event, options?: { dryRun?: boolean; force?: boolean }) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.install(options);
+    } catch (error) {
+        console.error('[TTS] Install error:', error);
+        return { success: false, error: { code: 'E_UNKNOWN', message: String(error) } };
+    }
+});
+
+// TTS 修復
+ipcMain.handle('tts-repair', async () => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.repair();
+    } catch (error) {
+        console.error('[TTS] Repair error:', error);
+        return { success: false, error: { code: 'E_UNKNOWN', message: String(error) } };
+    }
+});
+
+// TTS アンインストール
+ipcMain.handle('tts-uninstall', async () => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.uninstall();
+    } catch (error) {
+        console.error('[TTS] Uninstall error:', error);
+        return { success: false, error: { code: 'E_UNKNOWN', message: String(error) } };
+    }
+});
+
+// TTS サーバー開始
+ipcMain.handle('tts-start-server', async (_event, options?: any) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.startServer(options);
+    } catch (error) {
+        console.error('[TTS] Start server error:', error);
+        return { success: false, error: { code: 'E_SERVER_FAILED', message: String(error) } };
+    }
+});
+
+// TTS サーバー停止
+ipcMain.handle('tts-stop-server', async () => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.stopServer();
+    } catch (error) {
+        console.error('[TTS] Stop server error:', error);
+        return { success: false };
+    }
+});
+
+// モデル一覧取得
+ipcMain.handle('tts-list-models', async () => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.listModels();
+    } catch (error) {
+        console.error('[TTS] List models error:', error);
+        return [];
+    }
+});
+
+// モデル設定
+ipcMain.handle('tts-set-model', async (_event, modelId: string) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.setModel(modelId);
+    } catch (error) {
+        console.error('[TTS] Set model error:', error);
+        return { success: false, error: { code: 'E_MODEL_FAILED', message: String(error) } };
+    }
+});
+
+// 音声合成
+ipcMain.handle('tts-analyze-text', async (_event, text: string) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.analyzeText(text);
+    } catch (error) {
+        console.error('[TTS] Analyze text error:', error);
+        return { error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+// 音声合成
+ipcMain.handle('tts-synthesize', async (_event, params: TtsSynthesizeParams) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.synthesize(params);
+    } catch (error) {
+        console.error('[TTS] Synthesize error:', error);
+        return { success: false, error: { code: 'E_SERVER_FAILED', message: String(error) } };
+    }
+});
+
+// プリセット一覧取得
+ipcMain.handle('tts-get-presets', async () => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return service.getPresets();
+    } catch (error) {
+        console.error('[TTS] Get presets error:', error);
+        return [];
+    }
+});
+
+// プリセット保存
+ipcMain.handle('tts-save-preset', async (_event, preset: Omit<TtsPreset, 'id' | 'createdAt' | 'updatedAt'>) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return service.savePreset(preset);
+    } catch (error) {
+        console.error('[TTS] Save preset error:', error);
+        return null;
+    }
+});
+
+// プリセット更新
+ipcMain.handle('tts-update-preset', async (_event, id: string, updates: Partial<TtsPreset>) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return service.updatePreset(id, updates);
+    } catch (error) {
+        console.error('[TTS] Update preset error:', error);
+        return null;
+    }
+});
+
+// プリセット削除
+ipcMain.handle('tts-delete-preset', async (_event, id: string) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return service.deletePreset(id);
+    } catch (error) {
+        console.error('[TTS] Delete preset error:', error);
+        return false;
+    }
+});
+
+// GPU情報取得
+ipcMain.handle('tts-get-gpu-info', async () => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.getGpuInfo();
+    } catch (error) {
+        console.error('[TTS] Get GPU info error:', error);
+        return {
+            cudaAvailable: false,
+            cudaVersion: null,
+            torchVersion: 'Unknown',
+            deviceCount: 0,
+            currentDevice: 'none',
+            devices: [`Error: ${String(error)}`]
+        };
+    }
+});
+
+
+
+// TTS Paths Config
+ipcMain.handle('tts-get-paths-config', async () => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.getPathsConfig();
+    } catch (error) {
+        console.error('[TTS] Get paths config error:', error);
+        return { datasetRoot: 'Data', assetsRoot: 'model_assets' };
+    }
+});
+
+ipcMain.handle('tts-set-paths-config', async (_event, config: { datasetRoot: string; assetsRoot: string }) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        await service.setPathsConfig(config);
+        return { success: true };
+    } catch (error) {
+        console.error('[TTS] Set paths config error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+// TTS Install Training Dependencies
+ipcMain.handle('tts-install-training-deps', async () => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        await service.installTrainingDependencies();
+        return { success: true };
+    } catch (error) {
+        console.error('[TTS] Install training deps error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+// TTS Slice Audio
+ipcMain.handle('tts-slice-audio', async (_event, datasetName: string, inputDir: string, options?: any) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        await service.sliceAudio(datasetName, inputDir, options);
+        return { success: true };
+    } catch (error) {
+        console.error('Slice audio error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+// TTS Transcribe Audio
+ipcMain.handle('tts-transcribe-audio', async (_event, datasetName: string, options?: any) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        await service.transcribeAudio(datasetName, options);
+        return { success: true };
+    } catch (error) {
+        console.error('Transcribe audio error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+// TTS Save Transcription
+ipcMain.handle('tts-save-transcription', async (_event, datasetName: string, content: string) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        await service.saveTranscription(datasetName, content);
+        return { success: true };
+    } catch (error) {
+        console.error('Save transcription error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+// TTS Initialize Training Config
+ipcMain.handle('tts-init-training-config', async (_event, datasetName: string) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        await service.initializeTrainingConfig(datasetName);
+        return { success: true };
+    } catch (error) {
+        console.error('Init config error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+// TTS Generate BERT
+ipcMain.handle('tts-generate-bert', async (_event, datasetName: string) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        await service.generateBert(datasetName);
+        return { success: true };
+    } catch (error) {
+        console.error('Generate BERT error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+// TTS Train Model
+ipcMain.handle('tts-train-model', async (_event, datasetName: string, options?: { speedup?: boolean; noProgressBar?: boolean; epochs?: number }) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.trainModel(datasetName, options);
+    } catch (error) {
+        console.error('Train model error:', error);
+        return { success: false, error: { code: 'E_UNKNOWN', message: error instanceof Error ? error.message : 'Unknown error' } };
+    }
+});
+
+// TTS Clean Audio (DeepFilterNet)
+ipcMain.handle('tts-clean-audio', async (_event, datasetName: string) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.cleanAudio(datasetName);
+    } catch (error) {
+        console.error('Clean audio error:', error);
+        return { success: false, error: { code: 'E_UNKNOWN', message: error instanceof Error ? error.message : 'Unknown error' } };
+    }
+});
+
+// TTS Filter Audio (Gemini Quality Gate)
+ipcMain.handle('tts-filter-audio', async (_event, datasetName: string) => {
+    try {
+        const service = Sbv2Service.getInstance(ttsResourcesPath);
+        return await service.filterAudio(datasetName);
+    } catch (error) {
+        console.error('Filter audio error:', error);
+        return { success: false, error: { code: 'E_UNKNOWN', message: error instanceof Error ? error.message : 'Unknown error' } };
+    }
+});
+
+ipcMain.handle('util:select-directory', async () => {
+    const result = await dialog.showOpenDialog({
+        properties: ['openDirectory']
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+        return null;
+    }
+    return result.filePaths[0];
 });
 
 app.whenReady().then(() => {
     createWindow();
+
+    // Start Live2D Host
+    CubismService.getInstance().startHost();
+
+    // Auto-updater: Check for updates on startup (production only)
+    if (app.isPackaged) {
+        autoUpdater.checkForUpdatesAndNotify();
+    }
 
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) {

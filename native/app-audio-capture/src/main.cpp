@@ -102,6 +102,59 @@ Napi::Value StopCapture(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+// Start capturing system-wide audio (new)
+Napi::Value StartSystemCapture(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Object result = Napi::Object::New(env);
+    
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        result.Set("success", Napi::Boolean::New(env, false));
+        result.Set("error", Napi::String::New(env, "Invalid arguments: expected (callback: function)"));
+        return result;
+    }
+    
+    Napi::Function callback = info[0].As<Napi::Function>();
+    
+    // Create thread-safe function for calling back to JavaScript
+    g_tsfn = Napi::ThreadSafeFunction::New(
+        env,
+        callback,
+        "SystemAudioDataCallback",
+        0,
+        1,
+        [](Napi::Env) { /* cleanup */ }
+    );
+    
+    if (!g_audioCapture) {
+        g_audioCapture = std::make_unique<AudioCapture>();
+    }
+    
+    bool success = g_audioCapture->StartSystemCapture(
+        [](const uint8_t* data, size_t size, int channels, int sampleRate, int bytesPerSample) {
+            // Copy data to avoid lifetime issues
+            auto dataCopy = std::make_shared<std::vector<uint8_t>>(data, data + size);
+            
+            g_tsfn.NonBlockingCall([dataCopy, channels, sampleRate, bytesPerSample](Napi::Env env, Napi::Function jsCallback) {
+                Napi::Object audioData = Napi::Object::New(env);
+                audioData.Set("buffer", Napi::Buffer<uint8_t>::Copy(env, dataCopy->data(), dataCopy->size()));
+                audioData.Set("channels", Napi::Number::New(env, channels));
+                audioData.Set("sampleRate", Napi::Number::New(env, sampleRate));
+                audioData.Set("bytesPerSample", Napi::Number::New(env, bytesPerSample));
+                
+                jsCallback.Call({ audioData });
+            });
+        }
+    );
+    
+    result.Set("success", Napi::Boolean::New(env, success));
+    if (!success) {
+        result.Set("error", Napi::String::New(env, "Failed to start system capture."));
+        g_tsfn.Release();
+    }
+    
+    return result;
+}
+
 // Check if capture is active
 Napi::Value IsCapturing(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
@@ -113,9 +166,11 @@ Napi::Value IsCapturing(const Napi::CallbackInfo& info) {
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getAudioProcesses", Napi::Function::New(env, GetAudioProcesses));
     exports.Set("startCapture", Napi::Function::New(env, StartCapture));
+    exports.Set("startSystemCapture", Napi::Function::New(env, StartSystemCapture));
     exports.Set("stopCapture", Napi::Function::New(env, StopCapture));
     exports.Set("isCapturing", Napi::Function::New(env, IsCapturing));
     return exports;
 }
 
 NODE_API_MODULE(app_audio_capture, Init)
+

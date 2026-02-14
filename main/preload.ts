@@ -48,6 +48,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
         return await ipcRenderer.invoke('start-process-capture', pid);
     },
 
+    // システム全体の音声キャプチャを開始 (New: Native WASAPI loopback)
+    startSystemCapture: async () => {
+        return await ipcRenderer.invoke('start-system-capture');
+    },
+
     // プロセスの音声キャプチャを停止
     stopProcessCapture: async () => {
         return await ipcRenderer.invoke('stop-process-capture');
@@ -224,15 +229,207 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
 
     // ============================================
-    // GitHub Manager APIs
+    // Nano Studio APIs
     // ============================================
-    githubInitialize: async (token: string) => {
-        return await ipcRenderer.invoke('github:initialize', token);
+    // Generic invoke for vNext features (history, cost, etc)
+    invoke: async (channel: string, ...args: any[]) => {
+        return await ipcRenderer.invoke(channel, ...args);
     },
-    githubInitRepo: async (path: string, name: string) => {
-        return await ipcRenderer.invoke('github:init-repo', path, name);
+
+    selectFile: async (extensions: string[], multi: boolean = false) => {
+        return await ipcRenderer.invoke('nano:select-file', extensions, multi);
     },
-    githubGetStatus: async (path: string) => {
-        return await ipcRenderer.invoke('github:get-status', path);
+    readImage: async (path: string) => {
+        return await ipcRenderer.invoke('nano:read-image', path);
+    },
+    nanoLoadPresets: async () => {
+        return await ipcRenderer.invoke('nano:load-presets');
+    },
+    nanoLoadPreset: async (name: string) => {
+        return await ipcRenderer.invoke('nano:load-preset', name);
+    },
+    nanoSavePreset: async (preset: any) => {
+        return await ipcRenderer.invoke('nano:save-preset', preset);
+    },
+    nanoGenerate: async (params: {
+        prompt: string;
+        negativePrompt?: string;
+        aspectRatio?: string;
+        resolution?: string;
+        referenceImage?: string | null;
+        referenceImages?: string[];
+        modelKey?: string;
+        customModelId?: string;
+        upscaleScale?: number;
+        mode?: string;
+        upscaleMethod?: string;
+        outputFormat?: string;
+        outputQuality?: number;
+    }) => {
+        return await ipcRenderer.invoke('nano:generate', params);
+    },
+    upscaleImage: async (path: string, scale: number) => {
+        return await ipcRenderer.invoke('nano:upscale-image', { imagePath: path, scale });
+    },
+    smoothImage: async (path: string) => {
+        return await ipcRenderer.invoke('nano:smooth-image', path);
+    },
+    // Live2D
+    cubismSendCommand: async (type: string, name: string, payload: any) => {
+        return await ipcRenderer.invoke('cubism:send-command', type, name, payload);
+    },
+    cubismGetStatus: async () => {
+        return await ipcRenderer.invoke('cubism:get-status');
+    },
+    cubismOnEvent: (callback: (event: any) => void) => {
+        const handler = (_: any, event: any) => callback(event);
+        ipcRenderer.on('cubism:event', handler);
+        ipcRenderer.on('cubism:response', handler);
+        return () => {
+            ipcRenderer.removeListener('cubism:event', handler);
+            ipcRenderer.removeListener('cubism:response', handler);
+        };
+    },
+
+    // ============================================
+    // TTS (Style-Bert-VITS2) APIs
+    // ============================================
+
+    // TTS ステータス取得
+    ttsGetStatus: async () => {
+        return await ipcRenderer.invoke('tts-get-status');
+    },
+
+    // TTS インストール
+    ttsInstall: async (options?: { dryRun?: boolean; force?: boolean }) => {
+        return await ipcRenderer.invoke('tts-install', options);
+    },
+
+    // TTS 修復
+    ttsRepair: async () => {
+        return await ipcRenderer.invoke('tts-repair');
+    },
+
+    // TTS アンインストール
+    ttsUninstall: async () => {
+        return await ipcRenderer.invoke('tts-uninstall');
+    },
+
+    // TTS サーバー開始
+    ttsStartServer: async (options?: { forceCpu?: boolean }) => {
+        return await ipcRenderer.invoke('tts-start-server', options);
+    },
+
+    // TTS サーバー停止
+    ttsStopServer: async () => {
+        return await ipcRenderer.invoke('tts-stop-server');
+    },
+
+    // モデル一覧取得
+    ttsListModels: async () => {
+        return await ipcRenderer.invoke('tts-list-models');
+    },
+
+    // モデル設定
+    ttsSetModel: async (modelId: string) => {
+        return await ipcRenderer.invoke('tts-set-model', modelId);
+    },
+
+    // 音声合成
+    ttsAnalyzeText: async (text: string) => {
+        return await ipcRenderer.invoke('tts-analyze-text', text);
+    },
+
+    ttsSynthesize: async (params: {
+        text: string;
+        modelId?: string;
+        style?: string;
+        speed?: number;
+        pitch?: number;
+        intonation?: number;
+        emotion?: string;
+    }) => {
+        return await ipcRenderer.invoke('tts-synthesize', params);
+    },
+
+    // プリセット一覧取得
+    ttsGetPresets: async () => {
+        return await ipcRenderer.invoke('tts-get-presets');
+    },
+
+    // プリセット保存
+    ttsSavePreset: async (preset: {
+        name: string;
+        modelId: string;
+        style: string;
+        speed: number;
+        pitch: number;
+        intonation: number;
+        emotion?: string;
+    }) => {
+        return await ipcRenderer.invoke('tts-save-preset', preset);
+    },
+
+    // プリセット更新
+    ttsUpdatePreset: async (id: string, updates: any) => {
+        return await ipcRenderer.invoke('tts-update-preset', id, updates);
+    },
+
+    // プリセット削除
+    ttsDeletePreset: async (id: string) => {
+        return await ipcRenderer.invoke('tts-delete-preset', id);
+    },
+
+    // GPU情報取得
+    ttsGetGpuInfo: async () => {
+        return await ipcRenderer.invoke('tts-get-gpu-info');
+    },
+
+    ttsInstallTrainingDeps: async () => {
+        return await ipcRenderer.invoke('tts:install-training-deps');
+    },
+
+    ttsSliceAudio: async (datasetName: string, inputDir: string, options?: any) => {
+        return await ipcRenderer.invoke('tts-slice-audio', datasetName, inputDir, options);
+    },
+
+    ttsTranscribeAudio: async (datasetName: string, options?: any) => {
+        return await ipcRenderer.invoke('tts-transcribe-audio', datasetName, options);
+    },
+
+    ttsSaveTranscription: async (datasetName: string, content: string) => {
+        return await ipcRenderer.invoke('tts-save-transcription', datasetName, content);
+    },
+
+    ttsInitializeTrainingConfig: async (datasetName: string) => {
+        return await ipcRenderer.invoke('tts-init-training-config', datasetName);
+    },
+
+    ttsGenerateBert: async (datasetName: string) => {
+        return await ipcRenderer.invoke('tts-generate-bert', datasetName);
+    },
+
+    ttsTrainModel: async (datasetName: string, options?: { speedup?: boolean; noProgressBar?: boolean; epochs?: number }) => {
+        return await ipcRenderer.invoke('tts-train-model', datasetName, options);
+    },
+
+    ttsCleanAudio: async (datasetName: string) => {
+        return await ipcRenderer.invoke('tts-clean-audio', datasetName);
+    },
+
+    ttsFilterAudio: async (datasetName: string) => {
+        return await ipcRenderer.invoke('tts-filter-audio', datasetName);
+    },
+
+    utilSelectDirectory: async () => {
+        return await ipcRenderer.invoke('util-select-directory');
+    },
+
+    ttsGetPathsConfig: async () => {
+        return await ipcRenderer.invoke('tts-get-paths-config');
+    },
+
+    ttsSetPathsConfig: async (config: { datasetRoot: string; assetsRoot: string }) => {
+        return await ipcRenderer.invoke('tts-set-paths-config', config);
     },
 });

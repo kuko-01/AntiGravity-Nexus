@@ -15,8 +15,7 @@
         "esModuleInterop": true,
         "allowSyntheticDefaultImports": true,
         "forceConsistentCasingInFileNames": true,
-        "outDir": "dist/main",
-        "rootDir": "main"
+        "outDir": "dist",
     },
     "include": [
         "main"

@@ -47,13 +47,19 @@ public:
     AudioCapture();
     ~AudioCapture();
 
+    // Process-specific capture (existing)
     bool StartCapture(DWORD processId, AudioCallback callback);
+    
+    // System-wide capture (new)
+    bool StartSystemCapture(AudioCallback callback);
+    
     void StopCapture();
     bool IsCapturing() const;
 
 private:
     void CaptureThread();
     bool InitializeLoopbackCapture(DWORD processId);
+    bool InitializeSystemLoopback(); // New: System-wide loopback
     void Cleanup();
 
     IAudioClient* m_audioClient = nullptr;
@@ -67,4 +73,5 @@ private:
     
     AudioCallback m_callback;
     DWORD m_targetProcessId = 0;
+    bool m_isSystemCapture = false; // New: Flag for system-wide capture
 };

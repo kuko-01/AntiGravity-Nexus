@@ -32,6 +32,14 @@ export function startCapture(
 ): CaptureResult;
 
 /**
+ * Start capturing system-wide audio (all applications)
+ * @param callback Callback function that receives audio data chunks
+ */
+export function startSystemCapture(
+    callback: (data: AudioData) => void
+): CaptureResult;
+
+/**
  * Stop the current audio capture
  */
 export function stopCapture(): void;

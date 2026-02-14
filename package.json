@@ -9,7 +9,8 @@
     "dev:electron": "wait-on http://localhost:5173 && tsc -p tsconfig.main.json && electron .",
     "build": "tsc -p tsconfig.main.json && vite build",
     "start": "electron .",
-    "dist": "npm run build && electron-builder"
+    "dist": "npm run build && electron-builder",
+    "bundle:sbv2": "powershell -ExecutionPolicy Bypass -File tools/build_sbv2_bundle.ps1"
   },
   "build": {
     "appId": "com.gemini.antigravity-nexus",
@@ -33,17 +34,19 @@
       {
         "from": "native/app-audio-capture/build/Release/app_audio_capture.node",
         "to": "native/app-audio-capture/build/Release/app_audio_capture.node"
-      }
+      },
+      "resources/tts"
     ]
   },
   "dependencies": {
     "@discordjs/opus": "^0.10.0",
     "@google-cloud/speech": "^7.2.1",
+    "@google/genai": "^1.38.0",
     "@google/generative-ai": "^0.21.0",
-    "@octokit/rest": "^18.12.0",
     "@types/adm-zip": "^0.5.7",
     "adm-zip": "^0.5.16",
     "dotenv": "^16.4.5",
+    "electron-updater": "^6.7.3",
     "mammoth": "^1.11.0",
     "nodejs-whisper": "^0.2.9",
     "officeparser": "^6.0.4",
@@ -51,7 +54,6 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^7.13.0",
-    "simple-git": "^3.30.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {

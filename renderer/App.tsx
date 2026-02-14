@@ -3,7 +3,10 @@ import { HashRouter as Router, Routes, Route } from 'react-router-dom';
 import HomeScreen from './screens/HomeScreen';
 import CaptureScreen from './screens/CaptureScreen';
 import OrganizerScreen from './screens/OrganizerScreen';
-import GitHubManagerScreen from './screens/GitHubManagerScreen';
+import NanoStudioScreen from './screens/NanoStudioScreen';
+import VoiceStudioScreen from './screens/VoiceStudioScreen';
+import TrainerScreen from './screens/TrainerScreen';
+import Live2DControllerScreen from './screens/Live2DControllerScreen';
 
 const App: React.FC = () => {
     return (
@@ -12,7 +15,10 @@ const App: React.FC = () => {
                 <Route path="/" element={<HomeScreen />} />
                 <Route path="/capture" element={<CaptureScreen />} />
                 <Route path="/organizer" element={<OrganizerScreen />} />
-                <Route path="/github" element={<GitHubManagerScreen />} />
+                <Route path="/nano" element={<NanoStudioScreen />} />
+                <Route path="/tts" element={<VoiceStudioScreen />} />
+                <Route path="/trainer" element={<TrainerScreen />} />
+                <Route path="/live2d" element={<Live2DControllerScreen />} />
             </Routes>
         </Router>
     );

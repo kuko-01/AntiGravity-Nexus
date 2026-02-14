@@ -203,6 +203,94 @@ bool AudioCapture::InitializeLoopbackCapture(DWORD processId) {
     return true;
 }
 
+// New: Initialize system-wide loopback capture using default render endpoint
+bool AudioCapture::InitializeSystemLoopback() {
+    std::cout << "[AudioCapture] InitializeSystemLoopback called" << std::endl;
+    
+    IMMDeviceEnumerator* deviceEnumerator = nullptr;
+    IMMDevice* device = nullptr;
+    
+    // Create device enumerator
+    HRESULT hr = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator),
+        nullptr,
+        CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator),
+        (void**)&deviceEnumerator
+    );
+    
+    if (FAILED(hr)) {
+        std::cout << "[AudioCapture] Failed to create device enumerator: 0x" << std::hex << hr << std::dec << std::endl;
+        return false;
+    }
+    
+    // Get default audio render endpoint (speakers/headphones)
+    hr = deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (FAILED(hr)) {
+        std::cout << "[AudioCapture] Failed to get default render endpoint: 0x" << std::hex << hr << std::dec << std::endl;
+        deviceEnumerator->Release();
+        return false;
+    }
+    
+    // Activate audio client
+    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&m_audioClient);
+    device->Release();
+    deviceEnumerator->Release();
+    
+    if (FAILED(hr) || !m_audioClient) {
+        std::cout << "[AudioCapture] Failed to activate audio client: 0x" << std::hex << hr << std::dec << std::endl;
+        return false;
+    }
+    
+    // For system loopback, use the same fixed format as per-app capture
+    // to ensure consistent audio quality and avoid noise issues
+    m_waveFormat = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
+    if (!m_waveFormat) {
+        std::cout << "[AudioCapture] Failed to allocate WAVEFORMATEX" << std::endl;
+        Cleanup();
+        return false;
+    }
+
+    m_waveFormat->wFormatTag = WAVE_FORMAT_PCM;
+    m_waveFormat->nChannels = 2;
+    m_waveFormat->nSamplesPerSec = 44100;
+    m_waveFormat->wBitsPerSample = 16;
+    m_waveFormat->nBlockAlign = m_waveFormat->nChannels * m_waveFormat->wBitsPerSample / 8;
+    m_waveFormat->nAvgBytesPerSec = m_waveFormat->nSamplesPerSec * m_waveFormat->nBlockAlign;
+    m_waveFormat->cbSize = 0;
+    
+    std::cout << "[AudioCapture] System capture format: " << m_waveFormat->nChannels << " channels, " 
+              << m_waveFormat->nSamplesPerSec << " Hz, " 
+              << m_waveFormat->wBitsPerSample << " bits" << std::endl;
+    
+    // Initialize audio client in LOOPBACK mode with auto convert PCM flag
+    hr = m_audioClient->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+        200000, // 20ms buffer
+        0,
+        m_waveFormat,
+        nullptr
+    );
+    
+    if (FAILED(hr)) {
+        std::cout << "[AudioCapture] IAudioClient::Initialize (system loopback) failed: 0x" << std::hex << hr << std::dec << std::endl;
+        Cleanup();
+        return false;
+    }
+    
+    // Get capture client
+    hr = m_audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&m_captureClient);
+    if (FAILED(hr)) {
+        std::cout << "[AudioCapture] GetService(IAudioCaptureClient) failed: 0x" << std::hex << hr << std::dec << std::endl;
+        Cleanup();
+        return false;
+    }
+    
+    std::cout << "[AudioCapture] System loopback initialization complete!" << std::endl;
+    return true;
+}
+
 bool AudioCapture::StartCapture(DWORD processId, AudioCallback callback) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -213,6 +301,7 @@ bool AudioCapture::StartCapture(DWORD processId, AudioCallback callback) {
     m_callback = callback;
     m_targetProcessId = processId;
     m_stopRequested = false;
+    m_isSystemCapture = false;
 
     if (!InitializeLoopbackCapture(processId)) {
         return false;
@@ -228,6 +317,38 @@ bool AudioCapture::StartCapture(DWORD processId, AudioCallback callback) {
     m_isCapturing = true;
     m_captureThread = std::thread(&AudioCapture::CaptureThread, this);
 
+    return true;
+}
+
+// New: Start system-wide audio capture
+bool AudioCapture::StartSystemCapture(AudioCallback callback) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_isCapturing) {
+        return false;
+    }
+
+    m_callback = callback;
+    m_targetProcessId = 0;
+    m_stopRequested = false;
+    m_isSystemCapture = true;
+
+    if (!InitializeSystemLoopback()) {
+        return false;
+    }
+
+    // Start the audio client
+    HRESULT hr = m_audioClient->Start();
+    if (FAILED(hr)) {
+        std::cout << "[AudioCapture] Failed to start system capture: 0x" << std::hex << hr << std::dec << std::endl;
+        Cleanup();
+        return false;
+    }
+
+    m_isCapturing = true;
+    m_captureThread = std::thread(&AudioCapture::CaptureThread, this);
+
+    std::cout << "[AudioCapture] System-wide capture started!" << std::endl;
     return true;
 }
 

@@ -32,18 +32,18 @@ const HomeScreen: React.FC = () => {
 
             <div style={{
                 display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-                gap: '24px',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                gap: '16px',
                 width: '100%',
-                maxWidth: '800px',
+                maxWidth: '900px',
             }}>
                 {/* Audio Capture Card */}
                 <div
                     onClick={() => handleNavigate('/capture')}
                     style={{
                         background: 'var(--color-surface)',
-                        borderRadius: '16px',
-                        padding: '32px',
+                        borderRadius: '12px',
+                        padding: '24px',
                         boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
                         cursor: 'pointer',
                         transition: 'transform 0.2s, box-shadow 0.2s',
@@ -63,12 +63,12 @@ const HomeScreen: React.FC = () => {
                     }}
                 >
                     <div style={{
-                        fontSize: '4rem',
-                        marginBottom: '16px'
+                        fontSize: '3rem',
+                        marginBottom: '12px'
                     }}>
                         🎙️
                     </div>
-                    <h2 style={{ fontSize: '1.5rem', marginBottom: '8px', color: 'var(--color-text)' }}>
+                    <h2 style={{ fontSize: '1.25rem', marginBottom: '4px', color: 'var(--color-text)' }}>
                         音声キャプチャ
                     </h2>
                     <p style={{ color: 'var(--color-text-secondary)' }}>
@@ -81,8 +81,8 @@ const HomeScreen: React.FC = () => {
                     onClick={() => handleNavigate('/organizer')}
                     style={{
                         background: 'var(--color-surface)',
-                        borderRadius: '16px',
-                        padding: '32px',
+                        borderRadius: '12px',
+                        padding: '24px',
                         boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
                         cursor: 'pointer',
                         transition: 'transform 0.2s, box-shadow 0.2s',
@@ -102,12 +102,12 @@ const HomeScreen: React.FC = () => {
                     }}
                 >
                     <div style={{
-                        fontSize: '4rem',
-                        marginBottom: '16px'
+                        fontSize: '3rem',
+                        marginBottom: '12px'
                     }}>
                         📂
                     </div>
-                    <h2 style={{ fontSize: '1.5rem', marginBottom: '8px', color: 'var(--color-text)' }}>
+                    <h2 style={{ fontSize: '1.25rem', marginBottom: '4px', color: 'var(--color-text)' }}>
                         フォルダ整理
                     </h2>
                     <p style={{ color: 'var(--color-text-secondary)' }}>
@@ -115,13 +115,13 @@ const HomeScreen: React.FC = () => {
                     </p>
                 </div>
 
-                {/* GitHub Manager Card */}
+                {/* Nano Studio Card */}
                 <div
-                    onClick={() => handleNavigate('/github')}
+                    onClick={() => handleNavigate('/nano')}
                     style={{
                         background: 'var(--color-surface)',
-                        borderRadius: '16px',
-                        padding: '32px',
+                        borderRadius: '12px',
+                        padding: '24px',
                         boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
                         cursor: 'pointer',
                         transition: 'transform 0.2s, box-shadow 0.2s',
@@ -141,16 +141,134 @@ const HomeScreen: React.FC = () => {
                     }}
                 >
                     <div style={{
-                        fontSize: '4rem',
-                        marginBottom: '16px'
+                        fontSize: '3rem',
+                        marginBottom: '12px'
                     }}>
-                        🐙
+                        🎨
                     </div>
-                    <h2 style={{ fontSize: '1.5rem', marginBottom: '8px', color: 'var(--color-text)' }}>
-                        GitHub Manager
+                    <h2 style={{ fontSize: '1.25rem', marginBottom: '4px', color: 'var(--color-text)' }}>
+                        Nano Studio
                     </h2>
                     <p style={{ color: 'var(--color-text-secondary)' }}>
-                        Visual StudioやVBAプロジェクトを安全にPrivateリポジトリで管理します。
+                        Gemini 2.5 Flashで高品質な画像を生成します。
+                    </p>
+                </div>
+
+
+                {/* Model Trainer Card */}
+                <div
+                    onClick={() => handleNavigate('/trainer')}
+                    style={{
+                        background: 'var(--color-surface)',
+                        borderRadius: '12px',
+                        padding: '24px',
+                        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
+                        cursor: 'pointer',
+                        transition: 'transform 0.2s, box-shadow 0.2s',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        textAlign: 'center',
+                        border: '1px solid var(--color-border)'
+                    }}
+                    onMouseEnter={e => {
+                        e.currentTarget.style.transform = 'translateY(-5px)';
+                        e.currentTarget.style.boxShadow = '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)';
+                    }}
+                    onMouseLeave={e => {
+                        e.currentTarget.style.transform = 'translateY(0)';
+                        e.currentTarget.style.boxShadow = '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)';
+                    }}
+                >
+                    <div style={{
+                        fontSize: '3rem',
+                        marginBottom: '12px'
+                    }}>
+                        🧠
+                    </div>
+                    <h2 style={{ fontSize: '1.25rem', marginBottom: '4px', color: 'var(--color-text)' }}>
+                        Model Trainer
+                    </h2>
+                    <p style={{ color: 'var(--color-text-secondary)' }}>
+                        自分だけの音声モデルを作成・学習します (Beta)。
+                    </p>
+                </div>
+
+                {/* Voice Studio Card */}
+                <div
+                    onClick={() => handleNavigate('/tts')}
+                    style={{
+                        background: 'var(--color-surface)',
+                        borderRadius: '12px',
+                        padding: '24px',
+                        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
+                        cursor: 'pointer',
+                        transition: 'transform 0.2s, box-shadow 0.2s',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        textAlign: 'center',
+                        border: '1px solid var(--color-border)'
+                    }}
+                    onMouseEnter={e => {
+                        e.currentTarget.style.transform = 'translateY(-5px)';
+                        e.currentTarget.style.boxShadow = '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)';
+                    }}
+                    onMouseLeave={e => {
+                        e.currentTarget.style.transform = 'translateY(0)';
+                        e.currentTarget.style.boxShadow = '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)';
+                    }}
+                >
+                    <div style={{
+                        fontSize: '3rem',
+                        marginBottom: '12px'
+                    }}>
+                        🗣️
+                    </div>
+                    <h2 style={{ fontSize: '1.25rem', marginBottom: '4px', color: 'var(--color-text)' }}>
+                        Voice Studio
+                    </h2>
+                    <p style={{ color: 'var(--color-text-secondary)' }}>
+                        Style-Bert-VITS2による高品質なローカル音声合成。
+                    </p>
+                </div>
+
+                {/* Live2D Controller Card */}
+                <div
+                    onClick={() => handleNavigate('/live2d')}
+                    style={{
+                        background: 'var(--color-surface)',
+                        borderRadius: '12px',
+                        padding: '24px',
+                        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
+                        cursor: 'pointer',
+                        transition: 'transform 0.2s, box-shadow 0.2s',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        textAlign: 'center',
+                        border: '1px solid var(--color-border)'
+                    }}
+                    onMouseEnter={e => {
+                        e.currentTarget.style.transform = 'translateY(-5px)';
+                        e.currentTarget.style.boxShadow = '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)';
+                    }}
+                    onMouseLeave={e => {
+                        e.currentTarget.style.transform = 'translateY(0)';
+                        e.currentTarget.style.boxShadow = '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)';
+                    }}
+                >
+                    <div style={{
+                        fontSize: '3rem',
+                        marginBottom: '12px'
+                    }}>
+                        👾
+                    </div>
+                    <h2 style={{ fontSize: '1.25rem', marginBottom: '4px', color: 'var(--color-text)' }}>
+                        Live2D Controller
+                    </h2>
+                    <p style={{ color: 'var(--color-text-secondary)' }}>
+                        Unityホスト経由でLive2Dモデルを制御します。
                     </p>
                 </div>
             </div>

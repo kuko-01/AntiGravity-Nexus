@@ -244,89 +244,136 @@ const CaptureScreen: React.FC = () => {
                     setIsCapturing(true); // 即座にフラグを立てて二重起動防止
 
                     if (captureSource === 'system') {
-                        // システム音声 + マイク (GCPモード)
-                        let audioBuffer: number[] = [];
-                        let micAudioBuffer: number[] = [];
-                        let lastTranscribeTime = Date.now();
-                        const TRANSCRIBE_INTERVAL = 10000;
+                        // システム音声キャプチャを開始（ネイティブWASAPIループバック方式）
+                        const startResult = await window.electronAPI.startSystemCapture();
+                        if (!startResult.success) {
+                            throw new Error(startResult.error || 'システム音声キャプチャの開始に失敗しました');
+                        }
 
-                        const micDeviceId = selectedDeviceId ? selectedDeviceId : undefined;
-
-                        await audioCaptureService.startCaptureFromSystemAudio({
-                            onError: (err) => {
-                                console.error('Audio capture error:', err);
-                                setError(err.message);
-                                setIsCapturing(false);
-                            },
-                            onRawAudioData: async (data) => {
-                                if (data.source === 'mic') {
-                                    micAudioBuffer = micAudioBuffer.concat(data.buffer);
-                                } else {
-                                    // アプリ内で音声再生中はキャプチャしない (自己ループ防止)
-                                    if (!isAppPlaying) {
-                                        audioBuffer = audioBuffer.concat(data.buffer);
+                        // マイクも有効な場合は並列でマイクキャプチャを開始
+                        if (includeMic) {
+                            const micDeviceId = selectedDeviceId ? selectedDeviceId : '';
+                            try {
+                                await window.electronAPI.startMicContinuousRecording();
+                                await audioCaptureService.startMicOnlyCapture(micDeviceId, {
+                                    onError: (err) => {
+                                        console.error('[System+Mic] Mic capture error:', err);
+                                    },
+                                    onRawAudioData: async (data) => {
+                                        if (data.source === 'mic') {
+                                            await window.electronAPI.appendMicAudio(data.buffer, data.sampleRate, data.channels);
+                                        }
                                     }
+                                });
+                            } catch (micErr) {
+                                console.warn('[System+Mic] Failed to start mic capture:', micErr);
+                            }
+                        }
+
+                        // 連続録音方式: ファイルに録音し、30秒ごとにセグメントを読み取って文字起こし
+                        let lastTranscribedSamples = 0;
+                        let lastTranscribeTime = Date.now();
+                        const TRANSCRIBE_INTERVAL = 30000;
+                        let isTranscribing = false;
+
+                        window.electronAPI.onProcessAudioMetadata((metadata) => {
+                            const now = Date.now();
+                            const newSamples = metadata.totalSamples - lastTranscribedSamples;
+                            const minSamples = metadata.sampleRate * 5; // 最低5秒分
+
+                            if (now - lastTranscribeTime >= TRANSCRIBE_INTERVAL && newSamples >= minSamples && !isTranscribing) {
+                                const startSample = lastTranscribedSamples;
+                                const endSample = metadata.totalSamples;
+                                lastTranscribedSamples = endSample;
+                                lastTranscribeTime = now;
+
+                                // UIスレッドをブロックしないよう非同期で実行
+                                isTranscribing = true;
+                                setTimeout(async () => {
+                                    try {
+                                        const result = await window.electronAPI.transcribeRecordingSegment(startSample, endSample);
+
+                                        if (result.success && result.text) {
+                                            // 話者タグを抽出（最も多く出現するタグ、またはなければundefined）
+                                            let speakerTag: number | undefined;
+                                            if (result.words && result.words.length > 0) {
+                                                const tagCounts: Record<number, number> = {};
+                                                result.words.forEach(w => {
+                                                    if (w.speakerTag && w.speakerTag > 0) {
+                                                        tagCounts[w.speakerTag] = (tagCounts[w.speakerTag] || 0) + 1;
+                                                    }
+                                                });
+                                                const entries = Object.entries(tagCounts);
+                                                if (entries.length > 0) {
+                                                    speakerTag = parseInt(entries.sort((a, b) => b[1] - a[1])[0][0]);
+                                                }
+                                            }
+                                            // システム音声のログエントリを追加
+                                            addLogEntry(result.text, speakerTag, result.audioBuffer, metadata.sampleRate, metadata.channels);
+                                        }
+                                    } catch (err) {
+                                        console.error('[System] Failed to transcribe segment:', err);
+                                    } finally {
+                                        isTranscribing = false;
+                                    }
+                                }, 0);
+                            }
+                        });
+
+                        // マイクが有効な場合、マイクも30秒ごとに文字起こし
+                        if (includeMic) {
+                            let lastMicTranscribedSamples = 0;
+                            let lastMicTranscribeTime = Date.now();
+                            const MIC_TRANSCRIBE_INTERVAL = 30000;
+                            let isMicTranscribing = false;
+
+                            const checkMicInterval = setInterval(async () => {
+                                if (!isCapturing) {
+                                    clearInterval(checkMicInterval);
+                                    return;
                                 }
+
+                                const micStatus = await window.electronAPI.getMicRecordingStatus();
+                                if (!micStatus.isRecording) return;
 
                                 const now = Date.now();
-                                const diff = now - lastTranscribeTime;
+                                const totalMicSamples = micStatus.totalSamples;
+                                const newMicSamples = totalMicSamples - lastMicTranscribedSamples;
+                                const minMicSamples = micStatus.sampleRate * 5;
 
-                                if (diff >= TRANSCRIBE_INTERVAL) {
-                                    lastTranscribeTime = now;
+                                if (now - lastMicTranscribeTime >= MIC_TRANSCRIBE_INTERVAL && newMicSamples >= minMicSamples && !isMicTranscribing) {
+                                    const startSample = lastMicTranscribedSamples;
+                                    const endSample = totalMicSamples;
+                                    lastMicTranscribedSamples = endSample;
+                                    lastMicTranscribeTime = now;
 
-                                    // 1. システム音声 (GCP)
-                                    if (audioBuffer.length > 0) {
-                                        const bufferToSend = [...audioBuffer];
-                                        audioBuffer = []; // CLEAR
-
-                                        try {
-                                            // Int16[] -> Uint8[] に変換して送信 (IPCでのデータ破損防止)
-                                            const i16 = new Int16Array(bufferToSend);
-                                            const u8 = new Uint8Array(i16.buffer);
-                                            const bytesToSend = Array.from(u8);
-
-                                            const result = await window.electronAPI.transcribeLinear16(
-                                                bytesToSend,
-                                                data.sampleRate,
-                                                data.channels
-                                            );
-                                            if (result.success && result.text) {
-                                                // 修正: 再生・保存用にバイト配列とサンプルレートを渡す
-                                                addLogEntry(result.text, undefined, bytesToSend, data.sampleRate, data.channels);
+                                    isMicTranscribing = true;
+                                    try {
+                                        const result = await window.electronAPI.transcribeMicSegment(startSample, endSample);
+                                        if (result.success && result.text) {
+                                            let speakerTag: number | undefined;
+                                            if (result.words && result.words.length > 0) {
+                                                const tagCounts: Record<number, number> = {};
+                                                result.words.forEach(w => {
+                                                    if (w.speakerTag && w.speakerTag > 0) {
+                                                        tagCounts[w.speakerTag] = (tagCounts[w.speakerTag] || 0) + 1;
+                                                    }
+                                                });
+                                                const entries = Object.entries(tagCounts);
+                                                if (entries.length > 0) {
+                                                    speakerTag = parseInt(entries.sort((a, b) => b[1] - a[1])[0][0]);
+                                                }
                                             }
-                                        } catch (err) {
-                                            console.error('[GCP/System] Error:', err);
+                                            addLogEntry(result.text, speakerTag, result.audioBuffer, micStatus.sampleRate, 1, false, 'マイク');
                                         }
-                                    }
-
-                                    // 2. マイク音声 (GCP)
-                                    if (micAudioBuffer.length > 0) {
-                                        const bufferToSend = [...micAudioBuffer];
-                                        micAudioBuffer = []; // CLEAR
-
-                                        try {
-                                            // Int16[] -> Uint8[] に変換
-                                            const i16 = new Int16Array(bufferToSend);
-                                            const u8 = new Uint8Array(i16.buffer);
-                                            const bytesToSend = Array.from(u8);
-
-                                            const result = await window.electronAPI.transcribeLinear16(
-                                                bytesToSend,
-                                                data.sampleRate,
-                                                data.channels
-                                            );
-                                            if (result.success && result.text) {
-                                                // 修正: 再生・保存用にバイト配列とサンプルレートを渡す
-                                                // マイクとしてラベル付け
-                                                addLogEntry(result.text, undefined, bytesToSend, data.sampleRate, data.channels, false, 'マイク');
-                                            }
-                                        } catch (err) {
-                                            console.error('[GCP/Mic] Error:', err);
-                                        }
+                                    } catch (e) {
+                                        console.error('[System+Mic] Mic transcribe segment error:', e);
+                                    } finally {
+                                        isMicTranscribing = false;
                                     }
                                 }
-                            }
-                        }, micDeviceId);
+                            }, 1000); // 1秒ごとにチェック
+                        }
                     } else if (captureSource === 'app') {
                         // プロセスが選択されている場合のみプロセスキャプチャを開始
                         if (selectedProcessPid) {
@@ -339,7 +386,7 @@ const CaptureScreen: React.FC = () => {
                             // 連続録音方式: ファイルに録音し、10秒ごとにセグメントを読み取って文字起こし
                             let lastTranscribedSamples = 0;
                             let lastTranscribeTime = Date.now();
-                            const TRANSCRIBE_INTERVAL = 10000;
+                            const TRANSCRIBE_INTERVAL = 30000;
                             let isTranscribing = false;
 
                             window.electronAPI.onProcessAudioMetadata((metadata) => {
@@ -360,8 +407,22 @@ const CaptureScreen: React.FC = () => {
                                             const result = await window.electronAPI.transcribeRecordingSegment(startSample, endSample);
 
                                             if (result.success && result.text) {
+                                                // 話者タグを抽出（最も多く出現するタグ、またはなければundefined）
+                                                let speakerTag: number | undefined;
+                                                if (result.words && result.words.length > 0) {
+                                                    const tagCounts: Record<number, number> = {};
+                                                    result.words.forEach(w => {
+                                                        if (w.speakerTag && w.speakerTag > 0) {
+                                                            tagCounts[w.speakerTag] = (tagCounts[w.speakerTag] || 0) + 1;
+                                                        }
+                                                    });
+                                                    const entries = Object.entries(tagCounts);
+                                                    if (entries.length > 0) {
+                                                        speakerTag = parseInt(entries.sort((a, b) => b[1] - a[1])[0][0]);
+                                                    }
+                                                }
                                                 // 音声バッファも取得できるので再生可能
-                                                addLogEntry(result.text, undefined, result.audioBuffer, metadata.sampleRate, metadata.channels);
+                                                addLogEntry(result.text, speakerTag, result.audioBuffer, metadata.sampleRate, metadata.channels);
                                             }
                                         } catch (err) {
                                             console.error('[App] Failed to transcribe segment:', err);
@@ -383,7 +444,7 @@ const CaptureScreen: React.FC = () => {
 
                             let lastMicTranscribedSamples = 0;
                             let lastMicTranscribeTime = Date.now();
-                            const MIC_TRANSCRIBE_INTERVAL = 15000;
+                            const MIC_TRANSCRIBE_INTERVAL = 30000;
                             let isMicTranscribing = false;
 
                             // IPC呼び出し頻度を下げるためのバッファリング
@@ -427,7 +488,21 @@ const CaptureScreen: React.FC = () => {
                                                     try {
                                                         const result = await window.electronAPI.transcribeMicSegment(startSample, endSample);
                                                         if (result.success && result.text) {
-                                                            addLogEntry(result.text, undefined, result.audioBuffer, currentMicSampleRate, 1, false, 'マイク');
+                                                            // 話者タグを抽出（マイクは customLabel を優先するが、話者が複数居れば表示）
+                                                            let speakerTag: number | undefined;
+                                                            if (result.words && result.words.length > 0) {
+                                                                const tagCounts: Record<number, number> = {};
+                                                                result.words.forEach(w => {
+                                                                    if (w.speakerTag && w.speakerTag > 0) {
+                                                                        tagCounts[w.speakerTag] = (tagCounts[w.speakerTag] || 0) + 1;
+                                                                    }
+                                                                });
+                                                                const entries = Object.entries(tagCounts);
+                                                                if (entries.length > 0) {
+                                                                    speakerTag = parseInt(entries.sort((a, b) => b[1] - a[1])[0][0]);
+                                                                }
+                                                            }
+                                                            addLogEntry(result.text, speakerTag, result.audioBuffer, currentMicSampleRate, 1, false, 'マイク');
                                                         }
                                                     } catch (e) {
                                                         console.error('[App] Mic transcribe segment error:', e);
@@ -570,7 +645,7 @@ const CaptureScreen: React.FC = () => {
                                     }
                                 }
                             }
-                        }, micDeviceId);
+                        }, micDeviceId, includeMic);
                     } else if (captureSource === 'app') {
                         // Geminiモードでのプロセスキャプチャ
                         const startResult = await window.electronAPI.startProcessCapture(selectedProcessPid!);
@@ -622,23 +697,37 @@ const CaptureScreen: React.FC = () => {
                     webSpeechToTextService.stopListening();
                     setInterimText('');
                 } else {
-                    if (captureSource === 'app') {
+
+                    // アプリまたはシステム音声キャプチャの場合（ネイティブ連携）
+                    if (captureSource === 'app' || captureSource === 'system') {
                         try {
+                            // ネイティブキャプチャ停止 (システムもプロセスも実体は同じ)
                             await window.electronAPI.stopProcessCapture();
                         } catch (err) {
-                            console.error('[App] Error stopping process capture:', err);
+                            console.error('[App/System] Error stopping native capture:', err);
                         }
+
+                        // マイク連続録音の停止
+                        try {
+                            await window.electronAPI.stopMicContinuousRecording();
+                        } catch (err) {
+                            console.error('[App/System] Error stopping mic recording:', err);
+                        }
+
                         try {
                             window.electronAPI.offProcessAudioData();
                         } catch (err) {
-                            console.error('[App] Error removing audio listener:', err);
+                            console.error('[App/System] Error removing audio listener:', err);
                         }
-                        // マイクキャプチャも停止 (AudioCaptureServiceを使用するように変更したため)
+
+                        // AudioCaptureService (Web APIマイクなど) の停止
                         await audioCaptureService.stopCapture();
                     } else {
+                        // デバイス（Web API）キャプチャの場合
                         await audioCaptureService.stopCapture();
                     }
                 }
+
             } catch (err) {
                 console.error('[App] Error during stop:', err);
             }
@@ -1142,6 +1231,26 @@ const CaptureScreen: React.FC = () => {
                                     disabled={isCapturing}
                                     onRefresh={refreshAudioDevices}
                                 />
+                            )}
+                            {/* システム音声モードの場合もマイクトグルとデバイス選択を表示 */}
+                            {captureSource === 'system' && (
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    <ToggleSwitch
+                                        isOn={includeMic}
+                                        onChange={setIncludeMic}
+                                        disabled={isCapturing}
+                                        label="🎤 マイク"
+                                    />
+                                    {includeMic && (
+                                        <AudioDeviceSelector
+                                            devices={audioDevices}
+                                            selectedDeviceId={selectedDeviceId}
+                                            onDeviceChange={setSelectedDeviceId}
+                                            disabled={isCapturing}
+                                            onRefresh={refreshAudioDevices}
+                                        />
+                                    )}
+                                </div>
                             )}
                             {/* アプリモードの場合のみプロセス選択を表示 */}
                             {captureSource === 'app' && (

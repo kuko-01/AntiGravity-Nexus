@@ -5,7 +5,7 @@ npm_install_log.txt
 # Environment variables & Secrets
 .env
 .env.*
-gcp-credentials.json
+gcp-credentials*.json
 
 # Builds & Dist
 dist
@@ -29,3 +29,12 @@ transcript-*.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Large bundled artifacts
+.tmp/
+output/
+resources/tts/sbv2_bundle/wheels/
+resources/tts/sbv2_bundle/python_portable.zip
+resources/tts/sbv2_bundle/sbv2_app.zip
+*.whl
+*.tar.gz

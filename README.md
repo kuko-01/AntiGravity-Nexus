@@ -61,6 +61,13 @@ npm run build
 npm start
 ```
 
+### TTS/RVC バンドル生成
+
+```bash
+npm run bundle:sbv2
+npm run bundle:rvc
+```
+
 ## 使用方法
 
 1. **アプリを起動**

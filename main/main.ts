@@ -10,6 +10,9 @@ import { autoUpdater } from 'electron-updater';
 import { CubismService } from './live2d/CubismService';
 import { Sbv2Service } from './services/tts/Sbv2Service';
 import { TtsSynthesizeParams, TtsPreset } from '../types/tts';
+import { RvcService } from './services/tts/RvcService';
+import { VoicePipelineService } from './services/tts/VoicePipelineService';
+import { RvcConvertParams, RvcPreset, VoiceSynthesizeParams } from '../types/rvc';
 
 // .env ファイルを読み込み
 // .env ファイルを読み込み
@@ -2243,6 +2246,178 @@ ipcMain.handle('tts-filter-audio', async (_event, datasetName: string) => {
     } catch (error) {
         console.error('Filter audio error:', error);
         return { success: false, error: { code: 'E_UNKNOWN', message: error instanceof Error ? error.message : 'Unknown error' } };
+    }
+});
+
+// RVC ステータス取得
+ipcMain.handle('rvc-get-status', async () => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return service.getStatus();
+    } catch (error) {
+        console.error('[RVC] Get status error:', error);
+        return { installState: 'not_installed', runtimeState: 'stopped' };
+    }
+});
+
+// RVC インストール
+ipcMain.handle('rvc-install', async (_event, options?: { dryRun?: boolean; force?: boolean }) => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return await service.install(options);
+    } catch (error) {
+        console.error('[RVC] Install error:', error);
+        return { success: false, error: { code: 'E_UNKNOWN', message: String(error) } };
+    }
+});
+
+// RVC 修復
+ipcMain.handle('rvc-repair', async () => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return await service.repair();
+    } catch (error) {
+        console.error('[RVC] Repair error:', error);
+        return { success: false, error: { code: 'E_UNKNOWN', message: String(error) } };
+    }
+});
+
+// RVC アンインストール
+ipcMain.handle('rvc-uninstall', async () => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return await service.uninstall();
+    } catch (error) {
+        console.error('[RVC] Uninstall error:', error);
+        return { success: false, error: { code: 'E_UNKNOWN', message: String(error) } };
+    }
+});
+
+// RVC サーバー開始
+ipcMain.handle('rvc-start-server', async (_event, options?: { forceCpu?: boolean }) => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return await service.startServer(options);
+    } catch (error) {
+        console.error('[RVC] Start server error:', error);
+        return { success: false, error: { code: 'E_SERVER_FAILED', message: String(error) } };
+    }
+});
+
+// RVC サーバー停止
+ipcMain.handle('rvc-stop-server', async () => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return await service.stopServer();
+    } catch (error) {
+        console.error('[RVC] Stop server error:', error);
+        return { success: false };
+    }
+});
+
+// RVC GPU情報取得
+ipcMain.handle('rvc-get-gpu-info', async () => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return await service.getGpuInfo();
+    } catch (error) {
+        console.error('[RVC] Get GPU info error:', error);
+        return {
+            cudaAvailable: false,
+            cudaVersion: null,
+            torchVersion: 'Unknown',
+            deviceCount: 0,
+            currentDevice: 'none',
+            devices: [`Error: ${String(error)}`]
+        };
+    }
+});
+
+// RVC モデル一覧取得
+ipcMain.handle('rvc-list-models', async () => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return await service.listModels();
+    } catch (error) {
+        console.error('[RVC] List models error:', error);
+        return [];
+    }
+});
+
+// RVC モデル設定
+ipcMain.handle('rvc-set-model', async (_event, modelId: string) => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return await service.setModel(modelId);
+    } catch (error) {
+        console.error('[RVC] Set model error:', error);
+        return { success: false, error: { code: 'E_MODEL_FAILED', message: String(error) } };
+    }
+});
+
+// RVC 変換
+ipcMain.handle('rvc-convert', async (_event, params: RvcConvertParams) => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return await service.convert(params);
+    } catch (error) {
+        console.error('[RVC] Convert error:', error);
+        return { success: false, error: { code: 'E_CONVERT_FAILED', message: String(error) } };
+    }
+});
+
+// RVC プリセット一覧取得
+ipcMain.handle('rvc-get-presets', async () => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return service.getPresets();
+    } catch (error) {
+        console.error('[RVC] Get presets error:', error);
+        return [];
+    }
+});
+
+// RVC プリセット保存
+ipcMain.handle('rvc-save-preset', async (_event, preset: Omit<RvcPreset, 'id' | 'createdAt' | 'updatedAt'>) => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return service.savePreset(preset);
+    } catch (error) {
+        console.error('[RVC] Save preset error:', error);
+        return null;
+    }
+});
+
+// RVC プリセット更新
+ipcMain.handle('rvc-update-preset', async (_event, id: string, updates: Partial<RvcPreset>) => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return service.updatePreset(id, updates);
+    } catch (error) {
+        console.error('[RVC] Update preset error:', error);
+        return null;
+    }
+});
+
+// RVC プリセット削除
+ipcMain.handle('rvc-delete-preset', async (_event, id: string) => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return service.deletePreset(id);
+    } catch (error) {
+        console.error('[RVC] Delete preset error:', error);
+        return false;
+    }
+});
+
+// SBV2 / RVC 統合パイプライン
+ipcMain.handle('voice-synthesize', async (_event, params: VoiceSynthesizeParams) => {
+    try {
+        const service = VoicePipelineService.getInstance(ttsResourcesPath);
+        return await service.synthesize(params);
+    } catch (error) {
+        console.error('[VoicePipeline] Synthesize error:', error);
+        return { success: false, error: { code: 'E_UNKNOWN', message: String(error) } };
     }
 });
 

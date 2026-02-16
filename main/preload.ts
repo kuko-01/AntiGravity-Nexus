@@ -386,7 +386,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
 
     ttsInstallTrainingDeps: async () => {
-        return await ipcRenderer.invoke('tts:install-training-deps');
+        return await ipcRenderer.invoke('tts-install-training-deps');
     },
 
     ttsSliceAudio: async (datasetName: string, inputDir: string, options?: any) => {
@@ -421,8 +421,76 @@ contextBridge.exposeInMainWorld('electronAPI', {
         return await ipcRenderer.invoke('tts-filter-audio', datasetName);
     },
 
+    // ============================================
+    // RVC (Voice Conversion) APIs
+    // ============================================
+
+    rvcGetStatus: async () => {
+        return await ipcRenderer.invoke('rvc-get-status');
+    },
+
+    rvcInstall: async (options?: { dryRun?: boolean; force?: boolean }) => {
+        return await ipcRenderer.invoke('rvc-install', options);
+    },
+
+    rvcRepair: async () => {
+        return await ipcRenderer.invoke('rvc-repair');
+    },
+
+    rvcUninstall: async () => {
+        return await ipcRenderer.invoke('rvc-uninstall');
+    },
+
+    rvcStartServer: async (options?: { forceCpu?: boolean }) => {
+        return await ipcRenderer.invoke('rvc-start-server', options);
+    },
+
+    rvcStopServer: async () => {
+        return await ipcRenderer.invoke('rvc-stop-server');
+    },
+
+    rvcGetGpuInfo: async () => {
+        return await ipcRenderer.invoke('rvc-get-gpu-info');
+    },
+
+    rvcListModels: async () => {
+        return await ipcRenderer.invoke('rvc-list-models');
+    },
+
+    rvcSetModel: async (modelId: string) => {
+        return await ipcRenderer.invoke('rvc-set-model', modelId);
+    },
+
+    rvcConvert: async (params: any) => {
+        return await ipcRenderer.invoke('rvc-convert', params);
+    },
+
+    rvcGetPresets: async () => {
+        return await ipcRenderer.invoke('rvc-get-presets');
+    },
+
+    rvcSavePreset: async (preset: any) => {
+        return await ipcRenderer.invoke('rvc-save-preset', preset);
+    },
+
+    rvcUpdatePreset: async (id: string, updates: any) => {
+        return await ipcRenderer.invoke('rvc-update-preset', id, updates);
+    },
+
+    rvcDeletePreset: async (id: string) => {
+        return await ipcRenderer.invoke('rvc-delete-preset', id);
+    },
+
+    // ============================================
+    // Voice Pipeline APIs
+    // ============================================
+
+    voiceSynthesize: async (params: any) => {
+        return await ipcRenderer.invoke('voice-synthesize', params);
+    },
+
     utilSelectDirectory: async () => {
-        return await ipcRenderer.invoke('util-select-directory');
+        return await ipcRenderer.invoke('util:select-directory');
     },
 
     ttsGetPathsConfig: async () => {

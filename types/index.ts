@@ -1,4 +1,5 @@
 import { TtsError, SliceOptions, TranscribeOptions } from './tts';
+import { RvcConvertParams, RvcPreset, VoiceSynthesizeParams } from './rvc';
 
 // 画面/ウィンドウソース情報
 export interface DesktopSource {
@@ -86,6 +87,23 @@ export const IPC_CHANNELS = {
     TTS_SAVE_TRANSCRIPTION: 'tts-save-transcription',
     TTS_INIT_TRAINING_CONFIG: 'tts-init-training-config',
     TTS_GENERATE_BERT: 'tts-generate-bert',
+    // RVC
+    RVC_GET_STATUS: 'rvc-get-status',
+    RVC_INSTALL: 'rvc-install',
+    RVC_REPAIR: 'rvc-repair',
+    RVC_UNINSTALL: 'rvc-uninstall',
+    RVC_START_SERVER: 'rvc-start-server',
+    RVC_STOP_SERVER: 'rvc-stop-server',
+    RVC_GET_GPU_INFO: 'rvc-get-gpu-info',
+    RVC_LIST_MODELS: 'rvc-list-models',
+    RVC_SET_MODEL: 'rvc-set-model',
+    RVC_CONVERT: 'rvc-convert',
+    RVC_GET_PRESETS: 'rvc-get-presets',
+    RVC_SAVE_PRESET: 'rvc-save-preset',
+    RVC_UPDATE_PRESET: 'rvc-update-preset',
+    RVC_DELETE_PRESET: 'rvc-delete-preset',
+    // Pipeline
+    VOICE_SYNTHESIZE: 'voice-synthesize',
 } as const;
 
 // ログ保存用の型（DateをstringにシリアライズするためLogEntryとは別）
@@ -193,6 +211,25 @@ export interface ElectronAPI {
     ttsDeletePreset: (id: string) => Promise<boolean>;
     ttsGetPathsConfig: () => Promise<{ datasetRoot: string; assetsRoot: string }>;
     ttsSetPathsConfig: (config: { datasetRoot: string; assetsRoot: string }) => Promise<{ success: boolean; error?: string }>;
+
+    // RVC (Voice Conversion) APIs
+    rvcGetStatus: () => Promise<any>;
+    rvcInstall: (options?: { dryRun?: boolean; force?: boolean }) => Promise<any>;
+    rvcRepair: () => Promise<any>;
+    rvcUninstall: () => Promise<any>;
+    rvcStartServer: (options?: { forceCpu?: boolean }) => Promise<any>;
+    rvcStopServer: () => Promise<any>;
+    rvcGetGpuInfo: () => Promise<any>;
+    rvcListModels: () => Promise<any[]>;
+    rvcSetModel: (modelId: string) => Promise<any>;
+    rvcConvert: (params: RvcConvertParams) => Promise<any>;
+    rvcGetPresets: () => Promise<RvcPreset[]>;
+    rvcSavePreset: (preset: Omit<RvcPreset, 'id' | 'createdAt' | 'updatedAt'>) => Promise<any>;
+    rvcUpdatePreset: (id: string, updates: Partial<RvcPreset>) => Promise<any>;
+    rvcDeletePreset: (id: string) => Promise<boolean>;
+
+    // Voice Pipeline (SBV2 + RVC)
+    voiceSynthesize: (params: VoiceSynthesizeParams) => Promise<any>;
 }
 
 // Nano Studio Types

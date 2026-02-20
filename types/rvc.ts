@@ -196,6 +196,57 @@ export interface RvcStartOptions {
 
 export type VoicePipelineMode = 'sbv2' | 'rvc' | 'sbv2+rvc';
 
+export type VoiceEmotionLabelHint = 'neutral' | 'joy' | 'sad' | 'angry' | 'excited';
+
+export interface VoiceSbv2WaveEditSettings {
+    vibratoDepth?: number;
+    vibratoRateHz?: number;
+    dynamicBoost?: number;
+}
+
+export interface VoiceExpressionSettings {
+    singing?: boolean;
+    autoEmotionRefine?: boolean;
+    emotionLabelHint?: VoiceEmotionLabelHint;
+    emotionIntensityHint?: number;
+    sbv2WaveEdit?: VoiceSbv2WaveEditSettings;
+}
+
+export interface VoiceOutputSettings {
+    format?: 'wav' | 'flac';
+    sampleRate?: number;
+    normalize?: boolean;
+    enhanceFinalAudio?: boolean;
+    autoAnalyzeAndEnhance?: boolean;
+    persistQualityLearning?: boolean;
+    qualityProfileId?: string;
+}
+
+export interface VoiceAudioQualityMetrics {
+    sampleRate: number;
+    channels: number;
+    durationMs: number;
+    peakDb: number;
+    rmsDb: number;
+    crestFactorDb: number;
+    clippingRatio: number;
+    nearClipRatio: number;
+    silenceRatio: number;
+    dcOffset: number;
+    zeroCrossRate: number;
+    qualityScore: number;
+}
+
+export interface VoiceAudioEnhancementReport {
+    analyzed: boolean;
+    autoEnhanced: boolean;
+    actions: string[];
+    warnings?: string[];
+    profileId?: string;
+    before?: VoiceAudioQualityMetrics;
+    after?: VoiceAudioQualityMetrics;
+}
+
 export interface VoiceSynthesizeParams {
     text: string;
     mode: VoicePipelineMode;
@@ -213,13 +264,14 @@ export interface VoiceSynthesizeParams {
         assistTextWeight?: number;
         postFilter?: boolean;
         filterStrength?: number;
+        preserveLineBreaks?: boolean;
+        chunkPauseMs?: number;
+        lineSplit?: boolean;
+        splitInterval?: number;
     };
     rvc?: RvcConvertParams;
-    output?: {
-        format?: 'wav' | 'flac';
-        sampleRate?: number;
-        normalize?: boolean;
-    };
+    expression?: VoiceExpressionSettings;
+    output?: VoiceOutputSettings;
 }
 
 export interface VoiceSynthesizeResult {
@@ -232,7 +284,9 @@ export interface VoiceSynthesizeResult {
     stages?: {
         sbv2Ms?: number;
         rvcMs?: number;
+        analysisMs?: number;
         totalMs?: number;
     };
+    analysis?: VoiceAudioEnhancementReport;
     error?: { code: string; message: string };
 }

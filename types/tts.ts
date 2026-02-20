@@ -147,6 +147,12 @@ export interface TtsSynthesizeParams {
     // Audio Enhancement (Post-Processing)
     postFilter?: boolean;      // Apply DeepFilterNet post-processing
     filterStrength?: number;   // 0.0 - 1.0, denoise strength (0.3-0.5 for whisper)
+
+    // Singing-oriented synthesis hints
+    preserveLineBreaks?: boolean; // keep lyric line boundaries when chunking text
+    chunkPauseMs?: number;        // pause between generated chunks (ms)
+    lineSplit?: boolean;          // let SBV2 split by line breaks internally
+    splitInterval?: number;       // seconds between SBV2 internal line splits
 }
 
 export interface TtsSynthesizeResult {

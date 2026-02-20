@@ -1,4 +1,9 @@
-import { VoicePipelineMode, VoiceSynthesizeResult } from './rvc';
+import {
+    VoiceExpressionSettings,
+    VoiceOutputSettings,
+    VoicePipelineMode,
+    VoiceSynthesizeResult,
+} from './rvc';
 
 export type CharacterEmotionLabel = 'neutral' | 'joy' | 'sad' | 'angry' | 'excited';
 
@@ -44,6 +49,23 @@ export interface CharacterConversationSettings {
     user?: UserPersonaSettings;
 }
 
+export interface CharacterLearningRequest {
+    singingTrainingMode?: boolean;
+}
+
+export interface CharacterLearningResult {
+    success: boolean;
+    sourceUrl?: string;
+    runDir?: string;
+    sourceAudioPath?: string;
+    vocalWavPath?: string;
+    accompanimentWavPath?: string;
+    datasetInputPath?: string;
+    method?: 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+    warning?: string;
+    error?: string;
+}
+
 export interface CharacterVoiceRequest {
     mode?: VoicePipelineMode;
     sbv2?: {
@@ -60,6 +82,10 @@ export interface CharacterVoiceRequest {
         assistTextWeight?: number;
         postFilter?: boolean;
         filterStrength?: number;
+        preserveLineBreaks?: boolean;
+        chunkPauseMs?: number;
+        lineSplit?: boolean;
+        splitInterval?: number;
     };
     rvc?: {
         modelId?: string;
@@ -73,6 +99,8 @@ export interface CharacterVoiceRequest {
         rmsMixRate?: number;
         resampleSr?: number;
     };
+    expression?: VoiceExpressionSettings;
+    output?: VoiceOutputSettings;
 }
 
 export interface CharacterChatRequest {
@@ -82,6 +110,7 @@ export interface CharacterChatRequest {
     withVoice?: boolean;
     voice?: CharacterVoiceRequest;
     settings?: CharacterConversationSettings;
+    learning?: CharacterLearningRequest;
 }
 
 export interface CharacterChatResponse {
@@ -92,5 +121,6 @@ export interface CharacterChatResponse {
     responseText?: string;
     emotion?: CharacterEmotionResult;
     voice?: VoiceSynthesizeResult;
+    learning?: CharacterLearningResult;
     error?: string;
 }

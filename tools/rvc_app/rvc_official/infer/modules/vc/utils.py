@@ -71,7 +71,7 @@ def load_hubert(config):
             print(f"[RVC] Direct checkpoint load failed: {exc}")
 
     # ── Method 3: torchaudio built-in (last resort) ────────────────────
-    print("[RVC] WARNING: Using torchaudio built-in HuBERT — may degrade quality!")
+    print("[RVC] WARNING: Using torchaudio built-in HuBERT - may degrade quality!")
     print("[RVC] For best results, install fairseq: pip install fairseq")
     import torchaudio
 

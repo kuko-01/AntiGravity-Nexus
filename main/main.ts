@@ -12,9 +12,10 @@ import { Sbv2Service } from './services/tts/Sbv2Service';
 import { TtsSynthesizeParams, TtsPreset } from '../types/tts';
 import { RvcService } from './services/tts/RvcService';
 import { VoicePipelineService } from './services/tts/VoicePipelineService';
-import { RvcConvertParams, RvcPreset, VoiceSynthesizeParams } from '../types/rvc';
+import { RvcConvertParams, RvcPreset, VoiceExpressionSettings, VoiceSynthesizeParams, VoiceSynthesizeResult } from '../types/rvc';
 import { CharacterChatService } from './services/CharacterChatService';
 import { CharacterChatRequest, CharacterEmotionResult } from '../types/character';
+import { SingingLearningService } from './services/SingingLearningService';
 
 // .env ファイルを読み込み
 // .env ファイルを読み込み
@@ -2954,16 +2955,22 @@ ipcMain.handle('rvc-delete-preset', async (_event, id: string) => {
 ipcMain.handle('voice-synthesize', async (_event, params: VoiceSynthesizeParams) => {
     try {
         const service = VoicePipelineService.getInstance(ttsResourcesPath);
-        return await service.synthesize(params);
+        const result = await service.synthesize(params);
+        logVoiceEnhanceSummary('voice-synthesize', params, result);
+        return result;
     } catch (error) {
         console.error('[VoicePipeline] Synthesize error:', error);
         return { success: false, error: { code: 'E_UNKNOWN', message: String(error) } };
     }
 });
 
-const buildSbv2EmotionDefaults = (emotion?: CharacterEmotionResult): NonNullable<VoiceSynthesizeParams['sbv2']> => {
+const buildSbv2EmotionDefaults = (
+    emotion?: CharacterEmotionResult,
+    options?: { singing?: boolean },
+): NonNullable<VoiceSynthesizeParams['sbv2']> => {
     const label = emotion?.label || 'neutral';
     const intensity = Math.max(0, Math.min(1, emotion?.intensity ?? 0));
+    const singing = options?.singing === true;
 
     const base = {
         style: 'ノーマル',
@@ -2977,45 +2984,393 @@ const buildSbv2EmotionDefaults = (emotion?: CharacterEmotionResult): NonNullable
 
     switch (label) {
         case 'joy':
+            {
+                const result = {
+                    ...base,
+                    speed: 1.0 + 0.08 * intensity,
+                    pitch: 0.0 + 0.45 * intensity,
+                    intonation: 1.0 + 0.16 * intensity,
+                    styleWeight: 1.0 + 0.08 * intensity,
+                    assistText: '明るく優しく、親しみやすく',
+                };
+                if (!singing) return result;
+                return {
+                    ...result,
+                    speed: Math.max(0.82, result.speed * 0.94),
+                    intonation: Math.min(1.45, result.intonation + 0.12),
+                    styleWeight: Math.min(2.4, (result.styleWeight || 1.0) + 0.22),
+                    sdpRatio: Math.min(0.65, 0.26 + intensity * 0.18),
+                    noiseScale: Math.min(0.85, 0.36 + intensity * 0.16),
+                    noiseScaleW: Math.min(0.95, 0.56 + intensity * 0.14),
+                    assistText: `${result.assistText}。歌うように、母音を保って自然に伸ばす`,
+                    assistTextWeight: Math.max(1.2, result.assistTextWeight || 1.0),
+                    preserveLineBreaks: true,
+                    chunkPauseMs: Math.max(60, Math.round(120 + intensity * 90)),
+                    lineSplit: true,
+                    splitInterval: Math.min(1.5, Math.max(0.05, 0.14 + intensity * 0.08)),
+                };
+            }
+        case 'sad':
+            {
+                const result = {
+                    ...base,
+                    style: 'よふかし',
+                    speed: 1.0 - 0.1 * intensity,
+                    pitch: 0.0 - 0.35 * intensity,
+                    intonation: 1.0 - 0.12 * intensity,
+                    assistText: '落ち着いて穏やかに、やさしく',
+                };
+                if (!singing) return result;
+                return {
+                    ...result,
+                    speed: Math.max(0.8, result.speed * 0.92),
+                    intonation: Math.min(1.35, result.intonation + 0.1),
+                    styleWeight: Math.min(2.3, (result.styleWeight || 1.0) + 0.2),
+                    sdpRatio: Math.min(0.62, 0.24 + intensity * 0.16),
+                    noiseScale: Math.min(0.8, 0.34 + intensity * 0.14),
+                    noiseScaleW: Math.min(0.92, 0.52 + intensity * 0.14),
+                    assistText: `${result.assistText}。抑揚を保ちながら歌うように柔らかく`,
+                    assistTextWeight: Math.max(1.2, result.assistTextWeight || 1.0),
+                    preserveLineBreaks: true,
+                    chunkPauseMs: Math.max(70, Math.round(130 + intensity * 100)),
+                    lineSplit: true,
+                    splitInterval: Math.min(1.5, Math.max(0.05, 0.16 + intensity * 0.09)),
+                };
+            }
+        case 'angry':
+            {
+                const result = {
+                    ...base,
+                    speed: 1.0 + 0.07 * intensity,
+                    pitch: 0.0 + 0.2 * intensity,
+                    intonation: 1.0 + 0.15 * intensity,
+                    styleWeight: 1.0 + 0.1 * intensity,
+                    assistText: '強めだが威圧しすぎない、はっきりと',
+                };
+                if (!singing) return result;
+                return {
+                    ...result,
+                    speed: Math.max(0.84, result.speed * 0.95),
+                    intonation: Math.min(1.48, result.intonation + 0.12),
+                    styleWeight: Math.min(2.5, (result.styleWeight || 1.0) + 0.24),
+                    sdpRatio: Math.min(0.68, 0.28 + intensity * 0.18),
+                    noiseScale: Math.min(0.9, 0.38 + intensity * 0.17),
+                    noiseScaleW: Math.min(0.98, 0.58 + intensity * 0.16),
+                    assistText: `${result.assistText}。語尾をつぶさず歌唱調で強弱をつける`,
+                    assistTextWeight: Math.max(1.25, result.assistTextWeight || 1.0),
+                    preserveLineBreaks: true,
+                    chunkPauseMs: Math.max(50, Math.round(105 + intensity * 80)),
+                    lineSplit: true,
+                    splitInterval: Math.min(1.5, Math.max(0.05, 0.12 + intensity * 0.07)),
+                };
+            }
+        case 'excited':
+            {
+                const result = {
+                    ...base,
+                    style: 'るんるん',
+                    speed: 1.0 + 0.12 * intensity,
+                    pitch: 0.0 + 0.55 * intensity,
+                    intonation: 1.0 + 0.2 * intensity,
+                    styleWeight: 1.0 + 0.12 * intensity,
+                    assistText: '元気でわくわくした雰囲気',
+                };
+                if (!singing) return result;
+                return {
+                    ...result,
+                    speed: Math.max(0.86, result.speed * 0.95),
+                    intonation: Math.min(1.55, result.intonation + 0.14),
+                    styleWeight: Math.min(2.6, (result.styleWeight || 1.0) + 0.26),
+                    sdpRatio: Math.min(0.7, 0.3 + intensity * 0.19),
+                    noiseScale: Math.min(0.92, 0.4 + intensity * 0.18),
+                    noiseScaleW: Math.min(0.99, 0.6 + intensity * 0.17),
+                    assistText: `${result.assistText}。跳ねるような歌唱感で明るく`,
+                    assistTextWeight: Math.max(1.25, result.assistTextWeight || 1.0),
+                    preserveLineBreaks: true,
+                    chunkPauseMs: Math.max(45, Math.round(95 + intensity * 75)),
+                    lineSplit: true,
+                    splitInterval: Math.min(1.5, Math.max(0.05, 0.1 + intensity * 0.07)),
+                };
+            }
+        default:
+            {
+                const result = base;
+                if (!singing) return result;
+                return {
+                    ...result,
+                    speed: Math.max(0.84, result.speed * 0.94),
+                    intonation: Math.min(1.4, result.intonation + 0.1),
+                    styleWeight: Math.min(2.3, (result.styleWeight || 1.0) + 0.2),
+                    sdpRatio: Math.min(0.6, 0.24 + intensity * 0.14),
+                    noiseScale: Math.min(0.8, 0.33 + intensity * 0.14),
+                    noiseScaleW: Math.min(0.9, 0.5 + intensity * 0.12),
+                    assistText: `${result.assistText}。歌うように語尾を丁寧に保つ`,
+                    assistTextWeight: Math.max(1.15, result.assistTextWeight || 1.0),
+                    preserveLineBreaks: true,
+                    chunkPauseMs: Math.max(60, Math.round(110 + intensity * 80)),
+                    lineSplit: true,
+                    splitInterval: Math.min(1.5, Math.max(0.05, 0.14 + intensity * 0.08)),
+                };
+            }
+    }
+};
+
+const clamp01 = (value: number): number => Math.max(0, Math.min(1, value));
+
+const resolveEmotionForVoiceDefaults = (
+    baseEmotion: CharacterEmotionResult | undefined,
+    expression: VoiceExpressionSettings | undefined,
+): CharacterEmotionResult => {
+    const baseLabel = baseEmotion?.label || 'neutral';
+    const baseIntensity = clamp01(baseEmotion?.intensity ?? 0);
+
+    const hintedLabel = expression?.emotionLabelHint;
+    const label = (
+        hintedLabel === 'neutral'
+        || hintedLabel === 'joy'
+        || hintedLabel === 'sad'
+        || hintedLabel === 'angry'
+        || hintedLabel === 'excited'
+    )
+        ? hintedLabel
+        : baseLabel;
+
+    const hintIntensityRaw = expression?.emotionIntensityHint;
+    const intensity = typeof hintIntensityRaw === 'number' && Number.isFinite(hintIntensityRaw)
+        ? clamp01(hintIntensityRaw)
+        : baseIntensity;
+
+    return { label, intensity };
+};
+
+const detectSingingModeFromText = (text: string): boolean => {
+    const normalized = String(text || '').trim();
+    if (!normalized) {
+        return false;
+    }
+
+    const lower = normalized.toLowerCase();
+    const explicitMarkers = ['♪', '♫', '♬', 'サビ', 'aメロ', 'bメロ', 'chorus', 'verse', 'bridge', 'ラララ', 'ららら'];
+    if (explicitMarkers.some((marker) => lower.includes(marker.toLowerCase()))) {
+        return true;
+    }
+
+    const lines = normalized
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    if (lines.length >= 3) {
+        return true;
+    }
+
+    const phraseDelimiters = (normalized.match(/[、,]/g) || []).length;
+    const sentenceEndings = (normalized.match(/[。.!?！？]/g) || []).length;
+    return phraseDelimiters >= 3 && sentenceEndings <= 1;
+};
+
+const detectSingingIntentFromUserText = (text: string): boolean => {
+    const normalized = String(text || '').trim().toLowerCase();
+    if (!normalized) {
+        return false;
+    }
+    const patterns = [
+        /歌って/,
+        /歌をうた/,
+        /歌にして/,
+        /歌詞/,
+        /メロディ/,
+        /\bsing\b/,
+        /\bsing a song\b/,
+        /\blyrics\b/,
+        /ハミング/,
+    ];
+    return patterns.some((pattern) => pattern.test(normalized));
+};
+
+const buildCharacterVoiceExpressionDefaults = (
+    responseText: string,
+    emotion?: CharacterEmotionResult,
+    options?: { singingOverride?: boolean },
+): VoiceExpressionSettings => {
+    const label = emotion?.label || 'neutral';
+    const intensity = clamp01(emotion?.intensity ?? 0);
+    const singing = typeof options?.singingOverride === 'boolean'
+        ? options.singingOverride
+        : detectSingingModeFromText(responseText);
+
+    const baseWaveEdit = {
+        vibratoDepth: 0,
+        vibratoRateHz: 5.2,
+        dynamicBoost: 0.04,
+    };
+
+    if (singing) {
+        return {
+            singing: true,
+            autoEmotionRefine: true,
+            emotionLabelHint: label,
+            emotionIntensityHint: intensity,
+            sbv2WaveEdit: {
+                vibratoDepth: clamp01(0.18 + intensity * 0.28),
+                vibratoRateHz: 4.8 + intensity * 1.8,
+                dynamicBoost: Math.max(0, Math.min(2, 0.18 + intensity * 0.32)),
+            },
+        };
+    }
+
+    switch (label) {
+        case 'joy':
             return {
-                ...base,
-                speed: 1.0 + 0.08 * intensity,
-                pitch: 0.0 + 0.45 * intensity,
-                intonation: 1.0 + 0.16 * intensity,
-                styleWeight: 1.0 + 0.08 * intensity,
-                assistText: '明るく優しく、親しみやすく',
+                singing: false,
+                autoEmotionRefine: true,
+                emotionLabelHint: label,
+                emotionIntensityHint: intensity,
+                sbv2WaveEdit: {
+                    ...baseWaveEdit,
+                    vibratoDepth: clamp01(0.04 + intensity * 0.08),
+                    dynamicBoost: Math.max(0, Math.min(2, 0.08 + intensity * 0.2)),
+                },
             };
         case 'sad':
             return {
-                ...base,
-                style: 'よふかし',
-                speed: 1.0 - 0.1 * intensity,
-                pitch: 0.0 - 0.35 * intensity,
-                intonation: 1.0 - 0.12 * intensity,
-                assistText: '落ち着いて穏やかに、やさしく',
+                singing: false,
+                autoEmotionRefine: true,
+                emotionLabelHint: label,
+                emotionIntensityHint: intensity,
+                sbv2WaveEdit: {
+                    ...baseWaveEdit,
+                    vibratoDepth: clamp01(0.02 + intensity * 0.05),
+                    vibratoRateHz: 4.4,
+                    dynamicBoost: Math.max(0, Math.min(2, 0.02 + intensity * 0.08)),
+                },
             };
         case 'angry':
             return {
-                ...base,
-                speed: 1.0 + 0.07 * intensity,
-                pitch: 0.0 + 0.2 * intensity,
-                intonation: 1.0 + 0.15 * intensity,
-                styleWeight: 1.0 + 0.1 * intensity,
-                assistText: '強めだが威圧しすぎない、はっきりと',
+                singing: false,
+                autoEmotionRefine: true,
+                emotionLabelHint: label,
+                emotionIntensityHint: intensity,
+                sbv2WaveEdit: {
+                    ...baseWaveEdit,
+                    vibratoDepth: clamp01(0.01 + intensity * 0.04),
+                    dynamicBoost: Math.max(0, Math.min(2, 0.1 + intensity * 0.18)),
+                },
             };
         case 'excited':
             return {
-                ...base,
-                style: 'るんるん',
-                speed: 1.0 + 0.12 * intensity,
-                pitch: 0.0 + 0.55 * intensity,
-                intonation: 1.0 + 0.2 * intensity,
-                styleWeight: 1.0 + 0.12 * intensity,
-                assistText: '元気でわくわくした雰囲気',
+                singing: false,
+                autoEmotionRefine: true,
+                emotionLabelHint: label,
+                emotionIntensityHint: intensity,
+                sbv2WaveEdit: {
+                    ...baseWaveEdit,
+                    vibratoDepth: clamp01(0.06 + intensity * 0.12),
+                    vibratoRateHz: 5.6 + intensity * 0.8,
+                    dynamicBoost: Math.max(0, Math.min(2, 0.1 + intensity * 0.24)),
+                },
             };
         default:
-            return base;
+            return {
+                singing: false,
+                autoEmotionRefine: true,
+                emotionLabelHint: label,
+                emotionIntensityHint: intensity,
+                sbv2WaveEdit: baseWaveEdit,
+            };
     }
+};
+
+const normalizeQualityProfileSegment = (value: unknown, fallback: string): string => {
+    const source = String(value || '').trim().toLowerCase();
+    const normalized = source
+        .replace(/\s+/g, '_')
+        .replace(/[^\p{L}\p{N}_-]+/gu, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 80);
+    return normalized || fallback;
+};
+
+const buildCharacterQualityProfileId = (
+    characterId: string | undefined,
+    params: VoiceSynthesizeParams,
+): string => {
+    const characterSeg = normalizeQualityProfileSegment(characterId, 'character_default');
+    const modeSeg = normalizeQualityProfileSegment(params.mode, 'sbv2_rvc');
+    const sbv2Seg = normalizeQualityProfileSegment(params.sbv2?.modelId, 'sbv2_auto');
+    const rvcSeg = normalizeQualityProfileSegment(params.rvc?.modelId, 'rvc_auto');
+    return `character_${characterSeg}_${modeSeg}_${sbv2Seg}_${rvcSeg}`;
+};
+
+const summarizeVoiceEnhanceRequest = (params: VoiceSynthesizeParams) => ({
+    mode: params.mode,
+    singing: typeof params.expression?.singing === 'boolean' ? params.expression.singing : 'auto',
+    emotionHint: params.expression?.emotionLabelHint || 'auto',
+    emotionIntensityHint: typeof params.expression?.emotionIntensityHint === 'number'
+        ? clamp01(params.expression.emotionIntensityHint)
+        : null,
+    autoEmotionRefine: params.expression?.autoEmotionRefine !== false,
+    enhanceFinalAudio: Boolean(params.output?.enhanceFinalAudio),
+    autoAnalyzeAndEnhance: Boolean(params.output?.autoAnalyzeAndEnhance),
+    persistQualityLearning: params.output?.persistQualityLearning !== false,
+    qualityProfileId: params.output?.qualityProfileId || 'auto',
+});
+
+const logVoiceEnhanceSummary = (
+    source: 'voice-synthesize' | 'character-chat-send',
+    params: VoiceSynthesizeParams,
+    result: Pick<VoiceSynthesizeResult, 'success' | 'durationMs' | 'stages' | 'error' | 'analysis'>,
+) => {
+    const requestSummary = summarizeVoiceEnhanceRequest(params);
+    const beforeScore = result.analysis?.before?.qualityScore;
+    const afterScore = result.analysis?.after?.qualityScore;
+    const payload = {
+        source,
+        ...requestSummary,
+        success: result.success,
+        durationMs: result.durationMs ?? result.stages?.totalMs ?? null,
+        stages: result.stages || {},
+        errorCode: result.error?.code || null,
+        analysis: result.analysis
+            ? {
+                analyzed: result.analysis.analyzed,
+                autoEnhanced: result.analysis.autoEnhanced,
+                profileId: result.analysis.profileId || null,
+                actionCount: result.analysis.actions.length,
+                qualityBefore: typeof beforeScore === 'number' ? beforeScore : null,
+                qualityAfter: typeof afterScore === 'number' ? afterScore : null,
+            }
+            : null,
+    };
+    console.log('[VoiceEnhance]', JSON.stringify(payload));
+};
+
+const buildSingingLearningResultMessage = (result: {
+    success: boolean;
+    sourceUrl: string;
+    runDir?: string;
+    vocalWavPath?: string;
+    accompanimentWavPath?: string;
+    datasetInputPath?: string;
+    method?: 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+    warning?: string;
+    error?: string;
+}): string => {
+    if (!result.success) {
+        const reason = result.error || 'unknown error';
+        return `歌唱学習モード: 処理に失敗しました。\n理由: ${reason}`;
+    }
+
+    const lines: string[] = [];
+    lines.push('歌唱学習モード: 取り込み完了');
+    lines.push(`Source: ${result.sourceUrl}`);
+    if (result.method) lines.push(`Separation: ${result.method}`);
+    if (result.vocalWavPath) lines.push(`Vocal WAV: ${result.vocalWavPath}`);
+    if (result.accompanimentWavPath) lines.push(`BGM WAV: ${result.accompanimentWavPath}`);
+    if (result.datasetInputPath) lines.push(`Dataset Input: ${result.datasetInputPath}`);
+    if (result.runDir) lines.push(`Run Folder: ${result.runDir}`);
+    if (result.warning) lines.push(`Warning: ${result.warning}`);
+    lines.push('このボーカルWAVは学習素材として保存済みです。');
+    return lines.join('\n');
 };
 
 const ensureSbv2ServerRunningForCharacter = async (): Promise<{ success: boolean; error?: { code: string; message: string } }> => {
@@ -3100,6 +3455,51 @@ const ensureVoiceServersForCharacter = async (
 
 ipcMain.handle('character-chat-send', async (_event, request: CharacterChatRequest) => {
     try {
+        const learningMode = request.learning?.singingTrainingMode === true;
+        if (learningMode) {
+            const learningService = SingingLearningService.getInstance(ttsResourcesPath);
+            const youtubeUrl = learningService.extractYouTubeUrl(request.text || '');
+            if (youtubeUrl) {
+                console.log('[SingingLearning]', JSON.stringify({
+                    phase: 'start',
+                    characterId: request.characterId || 'default',
+                    sourceUrl: youtubeUrl,
+                }));
+                const ingestResult = await learningService.ingestFromYouTube({
+                    characterId: request.characterId || 'default',
+                    sourceUrl: youtubeUrl,
+                });
+                const sessionId = request.sessionId || `char_learning_${Date.now()}`;
+                const responseText = buildSingingLearningResultMessage(ingestResult);
+                console.log('[SingingLearning]', JSON.stringify({
+                    phase: 'end',
+                    success: ingestResult.success,
+                    method: ingestResult.method || null,
+                    warning: ingestResult.warning || null,
+                    error: ingestResult.error || null,
+                }));
+                return {
+                    success: true,
+                    sessionId,
+                    turnId: `${sessionId}:learning:${Date.now()}`,
+                    characterId: request.characterId || 'aozuki_fox_v1',
+                    responseText,
+                    learning: {
+                        success: ingestResult.success,
+                        sourceUrl: ingestResult.sourceUrl,
+                        runDir: ingestResult.runDir,
+                        sourceAudioPath: ingestResult.sourceAudioPath,
+                        vocalWavPath: ingestResult.vocalWavPath,
+                        accompanimentWavPath: ingestResult.accompanimentWavPath,
+                        datasetInputPath: ingestResult.datasetInputPath,
+                        method: ingestResult.method,
+                        warning: ingestResult.warning,
+                        error: ingestResult.error,
+                    },
+                };
+            }
+        }
+
         const chatService = CharacterChatService.getInstance();
         const chatResult = await chatService.sendMessage(request);
         if (!chatResult.success) {
@@ -3115,7 +3515,31 @@ ipcMain.handle('character-chat-send', async (_event, request: CharacterChatReque
             return chatResult;
         }
 
-        const defaultSbv2 = buildSbv2EmotionDefaults(chatResult.emotion);
+        const hintedEmotion = resolveEmotionForVoiceDefaults(chatResult.emotion, request.voice?.expression);
+        const requestedSingingSetting = request.voice?.expression?.singing;
+        const detectedSingingFromResponse = detectSingingModeFromText(responseText);
+        const detectedSingingFromUserText = detectSingingIntentFromUserText(request.text);
+        const effectiveSinging = requestedSingingSetting === true
+            ? true
+            : requestedSingingSetting === false
+                ? false
+                : (detectedSingingFromResponse || detectedSingingFromUserText);
+        const defaultExpression = buildCharacterVoiceExpressionDefaults(
+            responseText,
+            hintedEmotion,
+            { singingOverride: effectiveSinging },
+        );
+        const defaultSbv2 = buildSbv2EmotionDefaults(hintedEmotion, { singing: effectiveSinging });
+        const defaultQualityProfileId = buildCharacterQualityProfileId(request.characterId, {
+            text: responseText,
+            mode: request.voice?.mode || 'sbv2+rvc',
+            sbv2: {
+                modelId: request.voice?.sbv2?.modelId,
+            },
+            rvc: {
+                modelId: request.voice?.rvc?.modelId,
+            },
+        });
         const voiceParams: VoiceSynthesizeParams = {
             text: responseText,
             mode: request.voice?.mode || 'sbv2+rvc',
@@ -3124,10 +3548,37 @@ ipcMain.handle('character-chat-send', async (_event, request: CharacterChatReque
                 ...(request.voice?.sbv2 || {}),
             },
             rvc: request.voice?.rvc,
+            expression: {
+                ...defaultExpression,
+                ...(request.voice?.expression || {}),
+                singing: effectiveSinging,
+                sbv2WaveEdit: {
+                    ...(defaultExpression.sbv2WaveEdit || {}),
+                    ...(request.voice?.expression?.sbv2WaveEdit || {}),
+                },
+            },
+            output: {
+                enhanceFinalAudio: true,
+                autoAnalyzeAndEnhance: true,
+                persistQualityLearning: true,
+                qualityProfileId: defaultQualityProfileId,
+                ...(request.voice?.output || {}),
+            },
         };
+        console.log('[VoiceEnhance]', JSON.stringify({
+            source: 'character-chat-send',
+            phase: 'request',
+            ...summarizeVoiceEnhanceRequest(voiceParams),
+        }));
 
         const runtimeReady = await ensureVoiceServersForCharacter(voiceParams.mode);
         if (!runtimeReady.success) {
+            console.log('[VoiceEnhance]', JSON.stringify({
+                source: 'character-chat-send',
+                phase: 'runtime_ready',
+                success: false,
+                errorCode: runtimeReady.error?.code || 'E_SERVER_FAILED',
+            }));
             return {
                 ...chatResult,
                 voice: {
@@ -3139,6 +3590,7 @@ ipcMain.handle('character-chat-send', async (_event, request: CharacterChatReque
 
         const voiceService = VoicePipelineService.getInstance(ttsResourcesPath);
         const voiceResult = await voiceService.synthesize(voiceParams);
+        logVoiceEnhanceSummary('character-chat-send', voiceParams, voiceResult);
 
         return {
             ...chatResult,

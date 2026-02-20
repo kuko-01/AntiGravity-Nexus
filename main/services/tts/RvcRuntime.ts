@@ -352,6 +352,8 @@ exec(compile(open(r'${serverScript.replace(/\\/g, '\\\\')}', encoding='utf-8-sig
                 ...process.env,
                 RVC_MODELS_DIR: path.join(this.installPath, 'models'),
                 RVC_VERBOSE_LOG: this.verboseLogs ? '1' : '0',
+                PYTHONUTF8: '1',
+                PYTHONIOENCODING: 'utf-8',
             },
             stdio: ['ignore', 'pipe', 'pipe'],
         });

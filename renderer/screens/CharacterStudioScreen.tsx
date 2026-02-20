@@ -12,6 +12,18 @@ interface ChatMessage {
     text: string;
     emotionLabel?: string;
     emotionIntensity?: number;
+    voiceSnapshot?: string;
+}
+
+interface StoredCharacterVoiceSettings {
+    voiceEnabled?: boolean;
+    audioVolume?: number;
+    mode?: 'sbv2' | 'sbv2+rvc';
+    sbv2ModelId?: string;
+    sbv2Style?: string;
+    rvcModelId?: string;
+    rvcSpeakerId?: number;
+    rvcIndexPath?: string;
 }
 
 interface StoredCharacterProfile {
@@ -20,6 +32,20 @@ interface StoredCharacterProfile {
     firstPerson?: string;
     personaNote?: string;
     speakingStyleNote?: string;
+    voice?: StoredCharacterVoiceSettings;
+    voiceEnhance?: StoredVoiceEnhanceSettings;
+    updatedAt?: string;
+}
+
+interface LegacyStoredCharacterProfile {
+    name?: string;
+    nameKanji?: string;
+    nameKana?: string;
+    firstPerson?: string;
+    personaNote?: string;
+    speakingStyleNote?: string;
+    voice?: StoredCharacterVoiceSettings;
+    voiceEnhance?: StoredVoiceEnhanceSettings;
     updatedAt?: string;
 }
 
@@ -29,34 +55,88 @@ interface StoredUserProfile {
     profileNote?: string;
 }
 
+interface StoredVoiceEnhanceSettings {
+    singingTrainingMode?: boolean;
+    forceSingingMode?: boolean;
+    autoEmotionRefine?: boolean;
+    enhanceFinalAudio?: boolean;
+    autoAnalyzeAndEnhance?: boolean;
+    emotionLabelHint?: 'auto' | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited';
+    useEmotionIntensityHint?: boolean;
+    emotionIntensityHint?: number;
+}
+
+const DEFAULT_CHARACTER_ID = 'aozuki_fox_v1';
+const DEFAULT_CHARACTER_PROFILE: StoredCharacterProfile = {
+    nameKanji: '蒼月キツネ案内人',
+    nameKana: 'あおつききつねあんないにん',
+    firstPerson: 'わたし',
+    personaNote: '',
+    speakingStyleNote: '',
+};
 const createSessionId = () => `char_ui_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
 const DEFAULT_RVC_SPEAKER_COUNT = 8;
 const LEGACY_SETTINGS_STORAGE_KEY = 'character_studio_settings_v1';
 const CHARACTER_PROFILES_STORAGE_KEY = 'character_studio_profiles_v1';
 const USER_PROFILE_STORAGE_KEY = 'character_studio_user_profile_v1';
+const LAST_CHARACTER_ID_STORAGE_KEY = 'character_studio_last_character_id_v1';
+const VOICE_ENHANCE_STORAGE_KEY = 'character_studio_voice_enhance_v1';
+const DEFAULT_CHARACTER_VOICE_SETTINGS: StoredCharacterVoiceSettings = {
+    voiceEnabled: true,
+    audioVolume: 0.9,
+    mode: 'sbv2+rvc',
+    sbv2ModelId: '',
+    sbv2Style: 'ノーマル',
+    rvcModelId: '',
+    rvcSpeakerId: 0,
+    rvcIndexPath: '',
+};
+const DEFAULT_VOICE_ENHANCE_SETTINGS: StoredVoiceEnhanceSettings = {
+    singingTrainingMode: false,
+    forceSingingMode: false,
+    autoEmotionRefine: true,
+    enhanceFinalAudio: true,
+    autoAnalyzeAndEnhance: true,
+    emotionLabelHint: 'auto',
+    useEmotionIntensityHint: false,
+    emotionIntensityHint: 0.55,
+};
 
 const CharacterStudioScreen: React.FC = () => {
     const navigate = useNavigate();
 
     const [sessionId, setSessionId] = useState<string>(createSessionId());
-    const [characterId, setCharacterId] = useState<string>('aozuki_fox_v1');
-    const [characterNameKanji, setCharacterNameKanji] = useState<string>('蒼月キツネ案内人');
-    const [characterNameKana, setCharacterNameKana] = useState<string>('あおつききつねあんないにん');
-    const [characterFirstPerson, setCharacterFirstPerson] = useState<string>('わたし');
+    const [characterId, setCharacterId] = useState<string>(DEFAULT_CHARACTER_ID);
+    const [characterIdDraft, setCharacterIdDraft] = useState<string>('');
+    const [characterNameKanji, setCharacterNameKanji] = useState<string>(DEFAULT_CHARACTER_PROFILE.nameKanji || '');
+    const [characterNameKana, setCharacterNameKana] = useState<string>(DEFAULT_CHARACTER_PROFILE.nameKana || '');
+    const [characterFirstPerson, setCharacterFirstPerson] = useState<string>(DEFAULT_CHARACTER_PROFILE.firstPerson || 'わたし');
     const [characterPersonaNote, setCharacterPersonaNote] = useState<string>('');
     const [characterSpeakingStyleNote, setCharacterSpeakingStyleNote] = useState<string>('');
     const [userName, setUserName] = useState<string>('');
     const [userCallName, setUserCallName] = useState<string>('');
     const [userProfileNote, setUserProfileNote] = useState<string>('');
     const [characterProfiles, setCharacterProfiles] = useState<Record<string, StoredCharacterProfile>>({});
+    const [isStorageHydrated, setIsStorageHydrated] = useState<boolean>(false);
     const [profileStatus, setProfileStatus] = useState<string>('');
     const [inputText, setInputText] = useState<string>('');
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [isSending, setIsSending] = useState<boolean>(false);
     const [lastError, setLastError] = useState<string>('');
+    const [copyStatus, setCopyStatus] = useState<string>('');
 
     const [voiceEnabled, setVoiceEnabled] = useState<boolean>(true);
     const [voiceMode, setVoiceMode] = useState<'sbv2' | 'sbv2+rvc'>('sbv2+rvc');
+    const [singingTrainingMode, setSingingTrainingMode] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.singingTrainingMode === true);
+    const [forceSingingMode, setForceSingingMode] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.forceSingingMode || false);
+    const [autoEmotionRefine, setAutoEmotionRefine] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.autoEmotionRefine !== false);
+    const [enhanceFinalAudio, setEnhanceFinalAudio] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.enhanceFinalAudio !== false);
+    const [autoAnalyzeAndEnhance, setAutoAnalyzeAndEnhance] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.autoAnalyzeAndEnhance !== false);
+    const [emotionLabelHint, setEmotionLabelHint] = useState<'auto' | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited'>(
+        DEFAULT_VOICE_ENHANCE_SETTINGS.emotionLabelHint || 'auto',
+    );
+    const [useEmotionIntensityHint, setUseEmotionIntensityHint] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.useEmotionIntensityHint || false);
+    const [emotionIntensityHint, setEmotionIntensityHint] = useState<number>(DEFAULT_VOICE_ENHANCE_SETTINGS.emotionIntensityHint || 0.55);
     const [sbv2ModelId, setSbv2ModelId] = useState<string>('');
     const [sbv2Style, setSbv2Style] = useState<string>('ノーマル');
     const [rvcModelId, setRvcModelId] = useState<string>('');
@@ -91,6 +171,22 @@ const CharacterStudioScreen: React.FC = () => {
         const count = Math.max(1, Math.min(128, rvcSpeakerCount || 1));
         return Array.from({ length: count }, (_unused, index) => index);
     }, [rvcSpeakerCount]);
+    const characterIdOptions = useMemo(() => {
+        const merged = new Set<string>([DEFAULT_CHARACTER_ID]);
+        const current = characterId.trim();
+        if (current) {
+            merged.add(current);
+        }
+        for (const id of Object.keys(characterProfiles)) {
+            const trimmed = id.trim();
+            if (trimmed) merged.add(trimmed);
+        }
+        return Array.from(merged).sort((a, b) => a.localeCompare(b));
+    }, [characterId, characterProfiles]);
+    const hasSavedProfileForCurrentCharacter = useMemo(
+        () => Boolean(characterProfiles[characterId.trim()]),
+        [characterProfiles, characterId],
+    );
     const conversationSettings = useMemo<CharacterConversationSettings>(() => ({
         character: {
             nameKanji: characterNameKanji.trim() || undefined,
@@ -117,12 +213,156 @@ const CharacterStudioScreen: React.FC = () => {
         userProfileNote,
     ]);
 
-    const normalizeCharacterProfile = (profile: StoredCharacterProfile | undefined): StoredCharacterProfile => ({
-        nameKanji: String(profile?.nameKanji || '').trim(),
+    const normalizeVoiceEnhanceSettings = (
+        settings: StoredVoiceEnhanceSettings | undefined,
+    ): StoredVoiceEnhanceSettings => {
+        const nextEmotionLabelHint = (
+            settings?.emotionLabelHint === 'auto'
+            || settings?.emotionLabelHint === 'neutral'
+            || settings?.emotionLabelHint === 'joy'
+            || settings?.emotionLabelHint === 'sad'
+            || settings?.emotionLabelHint === 'angry'
+            || settings?.emotionLabelHint === 'excited'
+        )
+            ? settings.emotionLabelHint
+            : (DEFAULT_VOICE_ENHANCE_SETTINGS.emotionLabelHint || 'auto');
+        const nextEmotionIntensityHintRaw = Number(settings?.emotionIntensityHint);
+        const nextEmotionIntensityHint = Number.isFinite(nextEmotionIntensityHintRaw)
+            ? Math.max(0, Math.min(1, nextEmotionIntensityHintRaw))
+            : (DEFAULT_VOICE_ENHANCE_SETTINGS.emotionIntensityHint || 0.55);
+        return {
+            singingTrainingMode: settings?.singingTrainingMode === true,
+            forceSingingMode: settings?.forceSingingMode === true,
+            autoEmotionRefine: settings?.autoEmotionRefine !== false,
+            enhanceFinalAudio: settings?.enhanceFinalAudio !== false,
+            autoAnalyzeAndEnhance: settings?.autoAnalyzeAndEnhance !== false,
+            emotionLabelHint: nextEmotionLabelHint,
+            useEmotionIntensityHint: settings?.useEmotionIntensityHint === true,
+            emotionIntensityHint: nextEmotionIntensityHint,
+        };
+    };
+
+    const applyVoiceEnhanceSettings = (settings?: StoredVoiceEnhanceSettings) => {
+        const normalized = normalizeVoiceEnhanceSettings(settings);
+        setSingingTrainingMode(normalized.singingTrainingMode === true);
+        setForceSingingMode(normalized.forceSingingMode || false);
+        setAutoEmotionRefine(normalized.autoEmotionRefine !== false);
+        setEnhanceFinalAudio(normalized.enhanceFinalAudio !== false);
+        setAutoAnalyzeAndEnhance(normalized.autoAnalyzeAndEnhance !== false);
+        setEmotionLabelHint(normalized.emotionLabelHint || 'auto');
+        setUseEmotionIntensityHint(normalized.useEmotionIntensityHint || false);
+        setEmotionIntensityHint(Math.max(0, Math.min(1, normalized.emotionIntensityHint || 0.55)));
+    };
+
+    const buildVoiceEnhanceSettingsFromState = (): StoredVoiceEnhanceSettings => (
+        normalizeVoiceEnhanceSettings({
+            singingTrainingMode,
+            forceSingingMode,
+            autoEmotionRefine,
+            enhanceFinalAudio,
+            autoAnalyzeAndEnhance,
+            emotionLabelHint,
+            useEmotionIntensityHint,
+            emotionIntensityHint,
+        })
+    );
+
+    const normalizeCharacterVoiceSettings = (
+        settings: StoredCharacterVoiceSettings | undefined,
+    ): StoredCharacterVoiceSettings => {
+        const voiceEnabledSetting = typeof settings?.voiceEnabled === 'boolean'
+            ? settings.voiceEnabled
+            : (DEFAULT_CHARACTER_VOICE_SETTINGS.voiceEnabled !== false);
+        const audioVolumeRaw = Number(settings?.audioVolume);
+        const audioVolumeSetting = Number.isFinite(audioVolumeRaw)
+            ? Math.max(0, Math.min(1, audioVolumeRaw))
+            : (DEFAULT_CHARACTER_VOICE_SETTINGS.audioVolume || 0.9);
+        const mode = settings?.mode === 'sbv2' || settings?.mode === 'sbv2+rvc'
+            ? settings.mode
+            : (DEFAULT_CHARACTER_VOICE_SETTINGS.mode || 'sbv2+rvc');
+        const sbv2Model = String(settings?.sbv2ModelId || '').trim();
+        const sbv2StyleSetting = String(settings?.sbv2Style || '').trim();
+        const rvcModel = String(settings?.rvcModelId || '').trim();
+        const rvcIndex = String(settings?.rvcIndexPath || '').trim();
+        const speakerRaw = Number(settings?.rvcSpeakerId);
+        const rvcSpeaker = Number.isFinite(speakerRaw)
+            ? Math.max(0, Math.min(127, Math.floor(speakerRaw)))
+            : (DEFAULT_CHARACTER_VOICE_SETTINGS.rvcSpeakerId || 0);
+
+        return {
+            voiceEnabled: voiceEnabledSetting,
+            audioVolume: audioVolumeSetting,
+            mode,
+            sbv2ModelId: sbv2Model,
+            sbv2Style: sbv2StyleSetting || (DEFAULT_CHARACTER_VOICE_SETTINGS.sbv2Style || 'ノーマル'),
+            rvcModelId: rvcModel,
+            rvcSpeakerId: rvcSpeaker,
+            rvcIndexPath: rvcIndex,
+        };
+    };
+
+    const buildCharacterVoiceSettingsFromState = (): StoredCharacterVoiceSettings => (
+        normalizeCharacterVoiceSettings({
+            voiceEnabled,
+            audioVolume,
+            mode: voiceMode,
+            sbv2ModelId,
+            sbv2Style,
+            rvcModelId,
+            rvcSpeakerId,
+            rvcIndexPath,
+        })
+    );
+
+    const applyCharacterVoiceSettings = (settings?: StoredCharacterVoiceSettings) => {
+        const normalized = normalizeCharacterVoiceSettings(settings);
+        const nextVoiceEnabled = normalized.voiceEnabled !== false;
+        const nextAudioVolume = Number.isFinite(normalized.audioVolume)
+            ? Math.max(0, Math.min(1, Number(normalized.audioVolume)))
+            : 0.9;
+        const nextMode = normalized.mode || 'sbv2+rvc';
+        const nextSbv2ModelId = normalized.sbv2ModelId || '';
+        const nextSbv2Style = normalized.sbv2Style || 'ノーマル';
+        const nextRvcModelId = normalized.rvcModelId || '';
+        const nextRvcSpeakerId = Number.isFinite(normalized.rvcSpeakerId)
+            ? Math.max(0, Math.min(127, Math.floor(Number(normalized.rvcSpeakerId))))
+            : 0;
+        const nextRvcIndexPath = normalized.rvcIndexPath || '';
+
+        setVoiceEnabled(nextVoiceEnabled);
+        setAudioVolume(nextAudioVolume);
+        setVoiceMode(nextMode);
+        setSbv2ModelId(nextSbv2ModelId);
+        setSbv2Style(nextSbv2Style);
+        setRvcModelId(nextRvcModelId);
+        setRvcSpeakerId(nextRvcSpeakerId);
+        setRvcIndexPath(nextRvcIndexPath);
+
+        if (nextRvcModelId) {
+            void applyRvcModelMeta(nextRvcModelId, {
+                speakerId: nextRvcSpeakerId,
+                indexPath: nextRvcIndexPath,
+            });
+        } else {
+            setRvcIndexOptions([]);
+            setRvcIndexPath('');
+            setRvcSpeakerCount(DEFAULT_RVC_SPEAKER_COUNT);
+            setRvcSpeakerId(0);
+        }
+    };
+
+    const normalizeCharacterProfile = (profile: LegacyStoredCharacterProfile | undefined): StoredCharacterProfile => ({
+        nameKanji: String(profile?.nameKanji || profile?.name || '').trim(),
         nameKana: String(profile?.nameKana || '').trim(),
         firstPerson: String(profile?.firstPerson || '').trim(),
         personaNote: String(profile?.personaNote || '').trim(),
         speakingStyleNote: String(profile?.speakingStyleNote || '').trim(),
+        voice: profile?.voice
+            ? normalizeCharacterVoiceSettings(profile.voice)
+            : undefined,
+        voiceEnhance: profile?.voiceEnhance
+            ? normalizeVoiceEnhanceSettings(profile.voiceEnhance)
+            : undefined,
         updatedAt: profile?.updatedAt || new Date().toISOString(),
     });
 
@@ -132,6 +372,12 @@ const CharacterStudioScreen: React.FC = () => {
         setCharacterFirstPerson(profile.firstPerson || 'わたし');
         setCharacterPersonaNote(profile.personaNote || '');
         setCharacterSpeakingStyleNote(profile.speakingStyleNote || '');
+        applyCharacterVoiceSettings(profile.voice || DEFAULT_CHARACTER_VOICE_SETTINGS);
+        applyVoiceEnhanceSettings(profile.voiceEnhance || DEFAULT_VOICE_ENHANCE_SETTINGS);
+    };
+
+    const applyDefaultCharacterProfile = () => {
+        applyCharacterProfile(DEFAULT_CHARACTER_PROFILE);
     };
 
     const buildCharacterProfileFromState = (): StoredCharacterProfile => ({
@@ -140,6 +386,8 @@ const CharacterStudioScreen: React.FC = () => {
         firstPerson: characterFirstPerson.trim(),
         personaNote: characterPersonaNote.trim(),
         speakingStyleNote: characterSpeakingStyleNote.trim(),
+        voice: buildCharacterVoiceSettingsFromState(),
+        voiceEnhance: buildVoiceEnhanceSettingsFromState(),
         updatedAt: new Date().toISOString(),
     });
 
@@ -150,10 +398,18 @@ const CharacterStudioScreen: React.FC = () => {
             return;
         }
         const nextProfile = buildCharacterProfileFromState();
-        setCharacterProfiles((prev) => ({
-            ...prev,
-            [id]: nextProfile,
-        }));
+        setCharacterProfiles((prev) => {
+            const nextProfiles = {
+                ...prev,
+                [id]: nextProfile,
+            };
+            try {
+                localStorage.setItem(CHARACTER_PROFILES_STORAGE_KEY, JSON.stringify(nextProfiles));
+            } catch {
+                // Ignore storage failures.
+            }
+            return nextProfiles;
+        });
         setLastError('');
         if (showStatus) {
             setProfileStatus(`Saved profile: ${id}`);
@@ -178,7 +434,37 @@ const CharacterStudioScreen: React.FC = () => {
         }
     };
 
-    const applyRvcModelMeta = async (modelId: string) => {
+    const switchCharacterId = (nextIdRaw: string, options?: { fromSelect?: boolean }) => {
+        const nextId = nextIdRaw.trim();
+        if (!nextId) {
+            setLastError('Character ID is required.');
+            return;
+        }
+
+        setCharacterId(nextId);
+        setProfileStatus('');
+        setLastError('');
+        const saved = characterProfiles[nextId];
+        if (saved) {
+            applyCharacterProfile(saved);
+            if (options?.fromSelect) {
+                setProfileStatus(`Loaded profile: ${nextId}`);
+            }
+            return;
+        }
+
+        if (options?.fromSelect) {
+            applyDefaultCharacterProfile();
+            setProfileStatus(`No saved profile for ${nextId}. Using defaults.`);
+        } else {
+            setProfileStatus(`Switched to new Character ID: ${nextId} (save to create profile).`);
+        }
+    };
+
+    const applyRvcModelMeta = async (
+        modelId: string,
+        preferred?: { speakerId?: number; indexPath?: string },
+    ) => {
         if (!apiAvailable || !modelId) {
             setRvcIndexOptions([]);
             setRvcIndexPath('');
@@ -193,7 +479,11 @@ const CharacterStudioScreen: React.FC = () => {
             ]);
             const nextIndexFiles = Array.isArray(indexFiles) ? indexFiles : [];
             setRvcIndexOptions(nextIndexFiles);
+            const preferredIndexPath = String(preferred?.indexPath || '').trim();
             setRvcIndexPath((prev) => {
+                if (preferredIndexPath && nextIndexFiles.includes(preferredIndexPath)) {
+                    return preferredIndexPath;
+                }
                 if (prev && nextIndexFiles.includes(prev)) {
                     return prev;
                 }
@@ -204,7 +494,13 @@ const CharacterStudioScreen: React.FC = () => {
                 ? Math.floor(speakerCountRaw)
                 : DEFAULT_RVC_SPEAKER_COUNT;
             setRvcSpeakerCount(nextSpeakerCount);
-            setRvcSpeakerId((prev) => (prev >= 0 && prev < nextSpeakerCount ? prev : 0));
+            const preferredSpeakerIdRaw = Number(preferred?.speakerId);
+            setRvcSpeakerId((prev) => {
+                const candidate = Number.isFinite(preferredSpeakerIdRaw)
+                    ? Math.floor(preferredSpeakerIdRaw)
+                    : prev;
+                return candidate >= 0 && candidate < nextSpeakerCount ? candidate : 0;
+            });
         } catch {
             setRvcIndexOptions([]);
             setRvcIndexPath('');
@@ -265,13 +561,14 @@ const CharacterStudioScreen: React.FC = () => {
         try {
             const rawProfiles = localStorage.getItem(CHARACTER_PROFILES_STORAGE_KEY);
             const parsedProfiles = rawProfiles
-                ? (JSON.parse(rawProfiles) as Record<string, StoredCharacterProfile>)
+                ? (JSON.parse(rawProfiles) as Record<string, LegacyStoredCharacterProfile>)
                 : {};
             const nextProfiles: Record<string, StoredCharacterProfile> = {};
             if (parsedProfiles && typeof parsedProfiles === 'object') {
                 for (const [id, profile] of Object.entries(parsedProfiles)) {
-                    if (!id.trim()) continue;
-                    nextProfiles[id] = normalizeCharacterProfile(profile);
+                    const normalizedId = id.trim();
+                    if (!normalizedId) continue;
+                    nextProfiles[normalizedId] = normalizeCharacterProfile(profile);
                 }
             }
 
@@ -279,6 +576,13 @@ const CharacterStudioScreen: React.FC = () => {
             const parsedUser = rawUser
                 ? (JSON.parse(rawUser) as StoredUserProfile)
                 : null;
+            const rawVoiceEnhance = localStorage.getItem(VOICE_ENHANCE_STORAGE_KEY);
+            const parsedVoiceEnhance = rawVoiceEnhance
+                ? (JSON.parse(rawVoiceEnhance) as StoredVoiceEnhanceSettings)
+                : null;
+            const migratedVoiceEnhance = parsedVoiceEnhance && typeof parsedVoiceEnhance === 'object'
+                ? normalizeVoiceEnhanceSettings(parsedVoiceEnhance)
+                : undefined;
 
             // Migration from legacy key.
             const rawLegacy = localStorage.getItem(LEGACY_SETTINGS_STORAGE_KEY);
@@ -295,10 +599,32 @@ const CharacterStudioScreen: React.FC = () => {
                 });
             }
 
+            if (migratedVoiceEnhance) {
+                for (const [id, profile] of Object.entries(nextProfiles)) {
+                    if (profile.voiceEnhance) continue;
+                    nextProfiles[id] = {
+                        ...profile,
+                        voiceEnhance: migratedVoiceEnhance,
+                    };
+                }
+            }
+
             setCharacterProfiles(nextProfiles);
 
-            if (nextProfiles[characterId]) {
-                applyCharacterProfile(nextProfiles[characterId]);
+            const lastCharacterIdRaw = localStorage.getItem(LAST_CHARACTER_ID_STORAGE_KEY) || '';
+            const nextCharacterId = lastCharacterIdRaw.trim() || characterId;
+            if (nextCharacterId) {
+                setCharacterId(nextCharacterId);
+            }
+
+            const activeProfile = nextProfiles[nextCharacterId] || nextProfiles[characterId];
+            if (activeProfile) {
+                applyCharacterProfile(activeProfile);
+            } else {
+                applyDefaultCharacterProfile();
+                if (migratedVoiceEnhance) {
+                    applyVoiceEnhanceSettings(migratedVoiceEnhance);
+                }
             }
 
             if (parsedUser && typeof parsedUser === 'object') {
@@ -310,20 +636,25 @@ const CharacterStudioScreen: React.FC = () => {
                 if (typeof parsedLegacy.user.callName === 'string') setUserCallName(parsedLegacy.user.callName);
                 if (typeof parsedLegacy.user.profileNote === 'string') setUserProfileNote(parsedLegacy.user.profileNote);
             }
+
         } catch {
             // Ignore corrupted local settings.
+        } finally {
+            setIsStorageHydrated(true);
         }
     }, []);
 
     useEffect(() => {
+        if (!isStorageHydrated) return;
         try {
             localStorage.setItem(CHARACTER_PROFILES_STORAGE_KEY, JSON.stringify(characterProfiles));
         } catch {
             // Ignore storage failures.
         }
-    }, [characterProfiles]);
+    }, [characterProfiles, isStorageHydrated]);
 
     useEffect(() => {
+        if (!isStorageHydrated) return;
         try {
             const nextUserProfile: StoredUserProfile = {
                 name: userName.trim(),
@@ -334,41 +665,16 @@ const CharacterStudioScreen: React.FC = () => {
         } catch {
             // Ignore storage failures.
         }
-    }, [userName, userCallName, userProfileNote]);
+    }, [userName, userCallName, userProfileNote, isStorageHydrated]);
 
     useEffect(() => {
-        const id = characterId.trim();
-        if (!id) return;
-        const nextProfile = buildCharacterProfileFromState();
-        setCharacterProfiles((prev) => {
-            const prevProfile = prev[id];
-            if (
-                prevProfile
-                && prevProfile.nameKanji === nextProfile.nameKanji
-                && prevProfile.nameKana === nextProfile.nameKana
-                && prevProfile.firstPerson === nextProfile.firstPerson
-                && prevProfile.personaNote === nextProfile.personaNote
-                && prevProfile.speakingStyleNote === nextProfile.speakingStyleNote
-            ) {
-                return prev;
-            }
-            return { ...prev, [id]: nextProfile };
-        });
-    }, [
-        characterNameKanji,
-        characterNameKana,
-        characterFirstPerson,
-        characterPersonaNote,
-        characterSpeakingStyleNote,
-    ]);
-
-    useEffect(() => {
-        const id = characterId.trim();
-        if (!id) return;
-        const savedProfile = characterProfiles[id];
-        if (!savedProfile) return;
-        applyCharacterProfile(savedProfile);
-    }, [characterId, characterProfiles]);
+        if (!isStorageHydrated) return;
+        try {
+            localStorage.setItem(LAST_CHARACTER_ID_STORAGE_KEY, characterId.trim());
+        } catch {
+            // Ignore storage failures.
+        }
+    }, [characterId, isStorageHydrated]);
 
     useEffect(() => {
         if (!selectedSbv2Model) return;
@@ -402,6 +708,103 @@ const CharacterStudioScreen: React.FC = () => {
         }
     };
 
+    const buildVoiceSnapshotText = (voiceResult?: CharacterChatResponse['voice']): string => {
+        if (!voiceEnabled) {
+            return 'voice=OFF';
+        }
+
+        const parts: string[] = [];
+        parts.push(`voice=${voiceMode}`);
+        parts.push(`sbv2=${sbv2ModelId.trim() || 'auto'}`);
+        parts.push(`style=${sbv2Style.trim() || 'auto'}`);
+
+        if (voiceMode === 'sbv2+rvc') {
+            parts.push(`rvc=${rvcModelId.trim() || 'auto'}`);
+            parts.push(`sid=${Number.isFinite(rvcSpeakerId) ? rvcSpeakerId : 0}`);
+            parts.push(`index=${rvcIndexPath.trim() || 'none'}`);
+        }
+
+        parts.push(`learn=${singingTrainingMode ? 'on' : 'off'}`);
+        parts.push(`singing=${forceSingingMode ? 'forced' : 'auto'}`);
+        parts.push(`refine=${autoEmotionRefine ? 'on' : 'off'}`);
+        parts.push(`enhance=${enhanceFinalAudio ? 'on' : 'off'}`);
+        parts.push(`analyze=${autoAnalyzeAndEnhance ? 'on' : 'off'}`);
+        parts.push(`hint=${emotionLabelHint}`);
+        if (useEmotionIntensityHint) {
+            parts.push(`hintI=${Math.max(0, Math.min(1, emotionIntensityHint)).toFixed(2)}`);
+        }
+
+        if (voiceResult) {
+            const elapsed = voiceResult.stages?.totalMs ?? voiceResult.durationMs;
+            if (voiceResult.success) {
+                parts.push(`synth=ok${typeof elapsed === 'number' ? `(${elapsed}ms)` : ''}`);
+            } else {
+                parts.push(`synth=ng:${voiceResult.error?.code || 'unknown'}`);
+            }
+            if (voiceResult.analysis?.analyzed) {
+                const beforeScore = voiceResult.analysis.before?.qualityScore;
+                const afterScore = voiceResult.analysis.after?.qualityScore;
+                if (voiceResult.analysis.profileId) {
+                    parts.push(`profile=${voiceResult.analysis.profileId}`);
+                }
+                if (typeof beforeScore === 'number' && typeof afterScore === 'number') {
+                    parts.push(`q=${beforeScore.toFixed(1)}->${afterScore.toFixed(1)}`);
+                } else if (typeof afterScore === 'number') {
+                    parts.push(`q=${afterScore.toFixed(1)}`);
+                }
+                if (voiceResult.analysis.autoEnhanced && voiceResult.analysis.actions.length > 0) {
+                    parts.push(`fix=${voiceResult.analysis.actions.slice(0, 2).join('+')}`);
+                }
+            }
+        }
+
+        return parts.join(' | ');
+    };
+
+    const copyTextWithFallback = async (text: string): Promise<boolean> => {
+        const normalized = String(text || '');
+        if (!normalized) {
+            return false;
+        }
+
+        try {
+            if (navigator?.clipboard?.writeText) {
+                await navigator.clipboard.writeText(normalized);
+                return true;
+            }
+        } catch {
+            // Fallback below.
+        }
+
+        try {
+            const textarea = document.createElement('textarea');
+            textarea.value = normalized;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            textarea.style.pointerEvents = 'none';
+            textarea.style.left = '-9999px';
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            const copied = document.execCommand('copy');
+            document.body.removeChild(textarea);
+            return copied;
+        } catch {
+            return false;
+        }
+    };
+
+    const handleCopyVoiceSnapshot = async (text: string) => {
+        const copied = await copyTextWithFallback(text);
+        if (copied) {
+            setCopyStatus('Voice snapshot copied.');
+            setTimeout(() => setCopyStatus(''), 1600);
+            return;
+        }
+        setCopyStatus('Failed to copy voice snapshot.');
+        setTimeout(() => setCopyStatus(''), 2200);
+    };
+
     const handleSend = async () => {
         const text = inputText.trim();
         if (!text || isSending) return;
@@ -420,11 +823,31 @@ const CharacterStudioScreen: React.FC = () => {
 
         setIsSending(true);
         try {
+            const voiceExpression: {
+                singing?: boolean;
+                autoEmotionRefine: boolean;
+                emotionLabelHint?: 'neutral' | 'joy' | 'sad' | 'angry' | 'excited';
+                emotionIntensityHint?: number;
+            } = {
+                autoEmotionRefine,
+            };
+            if (forceSingingMode) {
+                voiceExpression.singing = true;
+            }
+            if (emotionLabelHint !== 'auto') {
+                voiceExpression.emotionLabelHint = emotionLabelHint;
+            }
+            if (useEmotionIntensityHint) {
+                voiceExpression.emotionIntensityHint = Math.max(0, Math.min(1, emotionIntensityHint));
+            }
             const response: CharacterChatResponse = await window.electronAPI.characterChatSend({
                 sessionId,
                 characterId,
                 text,
                 settings: conversationSettings,
+                learning: {
+                    singingTrainingMode,
+                },
                 withVoice: voiceEnabled,
                 voice: {
                     mode: voiceMode,
@@ -437,6 +860,11 @@ const CharacterStudioScreen: React.FC = () => {
                         speakerId: Number.isFinite(rvcSpeakerId) ? rvcSpeakerId : 0,
                         indexPath: rvcIndexPath.trim() || undefined,
                     } : undefined,
+                    expression: voiceExpression,
+                    output: {
+                        enhanceFinalAudio,
+                        autoAnalyzeAndEnhance,
+                    },
                 },
             });
 
@@ -457,6 +885,7 @@ const CharacterStudioScreen: React.FC = () => {
                 text: response.responseText || '(empty response)',
                 emotionLabel: response.emotion?.label,
                 emotionIntensity: response.emotion?.intensity,
+                voiceSnapshot: response.voice ? buildVoiceSnapshotText(response.voice) : undefined,
             });
 
             if (voiceEnabled) {
@@ -534,11 +963,45 @@ const CharacterStudioScreen: React.FC = () => {
                     <h3 style={{ marginTop: 0 }}>Character</h3>
                     <label
                         style={{ display: 'block', fontSize: '12px', marginBottom: '6px' }}
-                        title="話し相手のキャラクターIDです。登録済みIDを入力します。"
+                        title="話し相手のキャラクターIDです。保存済みIDから選択します。"
                     >
                         Character ID
                     </label>
-                    <input value={characterId} onChange={(e) => setCharacterId(e.target.value)} style={{ width: '100%', marginBottom: '12px' }} />
+                    <select
+                        value={characterId}
+                        onChange={(e) => switchCharacterId(e.target.value, { fromSelect: true })}
+                        style={{ width: '100%', marginBottom: '12px' }}
+                    >
+                        {characterIdOptions.map((id) => (
+                            <option key={id} value={id}>
+                                {id}
+                            </option>
+                        ))}
+                    </select>
+
+                    <label
+                        style={{ display: 'block', fontSize: '12px', marginBottom: '6px' }}
+                        title="新しいCharacter IDを入力して切り替えます。保存するとリストに追加されます。"
+                    >
+                        New Character ID
+                    </label>
+                    <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+                        <input
+                            value={characterIdDraft}
+                            onChange={(e) => setCharacterIdDraft(e.target.value)}
+                            style={{ flex: 1 }}
+                            placeholder="例: aozuki_fox_v2"
+                        />
+                        <button
+                            onClick={() => {
+                                switchCharacterId(characterIdDraft, { fromSelect: false });
+                                setCharacterIdDraft('');
+                            }}
+                            style={{ padding: '8px 10px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-surface)', color: 'var(--color-text)' }}
+                        >
+                            Use
+                        </button>
+                    </div>
 
                     <label
                         style={{ display: 'block', fontSize: '12px', marginBottom: '6px' }}
@@ -608,14 +1071,14 @@ const CharacterStudioScreen: React.FC = () => {
                         <button
                             onClick={() => saveCharacterProfile(true)}
                             style={{ flex: 1, padding: '8px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-surface)', color: 'var(--color-text)' }}
-                            title="Character ID をキーに現在のキャラクター設定を保存します。"
+                            title="Character ID をキーに現在のキャラクター設定（音声ON/OFF・再生音量・音声モデル・音声強化設定を含む）を保存します。"
                         >
                             Save Character
                         </button>
                         <button
                             onClick={() => loadCharacterProfile(true)}
                             style={{ flex: 1, padding: '8px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-surface)', color: 'var(--color-text)' }}
-                            title="Character ID に保存済みのキャラクター設定を読み込みます。"
+                            title="Character ID に保存済みのキャラクター設定（音声ON/OFF・再生音量・音声モデル・音声強化設定を含む）を読み込みます。"
                         >
                             Load Character
                         </button>
@@ -623,6 +1086,11 @@ const CharacterStudioScreen: React.FC = () => {
                     {profileStatus && (
                         <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginBottom: '12px' }}>
                             {profileStatus}
+                        </div>
+                    )}
+                    {!profileStatus && (
+                        <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginBottom: '12px' }}>
+                            {hasSavedProfileForCurrentCharacter ? 'Saved profile exists for this Character ID.' : 'No saved profile for this Character ID yet.'}
                         </div>
                     )}
 
@@ -695,6 +1163,115 @@ const CharacterStudioScreen: React.FC = () => {
                         <option value="sbv2+rvc">SBV2 + RVC</option>
                         <option value="sbv2">SBV2 only</option>
                     </select>
+
+                    <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}
+                        title="ONのとき、YouTube URLを送信すると音源を取得して歌声抽出と学習素材保存を実行します。"
+                    >
+                        <input
+                            type="checkbox"
+                            checked={singingTrainingMode}
+                            onChange={(e) => setSingingTrainingMode(e.target.checked)}
+                        />
+                        Singing learning mode (YouTube URL)
+                    </label>
+
+                    <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}
+                        title="ONで歌唱モードを強制します。OFFならテキスト内容から自動判定します。"
+                    >
+                        <input
+                            type="checkbox"
+                            checked={forceSingingMode}
+                            onChange={(e) => setForceSingingMode(e.target.checked)}
+                        />
+                        Force singing mode
+                    </label>
+
+                    <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}
+                        title="ONで感情強度の自己改善（履歴平滑化）を有効化します。"
+                    >
+                        <input
+                            type="checkbox"
+                            checked={autoEmotionRefine}
+                            onChange={(e) => setAutoEmotionRefine(e.target.checked)}
+                        />
+                        Auto emotion refine
+                    </label>
+
+                    <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}
+                        title="ONで最終WAVの軽量音質改善（ゲイン整形/クリップ保護）を有効化します。"
+                    >
+                        <input
+                            type="checkbox"
+                            checked={enhanceFinalAudio}
+                            onChange={(e) => setEnhanceFinalAudio(e.target.checked)}
+                        />
+                        Enhance final audio
+                    </label>
+
+                    <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}
+                        title="ONで生成WAVを解析し、クリップ・DCオフセット・音量バランスを自動補正します。"
+                    >
+                        <input
+                            type="checkbox"
+                            checked={autoAnalyzeAndEnhance}
+                            onChange={(e) => setAutoAnalyzeAndEnhance(e.target.checked)}
+                        />
+                        Auto analyze generated WAV
+                    </label>
+
+                    <label
+                        style={{ display: 'block', fontSize: '12px', marginBottom: '6px' }}
+                        title="感情ラベルのヒントです。Autoの場合は会話内容から自動推定します。"
+                    >
+                        Emotion Label Hint
+                    </label>
+                    <select
+                        value={emotionLabelHint}
+                        onChange={(e) => setEmotionLabelHint(
+                            e.target.value as 'auto' | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited',
+                        )}
+                        style={{ width: '100%', marginBottom: '8px' }}
+                    >
+                        <option value="auto">Auto</option>
+                        <option value="neutral">Neutral</option>
+                        <option value="joy">Joy</option>
+                        <option value="sad">Sad</option>
+                        <option value="angry">Angry</option>
+                        <option value="excited">Excited</option>
+                    </select>
+
+                    <label
+                        style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}
+                        title="ONで感情強度ヒント（0.00-1.00）を送信します。"
+                    >
+                        <input
+                            type="checkbox"
+                            checked={useEmotionIntensityHint}
+                            onChange={(e) => setUseEmotionIntensityHint(e.target.checked)}
+                        />
+                        Use emotion intensity hint
+                    </label>
+                    <label
+                        style={{ display: 'block', fontSize: '12px', marginBottom: '6px' }}
+                        title="感情強度ヒントです。大きいほど表現を強めます。"
+                    >
+                        Emotion Intensity Hint: {emotionIntensityHint.toFixed(2)}
+                    </label>
+                    <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.01}
+                        value={emotionIntensityHint}
+                        onChange={(e) => setEmotionIntensityHint(Number(e.target.value))}
+                        style={{ width: '100%', marginBottom: '10px' }}
+                        disabled={!useEmotionIntensityHint}
+                    />
 
                     <label
                         style={{ display: 'block', fontSize: '12px', marginBottom: '6px' }}
@@ -831,6 +1408,29 @@ const CharacterStudioScreen: React.FC = () => {
                                         <span>{` | emotion=${msg.emotionLabel}${typeof msg.emotionIntensity === 'number' ? `(${msg.emotionIntensity.toFixed(2)})` : ''}`}</span>
                                     )}
                                 </div>
+                                {msg.role === 'assistant' && msg.voiceSnapshot && (
+                                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', marginBottom: '6px' }}>
+                                        <div style={{ flex: 1, fontSize: '10px', opacity: 0.7, wordBreak: 'break-all' }}>
+                                            {msg.voiceSnapshot}
+                                        </div>
+                                        <button
+                                            onClick={() => { void handleCopyVoiceSnapshot(msg.voiceSnapshot || ''); }}
+                                            style={{
+                                                padding: '2px 6px',
+                                                borderRadius: '6px',
+                                                border: '1px solid var(--color-border)',
+                                                background: 'var(--color-surface)',
+                                                color: 'var(--color-text)',
+                                                fontSize: '10px',
+                                                lineHeight: 1.2,
+                                                cursor: 'pointer',
+                                            }}
+                                            title="Copy voice snapshot"
+                                        >
+                                            Copy
+                                        </button>
+                                    </div>
+                                )}
                                 <div>{msg.text}</div>
                             </div>
                         ))}
@@ -851,7 +1451,12 @@ const CharacterStudioScreen: React.FC = () => {
                             }}
                         />
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                            <div style={{ color: '#f87171', fontSize: '12px' }}>{lastError}</div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                <div style={{ color: '#f87171', fontSize: '12px' }}>{lastError}</div>
+                                {!lastError && copyStatus && (
+                                    <div style={{ color: 'var(--color-text-secondary)', fontSize: '12px' }}>{copyStatus}</div>
+                                )}
+                            </div>
                             <button
                                 onClick={handleSend}
                                 disabled={isSending || !inputText.trim()}

@@ -345,7 +345,26 @@ export class Sbv2Service {
      * Split long text into chunks suitable for SBV2 synthesis (max ~90 chars).
      * Removes newlines and splits at natural Japanese sentence boundaries.
      */
-    private splitTextForSynthesis(rawText: string, maxLen: number = 90): string[] {
+    private splitTextForSynthesis(rawText: string, maxLen: number = 90, preserveLineBreaks: boolean = false): string[] {
+        if (preserveLineBreaks) {
+            const lines = rawText
+                .split(/\r?\n+/)
+                .map((line) => line.trim())
+                .filter(Boolean);
+            const merged: string[] = [];
+            for (const line of lines) {
+                const chunks = this.splitTextForSynthesis(line, maxLen, false);
+                for (const chunk of chunks) {
+                    if (chunk) {
+                        merged.push(chunk);
+                    }
+                }
+            }
+            if (merged.length > 0) {
+                return merged;
+            }
+        }
+
         // Remove newlines and collapse whitespace
         const cleaned = rawText.replace(/[\r\n]+/g, '').replace(/\s+/g, ' ').trim();
         if (!cleaned) return [];
@@ -435,6 +454,15 @@ export class Sbv2Service {
         if (params.filterStrength !== undefined) {
             queryParams.set('filter_strength', String(params.filterStrength));
         }
+        if (params.lineSplit === true) {
+            queryParams.set('line_split', 'true');
+        }
+        if (params.splitInterval !== undefined) {
+            const interval = Number(params.splitInterval);
+            if (Number.isFinite(interval)) {
+                queryParams.set('split_interval', String(Math.max(0.01, Math.min(2, interval))));
+            }
+        }
 
         const requestUrl = `${endpoint}/voice?${queryParams.toString()}`;
         console.log('[Sbv2Service] Synthesize chunk:', params.text.slice(0, 40) + (params.text.length > 40 ? '...' : ''));
@@ -455,16 +483,45 @@ export class Sbv2Service {
     /**
      * Concatenate multiple WAV buffers (assumes same format) into one.
      */
-    private concatWavBuffers(buffers: ArrayBuffer[]): Buffer {
-        if (buffers.length === 1) return Buffer.from(buffers[0]);
+    private parseWavFormat(buffer: ArrayBuffer): { sampleRate: number; channels: number; bitsPerSample: number } {
+        if (buffer.byteLength < 44) {
+            return { sampleRate: 44100, channels: 1, bitsPerSample: 16 };
+        }
+        const view = new DataView(buffer);
+        const channels = view.getUint16(22, true);
+        const sampleRate = view.getUint32(24, true);
+        const bitsPerSample = view.getUint16(34, true);
+        return {
+            sampleRate: sampleRate || 44100,
+            channels: channels || 1,
+            bitsPerSample: bitsPerSample || 16,
+        };
+    }
+
+    private concatWavBuffers(buffers: ArrayBuffer[], pauseMs: number = 0): Buffer {
+        if (buffers.length === 1 && pauseMs <= 0) return Buffer.from(buffers[0]);
+
+        const format = this.parseWavFormat(buffers[0]);
+        const bytesPerSample = Math.max(1, Math.floor(format.bitsPerSample / 8));
+        const bytesPerFrame = Math.max(1, format.channels * bytesPerSample);
+        const silenceFrames = pauseMs > 0
+            ? Math.max(0, Math.round((format.sampleRate * pauseMs) / 1000))
+            : 0;
+        const silenceBytes = silenceFrames * bytesPerFrame;
+        const pauseBuffer = silenceBytes > 0 ? Buffer.alloc(silenceBytes, 0) : null;
 
         // Extract raw PCM data from each WAV (skip 44-byte header)
         const pcmChunks: Buffer[] = [];
         let totalDataLen = 0;
-        for (const buf of buffers) {
+        for (let i = 0; i < buffers.length; i += 1) {
+            const buf = buffers[i];
             const data = Buffer.from(buf).subarray(44);
             pcmChunks.push(data);
             totalDataLen += data.length;
+            if (pauseBuffer && i < buffers.length - 1) {
+                pcmChunks.push(pauseBuffer);
+                totalDataLen += pauseBuffer.length;
+            }
         }
 
         // Build new WAV from first buffer's header
@@ -504,7 +561,52 @@ export class Sbv2Service {
 
         try {
             // Split long text into chunks, removing newlines
-            const chunks = this.splitTextForSynthesis(params.text);
+            const preserveLineBreaks = params.preserveLineBreaks === true;
+            const lineSplit = params.lineSplit === true;
+            const pauseMsRaw = Number(params.chunkPauseMs);
+            const pauseMs = Number.isFinite(pauseMsRaw)
+                ? Math.max(0, Math.min(1500, Math.floor(pauseMsRaw)))
+                : 0;
+            const splitIntervalRaw = Number(params.splitInterval);
+            const splitInterval = Number.isFinite(splitIntervalRaw)
+                ? Math.max(0.01, Math.min(2, splitIntervalRaw))
+                : (pauseMs > 0 ? Math.max(0.05, Math.min(1.5, pauseMs / 1000)) : undefined);
+
+            if (lineSplit && preserveLineBreaks && /[\r\n]/.test(params.text)) {
+                const lineSplitResult = await this.synthesizeChunk(
+                    {
+                        ...params,
+                        lineSplit: true,
+                        splitInterval,
+                    },
+                    endpoint,
+                );
+                if (lineSplitResult.success && lineSplitResult.buffer) {
+                    const directBuffer = Buffer.from(lineSplitResult.buffer);
+                    const cacheDir = path.join(this.installPath, CACHE_DIR);
+                    fs.mkdirSync(cacheDir, { recursive: true });
+                    const wavPath = path.join(cacheDir, `synth_${Date.now()}.wav`);
+                    fs.writeFileSync(wavPath, directBuffer);
+
+                    const abuf = directBuffer.buffer.slice(
+                        directBuffer.byteOffset,
+                        directBuffer.byteOffset + directBuffer.byteLength,
+                    ) as ArrayBuffer;
+                    const durationMs = this.estimateWavDuration(abuf);
+                    const wavFormat = this.parseWavFormat(abuf);
+
+                    return {
+                        success: true,
+                        wavPath,
+                        audioBase64: directBuffer.toString('base64'),
+                        durationMs,
+                        sampleRate: wavFormat.sampleRate,
+                    };
+                }
+                console.warn('[Sbv2Service] line_split synthesis failed, fallback to local chunk concat');
+            }
+
+            const chunks = this.splitTextForSynthesis(params.text, 90, preserveLineBreaks);
             if (chunks.length === 0) {
                 return {
                     success: false,
@@ -516,7 +618,7 @@ export class Sbv2Service {
 
             const wavBuffers: ArrayBuffer[] = [];
             for (let i = 0; i < chunks.length; i++) {
-                const chunkParams = { ...params, text: chunks[i] };
+                const chunkParams = { ...params, text: chunks[i], lineSplit: false };
                 const result = await this.synthesizeChunk(chunkParams, endpoint);
                 if (!result.success || !result.buffer) {
                     return {
@@ -528,7 +630,7 @@ export class Sbv2Service {
             }
 
             // Concatenate all WAV chunks
-            const combinedBuffer = this.concatWavBuffers(wavBuffers);
+            const combinedBuffer = this.concatWavBuffers(wavBuffers, pauseMs);
 
             // Save to cache
             const cacheDir = path.join(this.installPath, CACHE_DIR);
@@ -538,13 +640,14 @@ export class Sbv2Service {
 
             const abuf = combinedBuffer.buffer.slice(combinedBuffer.byteOffset, combinedBuffer.byteOffset + combinedBuffer.byteLength) as ArrayBuffer;
             const durationMs = this.estimateWavDuration(abuf);
+            const wavFormat = this.parseWavFormat(abuf);
 
             return {
                 success: true,
                 wavPath,
                 audioBase64: combinedBuffer.toString('base64'),
                 durationMs,
-                sampleRate: 44100,
+                sampleRate: wavFormat.sampleRate,
             };
 
         } catch (err) {
@@ -559,10 +662,10 @@ export class Sbv2Service {
     }
 
     private estimateWavDuration(buffer: ArrayBuffer): number {
-        // Simple WAV duration estimation
-        // Assumes 44100Hz, 16-bit, mono for estimation
-        const dataSize = buffer.byteLength - 44; // Subtract header
-        const bytesPerSecond = 44100 * 2; // 16-bit = 2 bytes
+        const format = this.parseWavFormat(buffer);
+        const dataSize = Math.max(0, buffer.byteLength - 44);
+        const bytesPerSample = Math.max(1, Math.floor(format.bitsPerSample / 8));
+        const bytesPerSecond = Math.max(1, format.sampleRate * format.channels * bytesPerSample);
         return Math.round((dataSize / bytesPerSecond) * 1000);
     }
 

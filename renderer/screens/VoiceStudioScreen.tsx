@@ -11,6 +11,7 @@ type AutoEmotionStrengthPreset = 'subtle' | 'standard' | 'strong';
 type AutoEmotionApplyMode = 'fixed_style' | 'auto_style';
 type AutoEmotionOverride = 'auto' | AutoEmotion;
 type AutoEmotionAnalyzerMode = 'rule' | 'classifier' | 'hybrid';
+type AssistDirectionPreset = 'none' | 'bright' | 'dark' | 'joy' | 'anger' | 'sadness' | 'fear' | 'calm';
 
 interface TtsStatus {
     installState: TtsInstallState;
@@ -115,6 +116,23 @@ interface AutoEmotionSynthesisParams {
     curveFactor: number;
     assistText: string;
     jpExtraBoostApplied: boolean;
+}
+
+interface AssistDirectionOverride {
+    preset?: AssistDirectionPreset;
+    strength?: number;
+}
+
+interface AssistDirectionOptimizationResult {
+    enabled: boolean;
+    isLongForm: boolean;
+    preset: AssistDirectionPreset;
+    strength: number;
+    dominantEmotion: AutoEmotion;
+    averageIntensity: number;
+    segmentCount: number;
+    charCount: number;
+    reason: string;
 }
 
 interface AutoEmotionAudioSegment {
@@ -225,6 +243,74 @@ const AUTO_EMOTION_STRENGTH_GAIN: Record<AutoEmotionStrengthPreset, number> = {
     subtle: 0.65,
     standard: 1.0,
     strong: 1.35,
+};
+
+const ASSIST_DIRECTION_PROMPTS: Record<
+    Exclude<AssistDirectionPreset, 'none'>,
+    { primary: string; reinforce: string; mappedEmotion: AutoEmotion }
+> = {
+    bright: {
+        primary: '全体トーンを明るく前向きに保つ。',
+        reinforce: '語尾を軽く上げ、軽快に話す。',
+        mappedEmotion: 'joy',
+    },
+    dark: {
+        primary: '全体トーンを暗めで落ち着いた方向に寄せる。',
+        reinforce: '抑揚を少し抑え、静かに話す。',
+        mappedEmotion: 'sadness',
+    },
+    joy: {
+        primary: '喜びを中心に、明るく笑顔が伝わる口調で話す。',
+        reinforce: '快活で弾むようなニュアンスを強める。',
+        mappedEmotion: 'joy',
+    },
+    anger: {
+        primary: '怒りを中心に、語気を強めて芯のある口調で話す。',
+        reinforce: 'キレを保ち、テンポを詰めすぎず強調して話す。',
+        mappedEmotion: 'anger',
+    },
+    sadness: {
+        primary: '悲しみを中心に、沈んだ落ち着いた口調で話す。',
+        reinforce: '余韻を残すように丁寧に話す。',
+        mappedEmotion: 'sadness',
+    },
+    fear: {
+        primary: '不安・恐れを中心に、慎重で迷いのある口調で話す。',
+        reinforce: '語尾の迷いと間を少し増やして話す。',
+        mappedEmotion: 'fear',
+    },
+    calm: {
+        primary: '穏やかで中立寄りのトーンを最優先する。',
+        reinforce: '過度な感情を抑え、聞き取りやすく安定して話す。',
+        mappedEmotion: 'neutral',
+    },
+};
+
+const getAssistDirectionStrengthBand = (
+    strength: number,
+): { label: 'subtle' | 'natural' | 'strong'; text: string; gain: number } => {
+    if (strength < 0.40) {
+        return { label: 'subtle', text: '感情は控えめに', gain: 0.45 };
+    }
+    if (strength < 0.72) {
+        return { label: 'natural', text: '感情は自然に', gain: 0.75 };
+    }
+    return { label: 'strong', text: '感情は強めに', gain: 1.0 };
+};
+
+const mapEmotionToDirectionPreset = (emotion: AutoEmotion): AssistDirectionPreset => {
+    switch (emotion) {
+        case 'joy':
+            return 'joy';
+        case 'sadness':
+            return 'sadness';
+        case 'anger':
+            return 'anger';
+        case 'fear':
+            return 'fear';
+        default:
+            return 'calm';
+    }
 };
 
 const AUTO_EMOTION_STYLE_HINTS: Record<
@@ -511,6 +597,9 @@ const VoiceStudioScreen: React.FC = () => {
     const [text, setText] = useState('こんにちは、音声合成のテストです。');
     const [assistText, setAssistText] = useState('');
     const [assistTextWeight, setAssistTextWeight] = useState(1.0);
+    const [assistDirectionPreset, setAssistDirectionPreset] = useState<AssistDirectionPreset>('none');
+    const [assistDirectionStrength, setAssistDirectionStrength] = useState(0.50);
+    const [assistDirectionAutoOptimize, setAssistDirectionAutoOptimize] = useState(false);
     const [speed, setSpeed] = useState(1.0);
     const [pitch, setPitch] = useState(0.0);
     const [intonation, setIntonation] = useState(1.0);
@@ -3067,13 +3156,81 @@ const VoiceStudioScreen: React.FC = () => {
         return availableStyles[0] || preferredBase || 'Neutral';
     };
 
+    const buildDirectionalAssistText = (
+        baseAssistText: string,
+        autoEmotion?: AutoEmotion,
+        override?: AssistDirectionOverride,
+    ): string => {
+        const manual = (baseAssistText || '').trim();
+        const preset = override?.preset ?? assistDirectionPreset;
+        const strength = clamp(override?.strength ?? assistDirectionStrength, 0, 1);
+        if (preset === 'none') {
+            return manual;
+        }
+        const def = ASSIST_DIRECTION_PROMPTS[preset];
+        const band = getAssistDirectionStrengthBand(strength);
+        const withReinforce = band.label === 'strong' || strength >= 0.58;
+        const conflict = autoEmotion && autoEmotion !== def.mappedEmotion && autoEmotion !== 'neutral'
+            ? `補助として${AUTO_EMOTION_EMOJI[autoEmotion]}の要素を弱く残す。`
+            : '';
+        const directionText = [
+            `${band.text}。`,
+            def.primary,
+            withReinforce ? def.reinforce : '',
+            conflict,
+        ]
+            .filter(Boolean)
+            .join('');
+        return manual ? `${directionText}${manual}` : directionText;
+    };
+
+    const resolveAssistParams = (
+        baseAssistText: string,
+        baseAssistTextWeight: number,
+        autoEmotion?: AutoEmotion,
+        override?: AssistDirectionOverride,
+    ): {
+        resolvedAssistText: string;
+        resolvedAssistTextWeight: number;
+        forcedEmotion: AutoEmotion | null;
+        conflict: boolean;
+        reason: string;
+    } => {
+        const safeBaseWeight = clamp(baseAssistTextWeight, 0, 2);
+        const preset = override?.preset ?? assistDirectionPreset;
+        const strength = clamp(override?.strength ?? assistDirectionStrength, 0, 1);
+        if (preset === 'none') {
+            return {
+                resolvedAssistText: (baseAssistText || '').trim(),
+                resolvedAssistTextWeight: safeBaseWeight,
+                forcedEmotion: null,
+                conflict: false,
+                reason: 'direction=none',
+            };
+        }
+        const def = ASSIST_DIRECTION_PROMPTS[preset];
+        const band = getAssistDirectionStrengthBand(strength);
+        const conflict = !!autoEmotion && autoEmotion !== def.mappedEmotion;
+        const conflictPenalty = def.mappedEmotion === 'neutral' && conflict ? 0.75 : 1.0;
+        const delta = (0.12 + 0.88 * strength) * band.gain * conflictPenalty;
+        const resolvedAssistTextWeight = clamp(safeBaseWeight + delta, 0, 2);
+        return {
+            resolvedAssistText: buildDirectionalAssistText(baseAssistText, autoEmotion, override),
+            resolvedAssistTextWeight,
+            forcedEmotion: def.mappedEmotion,
+            conflict,
+            reason: `direction=${preset}; strength=${strength.toFixed(2)}; band=${band.label}; delta=${delta.toFixed(2)}`,
+        };
+    };
+
     const buildEmotionAssistText = (
         emotion: AutoEmotion,
         intensity: number,
         jpExtraBoostActive: boolean,
         boostLevel: number,
+        baseAssistText: string,
     ): string => {
-        const baseAssist = (assistText || '').trim();
+        const baseAssist = (baseAssistText || '').trim();
         if (!jpExtraBoostActive) {
             return baseAssist;
         }
@@ -3094,18 +3251,104 @@ const VoiceStudioScreen: React.FC = () => {
         return baseAssist ? `${jpPrompt}${baseAssist}` : jpPrompt;
     };
 
+    const buildAssistDirectionOptimization = (
+        sourceText: string,
+    ): AssistDirectionOptimizationResult => {
+        const textBody = (sourceText || '').trim();
+        const fallback: AssistDirectionOptimizationResult = {
+            enabled: false,
+            isLongForm: false,
+            preset: assistDirectionPreset,
+            strength: assistDirectionStrength,
+            dominantEmotion: 'neutral',
+            averageIntensity: 0,
+            segmentCount: 0,
+            charCount: textBody.length,
+            reason: 'auto-optimize disabled or short text',
+        };
+        if (!assistDirectionAutoOptimize) {
+            return fallback;
+        }
+        if (!textBody) {
+            return {
+                ...fallback,
+                enabled: true,
+                reason: 'auto-optimize enabled but empty text',
+            };
+        }
+
+        const segments = splitTextForAutoEmotion(textBody);
+        const isLongForm = textBody.length >= 120 || segments.length >= 3;
+        if (!isLongForm) {
+            return {
+                ...fallback,
+                enabled: true,
+                reason: `auto-optimize enabled but short text (chars=${textBody.length}, segments=${segments.length})`,
+                segmentCount: segments.length,
+            };
+        }
+
+        const analyses = segments.map((seg) => analyzeAutoEmotionSegment(seg));
+        const aggScores: Record<AutoEmotion, number> = {
+            neutral: 0,
+            joy: 0,
+            sadness: 0,
+            anger: 0,
+            fear: 0,
+        };
+        let intensitySum = 0;
+        for (const a of analyses) {
+            intensitySum += a.intensity;
+            for (const emotionKey of ['neutral', 'joy', 'sadness', 'anger', 'fear'] as AutoEmotion[]) {
+                aggScores[emotionKey] += a.scoreByEmotion[emotionKey] || 0;
+            }
+        }
+        const dominantEmotion = (Object.entries(aggScores) as [AutoEmotion, number][])
+            .sort((a, b) => b[1] - a[1])[0]?.[0] || 'neutral';
+        const averageIntensity = analyses.length > 0
+            ? clamp(intensitySum / analyses.length, 0, 1)
+            : 0;
+
+        const punctuationDrive = clamp(
+            ((textBody.match(/[!?！？]/g)?.length || 0)
+                + (textBody.match(/…|\.\.\./g)?.length || 0) * 0.7) / Math.max(2, segments.length * 2),
+            0,
+            1,
+        );
+        const globalPreset = assistDirectionPreset === 'none'
+            ? mapEmotionToDirectionPreset(dominantEmotion)
+            : assistDirectionPreset;
+        const baseStrength = assistDirectionPreset === 'none'
+            ? clamp(0.26 + averageIntensity * 0.42 + punctuationDrive * 0.22 + Math.min(0.14, segments.length * 0.02), 0.20, 0.95)
+            : clamp(assistDirectionStrength * 0.72 + (0.24 + averageIntensity * 0.34 + punctuationDrive * 0.20) * 0.28, 0, 1);
+
+        return {
+            enabled: true,
+            isLongForm: true,
+            preset: globalPreset,
+            strength: baseStrength,
+            dominantEmotion,
+            averageIntensity,
+            segmentCount: segments.length,
+            charCount: textBody.length,
+            reason: `long-text context preset=${globalPreset}, dominant=${dominantEmotion}, avgInt=${averageIntensity.toFixed(2)}, punct=${punctuationDrive.toFixed(2)}`,
+        };
+    };
+
     const mapAutoEmotionToParams = (
         segment: string,
         analysis: AutoEmotionAnalysis,
         segmentIndex: number,
         segmentCount: number,
         availableStyles: string[],
+        directionOptimization?: AssistDirectionOptimizationResult,
     ): { resolvedEmotion: AutoEmotion; params: AutoEmotionSynthesisParams; reason: string } => {
         const jpExtraBoostActive = sbv2JpExtraEmotionBoost && selectedTtsLikelyJpExtra;
         const boostLevel = clamp(sbv2JpExtraBoostLevel, 0, 1);
         let emotion = analysis.emotion;
         let confidence = analysis.confidence;
         let intensity = analysis.intensity;
+        let conflictClampApplied = false;
 
         if (sbv2AutoEmotionOverride !== 'auto') {
             emotion = sbv2AutoEmotionOverride;
@@ -3120,6 +3363,48 @@ const VoiceStudioScreen: React.FC = () => {
             if (confidence < effectiveThreshold) {
                 emotion = 'neutral';
                 intensity = Math.min(intensity, 0.35);
+            }
+        }
+
+        let directionOverride: AssistDirectionOverride | undefined;
+        if (directionOptimization?.enabled && directionOptimization.isLongForm) {
+            const progress = segmentCount <= 1 ? 0.5 : clamp(segmentIndex / (segmentCount - 1), 0, 1);
+            const localPreset = mapEmotionToDirectionPreset(analysis.emotion);
+            const useManualPreset = assistDirectionPreset !== 'none';
+            const basePreset = useManualPreset
+                ? assistDirectionPreset
+                : (analysis.confidence >= 0.58 ? localPreset : directionOptimization.preset);
+            const localStrength = clamp(0.24 + analysis.intensity * 0.52 + analysis.confidence * 0.24, 0, 1);
+            const mergedStrength = clamp(directionOptimization.strength * 0.62 + localStrength * 0.38, 0, 1);
+            const arcGain = basePreset === 'calm'
+                ? (1.06 - progress * 0.16)
+                : (0.90 + progress * 0.24);
+            directionOverride = {
+                preset: basePreset,
+                strength: clamp(mergedStrength * arcGain, 0, 1),
+            };
+        }
+
+        const directionAssist = resolveAssistParams(assistText, assistTextWeight, emotion, directionOverride);
+        const emotionBeforeDirection = emotion;
+        if (sbv2AutoEmotionOverride === 'auto' && directionAssist.forcedEmotion) {
+            emotion = directionAssist.forcedEmotion;
+            if (emotion !== emotionBeforeDirection) {
+                if (emotion === 'neutral') {
+                    // calm/neutral direction wins: keep prosody moderate to avoid overacting.
+                    const effectiveStrength = clamp(directionOverride?.strength ?? assistDirectionStrength, 0, 1);
+                    const cap = clamp(0.48 + effectiveStrength * 0.22, 0.48, 0.70);
+                    intensity = Math.min(intensity, cap);
+                    conflictClampApplied = true;
+                } else {
+                    // explicit direction wins: keep some auto emotion influence as support.
+                    const effectiveStrength = clamp(directionOverride?.strength ?? assistDirectionStrength, 0, 1);
+                    intensity = clamp(intensity * 0.62 + effectiveStrength * 0.55, 0, 1);
+                }
+                confidence = Math.max(
+                    confidence,
+                    0.58 + clamp(directionOverride?.strength ?? assistDirectionStrength, 0, 1) * 0.22,
+                );
             }
         }
 
@@ -3147,12 +3432,14 @@ const VoiceStudioScreen: React.FC = () => {
             availableStyles,
             selectedStyle,
             sbv2AutoEmotionApplyMode,
-            jpExtraBoostActive,
+            jpExtraBoostActive
+                || assistDirectionPreset !== 'none'
+                || ((directionOverride?.preset ?? 'none') !== 'none'),
         );
         const jpStyleWeightBoost = jpExtraBoostActive && emotion !== 'neutral'
             ? 0.22 * boostLevel
             : 0;
-        const baseAssistWeight = clamp(assistTextWeight, 0.0, 2.0);
+        const baseAssistWeight = clamp(directionAssist.resolvedAssistTextWeight, 0.0, 2.0);
         const boostedAssistWeight = jpExtraBoostActive && emotion !== 'neutral'
             ? clamp(baseAssistWeight + 0.45 * boostLevel * acted, 0.0, 2.0)
             : baseAssistWeight;
@@ -3161,6 +3448,7 @@ const VoiceStudioScreen: React.FC = () => {
             acted,
             jpExtraBoostActive,
             boostLevel,
+            directionAssist.resolvedAssistText,
         );
 
         const params: AutoEmotionSynthesisParams = {
@@ -3179,7 +3467,7 @@ const VoiceStudioScreen: React.FC = () => {
         return {
             resolvedEmotion: emotion,
             params,
-            reason: `${analysis.reason}; conf=${confidence.toFixed(2)}; int=${acted.toFixed(2)}; curve=${curveFactor.toFixed(2)}; jpExtraBoost=${jpExtraBoostActive ? boostLevel.toFixed(2) : 'off'}`,
+            reason: `${analysis.reason}; dir=${directionAssist.reason}; conf=${confidence.toFixed(2)}; int=${acted.toFixed(2)}; curve=${curveFactor.toFixed(2)}; conflictClamp=${conflictClampApplied ? 'on' : 'off'}; jpExtraBoost=${jpExtraBoostActive ? boostLevel.toFixed(2) : 'off'}`,
         };
     };
 
@@ -3434,6 +3722,14 @@ const VoiceStudioScreen: React.FC = () => {
             addLog('Auto Emotion: no text to synthesize.');
             return null;
         }
+        const directionOptimization = buildAssistDirectionOptimization(sourceText);
+        if (directionOptimization.enabled && directionOptimization.isLongForm) {
+            addLog(
+                `Direction auto-optimize: preset=${directionOptimization.preset}, `
+                + `strength=${directionOptimization.strength.toFixed(2)}, `
+                + `segments=${directionOptimization.segmentCount}, chars=${directionOptimization.charCount}`,
+            );
+        }
 
         const availableStyles = ttsModels.find((m) => m.id === selectedTtsModel)?.styles || [];
         const decodeContext = new AudioContext();
@@ -3453,6 +3749,7 @@ const VoiceStudioScreen: React.FC = () => {
                     i,
                     segments.length,
                     availableStyles,
+                    directionOptimization,
                 );
 
                 setSbv2AutoEmotionDetected({
@@ -3552,6 +3849,15 @@ const VoiceStudioScreen: React.FC = () => {
         options?: { forceAutoEmotion?: boolean; autoPlayAfterSynthesize?: boolean; waitForPlaybackEnd?: boolean },
     ): Promise<boolean> => {
         const sourceText = sourceTextOverride ?? text;
+        const directionOptimization = buildAssistDirectionOptimization(sourceText);
+        const resolvedAssistGlobal = resolveAssistParams(
+            assistText,
+            assistTextWeight,
+            undefined,
+            directionOptimization.enabled && directionOptimization.isLongForm
+                ? { preset: directionOptimization.preset, strength: directionOptimization.strength }
+                : undefined,
+        );
         const effectiveAutoEmotion = mode === 'sbv2'
             ? (options?.forceAutoEmotion ? true : sbv2AutoEmotionEnabled)
             : sbv2AutoEmotionEnabled;
@@ -3573,6 +3879,16 @@ const VoiceStudioScreen: React.FC = () => {
             }
             return true;
         };
+
+        if (mode !== 'rvc') {
+            addLog(
+                `Assist resolved: preset=${assistDirectionPreset}, strength=${assistDirectionStrength.toFixed(2)}, `
+                + `weight=${resolvedAssistGlobal.resolvedAssistTextWeight.toFixed(2)}, reason=${resolvedAssistGlobal.reason}`,
+            );
+            if (directionOptimization.enabled) {
+                addLog(`Assist auto-optimize status: ${directionOptimization.reason}`);
+            }
+        }
 
         try {
             if (mode === 'sbv2') {
@@ -3609,6 +3925,11 @@ const VoiceStudioScreen: React.FC = () => {
                                     noiseScaleW,
                                     assistText,
                                     assistTextWeight,
+                                    assistDirectionPreset,
+                                    assistDirectionStrength,
+                                    assistDirectionAutoOptimize,
+                                    resolvedAssistText: resolvedAssistGlobal.resolvedAssistText,
+                                    resolvedAssistTextWeight: resolvedAssistGlobal.resolvedAssistTextWeight,
                                     autoEmotion: {
                                         enabled: effectiveAutoEmotion,
                                         strength: sbv2AutoEmotionStrength,
@@ -3654,8 +3975,8 @@ const VoiceStudioScreen: React.FC = () => {
                     sdpRatio,
                     noiseScale,
                     noiseScaleW,
-                    assistText,
-                    assistTextWeight,
+                    assistText: resolvedAssistGlobal.resolvedAssistText,
+                    assistTextWeight: resolvedAssistGlobal.resolvedAssistTextWeight,
                 });
 
                 if (!res.success) {
@@ -3750,8 +4071,8 @@ const VoiceStudioScreen: React.FC = () => {
                     sdpRatio,
                     noiseScale,
                     noiseScaleW,
-                    assistText,
-                    assistTextWeight,
+                    assistText: resolvedAssistGlobal.resolvedAssistText,
+                    assistTextWeight: resolvedAssistGlobal.resolvedAssistTextWeight,
                 },
                 rvc: {
                     modelId: selectedRvcModel,
@@ -5187,6 +5508,70 @@ const VoiceStudioScreen: React.FC = () => {
                                     onChange={(e) => setAssistTextWeight(Number(e.target.value))}
                                     style={rangeStyle}
                                 />
+                                <label
+                                    style={labelStyle}
+                                    title="話し方の方向性を高レベル指定します。Auto Emotion併用時はこの指定が優先されます。"
+                                >
+                                    Direction Preset
+                                </label>
+                                <select
+                                    value={assistDirectionPreset}
+                                    onChange={(e) => setAssistDirectionPreset(e.target.value as AssistDirectionPreset)}
+                                    style={inputStyle}
+                                >
+                                    <option value="none">none (既存互換)</option>
+                                    <option value="bright">bright（明るい）</option>
+                                    <option value="dark">dark（暗い）</option>
+                                    <option value="joy">joy（喜）</option>
+                                    <option value="anger">anger（怒）</option>
+                                    <option value="sadness">sadness（哀）</option>
+                                    <option value="fear">fear（不安）</option>
+                                    <option value="calm">calm（穏やか）</option>
+                                </select>
+                                <label
+                                    style={labelStyle}
+                                    title="方向性の強さです。上げるほど演出は強くなりますが、不自然になるリスクも増えます。"
+                                >
+                                    Direction Strength: {assistDirectionStrength.toFixed(2)}
+                                </label>
+                                <input
+                                    type="range"
+                                    min="0.00"
+                                    max="1.00"
+                                    step="0.01"
+                                    value={assistDirectionStrength}
+                                    onChange={(e) => setAssistDirectionStrength(Number(e.target.value))}
+                                    style={rangeStyle}
+                                    disabled={assistDirectionPreset === 'none'}
+                                />
+                                <label
+                                    style={labelStyle}
+                                    title="長文時に文脈を解析し、Direction Preset / Strength / Assist Weight を自動最適化します。"
+                                >
+                                    <input
+                                        type="checkbox"
+                                        checked={assistDirectionAutoOptimize}
+                                        onChange={(e) => setAssistDirectionAutoOptimize(e.target.checked)}
+                                        style={{ marginRight: '8px' }}
+                                    />
+                                    Auto Optimize Direction Params (Long Text)
+                                </label>
+                                {assistDirectionPreset === 'none' ? (
+                                    <div style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '8px' }}>
+                                        Direction Preset が none のため、既存の Assist Text 動作を維持します。
+                                    </div>
+                                ) : (
+                                    <div
+                                        style={{
+                                            fontSize: '11px',
+                                            color: assistDirectionStrength >= 0.85 ? '#fca5a5' : '#94a3b8',
+                                            marginBottom: '8px',
+                                        }}
+                                    >
+                                        Auto Emotion と競合する場合は Direction Preset を優先します。
+                                        {assistDirectionStrength >= 0.85 ? ' 強度が高いため過演出に注意。' : ''}
+                                    </div>
+                                )}
                             </>
                         )}
 

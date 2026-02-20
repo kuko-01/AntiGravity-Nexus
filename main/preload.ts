@@ -576,6 +576,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
         return await ipcRenderer.invoke('voice-synthesize', params);
     },
 
+    characterChatSend: async (params: any) => {
+        return await ipcRenderer.invoke('character-chat-send', params);
+    },
+
+    characterChatReset: async (sessionId: string) => {
+        return await ipcRenderer.invoke('character-chat-reset', sessionId);
+    },
+
     utilSelectDirectory: async () => {
         return await ipcRenderer.invoke('util:select-directory');
     },

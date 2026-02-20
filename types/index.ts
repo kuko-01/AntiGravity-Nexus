@@ -1,5 +1,6 @@
 import { TtsError, SliceOptions, TranscribeOptions } from './tts';
 import { RvcConvertParams, RvcPreset, VoiceSynthesizeParams } from './rvc';
+import { CharacterChatRequest, CharacterChatResponse } from './character';
 
 // 画面/ウィンドウソース情報
 export interface DesktopSource {
@@ -111,6 +112,8 @@ export const IPC_CHANNELS = {
     RVC_DELETE_PRESET: 'rvc-delete-preset',
     // Pipeline
     VOICE_SYNTHESIZE: 'voice-synthesize',
+    CHARACTER_CHAT_SEND: 'character-chat-send',
+    CHARACTER_CHAT_RESET: 'character-chat-reset',
 } as const;
 
 // ログ保存用の型（DateをstringにシリアライズするためLogEntryとは別）
@@ -247,6 +250,10 @@ export interface ElectronAPI {
 
     // Voice Pipeline (SBV2 + RVC)
     voiceSynthesize: (params: VoiceSynthesizeParams) => Promise<any>;
+
+    // AI Character Chat
+    characterChatSend: (params: CharacterChatRequest) => Promise<CharacterChatResponse>;
+    characterChatReset: (sessionId: string) => Promise<{ success: boolean; error?: string }>;
 }
 
 // Nano Studio Types

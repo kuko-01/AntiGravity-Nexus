@@ -7,6 +7,7 @@ import NanoStudioScreen from './screens/NanoStudioScreen';
 import VoiceStudioScreen from './screens/VoiceStudioScreen';
 import TrainerScreen from './screens/TrainerScreen';
 import Live2DControllerScreen from './screens/Live2DControllerScreen';
+import CharacterStudioScreen from './screens/CharacterStudioScreen';
 
 const App: React.FC = () => {
     return (
@@ -17,6 +18,7 @@ const App: React.FC = () => {
                 <Route path="/organizer" element={<OrganizerScreen />} />
                 <Route path="/nano" element={<NanoStudioScreen />} />
                 <Route path="/tts" element={<VoiceStudioScreen />} />
+                <Route path="/character" element={<CharacterStudioScreen />} />
                 <Route path="/trainer" element={<TrainerScreen />} />
                 <Route path="/live2d" element={<Live2DControllerScreen />} />
             </Routes>

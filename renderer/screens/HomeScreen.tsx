@@ -154,6 +154,45 @@ const HomeScreen: React.FC = () => {
                     </p>
                 </div>
 
+                {/* AI Character Card */}
+                <div
+                    onClick={() => handleNavigate('/character')}
+                    style={{
+                        background: 'var(--color-surface)',
+                        borderRadius: '12px',
+                        padding: '24px',
+                        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
+                        cursor: 'pointer',
+                        transition: 'transform 0.2s, box-shadow 0.2s',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        textAlign: 'center',
+                        border: '1px solid var(--color-border)'
+                    }}
+                    onMouseEnter={e => {
+                        e.currentTarget.style.transform = 'translateY(-5px)';
+                        e.currentTarget.style.boxShadow = '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)';
+                    }}
+                    onMouseLeave={e => {
+                        e.currentTarget.style.transform = 'translateY(0)';
+                        e.currentTarget.style.boxShadow = '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)';
+                    }}
+                >
+                    <div style={{
+                        fontSize: '3rem',
+                        marginBottom: '12px'
+                    }}>
+                        🦊
+                    </div>
+                    <h2 style={{ fontSize: '1.25rem', marginBottom: '4px', color: 'var(--color-text)' }}>
+                        AI Character
+                    </h2>
+                    <p style={{ color: 'var(--color-text-secondary)' }}>
+                        テキスト会話とSBV2+RVC音声でキャラクター対話を行います。
+                    </p>
+                </div>
+
 
                 {/* Model Trainer Card */}
                 <div

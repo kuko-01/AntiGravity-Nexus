@@ -13,6 +13,8 @@ import { TtsSynthesizeParams, TtsPreset } from '../types/tts';
 import { RvcService } from './services/tts/RvcService';
 import { VoicePipelineService } from './services/tts/VoicePipelineService';
 import { RvcConvertParams, RvcPreset, VoiceSynthesizeParams } from '../types/rvc';
+import { CharacterChatService } from './services/CharacterChatService';
+import { CharacterChatRequest, CharacterEmotionResult } from '../types/character';
 
 // .env ファイルを読み込み
 // .env ファイルを読み込み
@@ -2956,6 +2958,209 @@ ipcMain.handle('voice-synthesize', async (_event, params: VoiceSynthesizeParams)
     } catch (error) {
         console.error('[VoicePipeline] Synthesize error:', error);
         return { success: false, error: { code: 'E_UNKNOWN', message: String(error) } };
+    }
+});
+
+const buildSbv2EmotionDefaults = (emotion?: CharacterEmotionResult): NonNullable<VoiceSynthesizeParams['sbv2']> => {
+    const label = emotion?.label || 'neutral';
+    const intensity = Math.max(0, Math.min(1, emotion?.intensity ?? 0));
+
+    const base = {
+        style: 'ノーマル',
+        speed: 1.0,
+        pitch: 0.0,
+        intonation: 1.0,
+        styleWeight: 1.0,
+        assistText: '親しみやすく自然な話し方',
+        assistTextWeight: 1.0,
+    };
+
+    switch (label) {
+        case 'joy':
+            return {
+                ...base,
+                speed: 1.0 + 0.08 * intensity,
+                pitch: 0.0 + 0.45 * intensity,
+                intonation: 1.0 + 0.16 * intensity,
+                styleWeight: 1.0 + 0.08 * intensity,
+                assistText: '明るく優しく、親しみやすく',
+            };
+        case 'sad':
+            return {
+                ...base,
+                style: 'よふかし',
+                speed: 1.0 - 0.1 * intensity,
+                pitch: 0.0 - 0.35 * intensity,
+                intonation: 1.0 - 0.12 * intensity,
+                assistText: '落ち着いて穏やかに、やさしく',
+            };
+        case 'angry':
+            return {
+                ...base,
+                speed: 1.0 + 0.07 * intensity,
+                pitch: 0.0 + 0.2 * intensity,
+                intonation: 1.0 + 0.15 * intensity,
+                styleWeight: 1.0 + 0.1 * intensity,
+                assistText: '強めだが威圧しすぎない、はっきりと',
+            };
+        case 'excited':
+            return {
+                ...base,
+                style: 'るんるん',
+                speed: 1.0 + 0.12 * intensity,
+                pitch: 0.0 + 0.55 * intensity,
+                intonation: 1.0 + 0.2 * intensity,
+                styleWeight: 1.0 + 0.12 * intensity,
+                assistText: '元気でわくわくした雰囲気',
+            };
+        default:
+            return base;
+    }
+};
+
+const ensureSbv2ServerRunningForCharacter = async (): Promise<{ success: boolean; error?: { code: string; message: string } }> => {
+    const service = Sbv2Service.getInstance(ttsResourcesPath);
+    const status = service.getStatus();
+    if (status.installState !== 'installed') {
+        return {
+            success: false,
+            error: {
+                code: 'E_SERVER_FAILED',
+                message: 'SBV2 is not installed. Please install SBV2 first.',
+            },
+        };
+    }
+
+    if (status.runtimeState !== 'running') {
+        console.log('[CharacterChat] Auto-starting SBV2 server...');
+        const startResult = await service.startServer();
+        if (!startResult.success) {
+            return {
+                success: false,
+                error: {
+                    code: startResult.error?.code || 'E_SERVER_FAILED',
+                    message: startResult.error?.message || 'Failed to start SBV2 server',
+                },
+            };
+        }
+    }
+
+    return { success: true };
+};
+
+const ensureRvcServerRunningForCharacter = async (): Promise<{ success: boolean; error?: { code: string; message: string } }> => {
+    const service = RvcService.getInstance(ttsResourcesPath);
+    const status = service.getStatus();
+    if (status.installState !== 'installed') {
+        return {
+            success: false,
+            error: {
+                code: 'E_SERVER_FAILED',
+                message: 'RVC is not installed. Please install RVC first.',
+            },
+        };
+    }
+
+    if (status.runtimeState !== 'running') {
+        console.log('[CharacterChat] Auto-starting RVC server...');
+        const startResult = await service.startServer();
+        if (!startResult.success) {
+            return {
+                success: false,
+                error: {
+                    code: startResult.error?.code || 'E_SERVER_FAILED',
+                    message: startResult.error?.message || 'Failed to start RVC server',
+                },
+            };
+        }
+    }
+
+    return { success: true };
+};
+
+const ensureVoiceServersForCharacter = async (
+    mode: VoiceSynthesizeParams['mode'],
+): Promise<{ success: boolean; error?: { code: string; message: string } }> => {
+    if (mode === 'sbv2' || mode === 'sbv2+rvc') {
+        const sbv2Ready = await ensureSbv2ServerRunningForCharacter();
+        if (!sbv2Ready.success) {
+            return sbv2Ready;
+        }
+    }
+
+    if (mode === 'rvc' || mode === 'sbv2+rvc') {
+        const rvcReady = await ensureRvcServerRunningForCharacter();
+        if (!rvcReady.success) {
+            return rvcReady;
+        }
+    }
+
+    return { success: true };
+};
+
+ipcMain.handle('character-chat-send', async (_event, request: CharacterChatRequest) => {
+    try {
+        const chatService = CharacterChatService.getInstance();
+        const chatResult = await chatService.sendMessage(request);
+        if (!chatResult.success) {
+            return chatResult;
+        }
+
+        if (!request.withVoice) {
+            return chatResult;
+        }
+
+        const responseText = chatResult.responseText || '';
+        if (!responseText.trim()) {
+            return chatResult;
+        }
+
+        const defaultSbv2 = buildSbv2EmotionDefaults(chatResult.emotion);
+        const voiceParams: VoiceSynthesizeParams = {
+            text: responseText,
+            mode: request.voice?.mode || 'sbv2+rvc',
+            sbv2: {
+                ...defaultSbv2,
+                ...(request.voice?.sbv2 || {}),
+            },
+            rvc: request.voice?.rvc,
+        };
+
+        const runtimeReady = await ensureVoiceServersForCharacter(voiceParams.mode);
+        if (!runtimeReady.success) {
+            return {
+                ...chatResult,
+                voice: {
+                    success: false,
+                    error: runtimeReady.error || { code: 'E_SERVER_FAILED', message: 'Voice server startup failed' },
+                },
+            };
+        }
+
+        const voiceService = VoicePipelineService.getInstance(ttsResourcesPath);
+        const voiceResult = await voiceService.synthesize(voiceParams);
+
+        return {
+            ...chatResult,
+            voice: voiceResult,
+        };
+    } catch (error) {
+        console.error('[CharacterChat] Send error:', error);
+        return {
+            success: false,
+            sessionId: request.sessionId || `char_error_${Date.now()}`,
+            error: String(error),
+        };
+    }
+});
+
+ipcMain.handle('character-chat-reset', async (_event, sessionId: string) => {
+    try {
+        const service = CharacterChatService.getInstance();
+        return service.resetSession(String(sessionId || ''));
+    } catch (error) {
+        console.error('[CharacterChat] Reset error:', error);
+        return { success: false, error: String(error) };
     }
 });
 

@@ -10,6 +10,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as http from 'http';
+import * as https from 'https';
 import { app } from 'electron';
 import { RvcBootstrapper } from './RvcBootstrapper';
 import { RvcRuntime } from './RvcRuntime';
@@ -34,6 +36,7 @@ import { GpuInfo } from '../../../types/tts';
 
 const PRESETS_FILENAME = 'rvc_presets.json';
 const CACHE_DIR = 'audio_cache';
+const CONVERT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
 export class RvcService {
     private static instance: RvcService | null = null;
@@ -377,14 +380,15 @@ export class RvcService {
                 console.log('[RvcService] Convert request:', { ...requestBody, input_base64: requestBody.input_base64 ? '(base64 data)' : undefined });
             }
 
-            const response = await fetch(`${endpoint}/convert`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(requestBody),
-            });
+            this.runtime.beginConversion();
+            const response = await this.postJsonForBinary(
+                `${endpoint}/convert`,
+                requestBody,
+                CONVERT_REQUEST_TIMEOUT_MS
+            );
 
-            if (!response.ok) {
-                const errorText = await response.text();
+            if (response.statusCode < 200 || response.statusCode >= 300) {
+                const errorText = response.body.toString('utf-8');
                 return {
                     success: false,
                     error: {
@@ -395,14 +399,17 @@ export class RvcService {
             }
 
             // Get audio data
-            const audioBuffer = await response.arrayBuffer();
+            const audioBuffer = response.body.buffer.slice(
+                response.body.byteOffset,
+                response.body.byteOffset + response.body.byteLength
+            ) as ArrayBuffer;
 
             // Save to cache
             const cacheDir = path.join(this.installPath, CACHE_DIR);
             fs.mkdirSync(cacheDir, { recursive: true });
 
             const wavPath = path.join(cacheDir, `rvc_${Date.now()}.wav`);
-            fs.writeFileSync(wavPath, Buffer.from(audioBuffer));
+            fs.writeFileSync(wavPath, response.body);
 
             const wavInfo = this.parseWavHeader(audioBuffer);
 
@@ -422,7 +429,49 @@ export class RvcService {
                     message: err instanceof Error ? err.message : String(err),
                 },
             };
+        } finally {
+            this.runtime.endConversion();
         }
+    }
+
+    private postJsonForBinary(urlString: string, payload: unknown, timeoutMs: number): Promise<{ statusCode: number; body: Buffer }> {
+        return new Promise((resolve, reject) => {
+            const url = new URL(urlString);
+            const body = Buffer.from(JSON.stringify(payload), 'utf-8');
+            const transport = url.protocol === 'https:' ? https : http;
+
+            const req = transport.request({
+                protocol: url.protocol,
+                hostname: url.hostname,
+                port: url.port,
+                path: `${url.pathname}${url.search}`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': body.byteLength,
+                },
+            }, (res) => {
+                const chunks: Buffer[] = [];
+                res.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+                res.on('end', () => {
+                    resolve({
+                        statusCode: res.statusCode ?? 0,
+                        body: Buffer.concat(chunks),
+                    });
+                });
+            });
+
+            req.setTimeout(timeoutMs, () => {
+                req.destroy(new Error(`RVC convert timeout after ${Math.floor(timeoutMs / 1000)}s`));
+            });
+
+            req.on('error', (error) => {
+                reject(error);
+            });
+
+            req.write(body);
+            req.end();
+        });
     }
 
     private parseWavHeader(buffer: ArrayBuffer): { sampleRate: number; durationMs: number } {

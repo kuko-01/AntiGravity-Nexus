@@ -29,6 +29,7 @@ const DEFAULT_PORT_RANGE_START = 50031;
 const DEFAULT_PORT_RANGE_END = 50040;
 const HEALTH_CHECK_INTERVAL_MS = 30000;
 const HEALTH_CHECK_TIMEOUT_MS = 30000;
+const HEALTH_CHECK_CONSECUTIVE_FAILURE_LIMIT = 3;
 const MAX_RESTART_ATTEMPTS = 3;
 const RESTART_BACKOFF_MS = 2000;
 
@@ -39,6 +40,8 @@ export class RvcRuntime {
     private port: number | null = null;
     private verboseLogs = false;
     private healthCheckTimer: NodeJS.Timeout | null = null;
+    private healthConsecutiveFailures = 0;
+    private activeConversionCount = 0;
     private restartAttempts = 0;
     private lastError: RvcError | null = null;
     private onStateChange?: (state: RvcRuntimeState) => void;
@@ -80,6 +83,14 @@ export class RvcRuntime {
         this.onStateChange = handler;
     }
 
+    beginConversion(): void {
+        this.activeConversionCount += 1;
+    }
+
+    endConversion(): void {
+        this.activeConversionCount = Math.max(0, this.activeConversionCount - 1);
+    }
+
     /**
      * Start RVC FastAPI server
      */
@@ -95,6 +106,8 @@ export class RvcRuntime {
         this.setState('starting');
         this.lastError = null;
         this.restartAttempts = 0;
+        this.healthConsecutiveFailures = 0;
+        this.activeConversionCount = 0;
 
         try {
             // Find available port
@@ -419,15 +432,27 @@ exec(compile(open(r'${serverScript.replace(/\\/g, '\\\\')}', encoding='utf-8-sig
 
     private startHealthMonitoring(): void {
         this.stopHealthMonitoring();
+        this.healthConsecutiveFailures = 0;
 
         this.healthCheckTimer = setInterval(async () => {
             if (this.state !== 'running') return;
 
+            if (this.activeConversionCount > 0) {
+                // /convert can take minutes on long audio. Skip watchdog during active inference.
+                this.healthConsecutiveFailures = 0;
+                return;
+            }
+
             const healthy = await this.checkHealth();
             if (!healthy) {
-                console.warn('[RvcRuntime] Health check failed');
-                this.handleUnexpectedExit();
+                this.healthConsecutiveFailures += 1;
+                console.warn(`[RvcRuntime] Health check failed (${this.healthConsecutiveFailures}/${HEALTH_CHECK_CONSECUTIVE_FAILURE_LIMIT})`);
+                if (this.healthConsecutiveFailures >= HEALTH_CHECK_CONSECUTIVE_FAILURE_LIMIT) {
+                    this.handleUnexpectedExit();
+                }
+                return;
             }
+            this.healthConsecutiveFailures = 0;
         }, HEALTH_CHECK_INTERVAL_MS);
     }
 
@@ -439,6 +464,10 @@ exec(compile(open(r'${serverScript.replace(/\\/g, '\\\\')}', encoding='utf-8-sig
     }
 
     private async handleUnexpectedExit(): Promise<void> {
+        if (this.state === 'restarting') {
+            return;
+        }
+
         if (this.restartAttempts >= MAX_RESTART_ATTEMPTS) {
             console.error('[RvcRuntime] Max restart attempts reached');
             this.lastError = {

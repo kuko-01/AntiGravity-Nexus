@@ -77,7 +77,7 @@ $AppZip = "$WorkDir/download/rvc_app.zip"
 Compress-Archive -Path "$RvcAppDir/*" -DestinationPath $AppZip -Force
 
 Write-Log "Downloading wheels..."
-$downloadCmd = "download -r `"$RequirementsFile`" -d `"$OutDir/wheels`" --extra-index-url $TorchIndexUrl --python-version 3.10 --platform win_amd64 --only-binary=:all: --ignore-requires-python"
+$downloadCmd = "download -r `"$RequirementsFile`" -d `"$OutDir/wheels`" --extra-index-url $TorchIndexUrl --python-version 3.10 --platform win_amd64 --only-binary=:all:"
 $downloadProc = Start-Process -FilePath "pip" -ArgumentList $downloadCmd -Wait -NoNewWindow -PassThru
 if ($downloadProc.ExitCode -ne 0) {
     Write-Warning "pip download failed for some packages. Verify torch/cu wheels availability."
@@ -98,7 +98,7 @@ $manifest = @{
     )
     meta          = @{
         appType = "rvc"
-        note    = "rvc_server.py is currently a passthrough stub; replace with real inference"
+        note    = "rvc_server.py uses model-aware realtime voice conversion backend (experimental)."
     }
 }
 

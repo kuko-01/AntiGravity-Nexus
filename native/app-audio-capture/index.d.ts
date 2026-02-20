@@ -9,6 +9,18 @@ export interface CaptureResult {
     error?: string;
 }
 
+export interface MuteResult {
+    success: boolean;
+    error?: string;
+}
+
+export interface ProcessMuteState {
+    success: boolean;
+    found: boolean;
+    muted: boolean;
+    error?: string;
+}
+
 export interface AudioData {
     buffer: Buffer;
     channels: number;
@@ -48,3 +60,13 @@ export function stopCapture(): void;
  * Check if capture is currently active
  */
 export function isCapturing(): boolean;
+
+/**
+ * Set mute state for a specific process audio session
+ */
+export function setProcessMute(pid: number, mute: boolean): MuteResult;
+
+/**
+ * Get mute state for a specific process audio session
+ */
+export function getProcessMute(pid: number): ProcessMuteState;

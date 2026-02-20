@@ -41,6 +41,7 @@ export class RvcService {
     private bootstrapper: RvcBootstrapper;
     private runtime: RvcRuntime;
     private installPath: string;
+    private verboseLogs = false;
 
     private presets: RvcPreset[] = [];
     private activeModelId: string | null = null;
@@ -127,6 +128,10 @@ export class RvcService {
             };
         }
 
+        if (typeof options?.verboseLogs === 'boolean') {
+            this.setVerboseLogs(options.verboseLogs);
+        }
+
         return this.runtime.start(options);
     }
 
@@ -138,12 +143,63 @@ export class RvcService {
         return await this.runtime.getGpuInfo();
     }
 
+    setVerboseLogs(enabled: boolean): void {
+        this.verboseLogs = !!enabled;
+        this.runtime.setVerboseLogs(this.verboseLogs);
+    }
+
+    getVerboseLogs(): boolean {
+        return this.verboseLogs;
+    }
+
     // ========================================
     // Models
     // ========================================
 
+    getModelsPath(): string {
+        return path.join(this.installPath, 'models');
+    }
+
+    private findModelPthPath(model: RvcModel): string | null {
+        if (model.path.toLowerCase().endsWith('.pth') && fs.existsSync(model.path)) {
+            return model.path;
+        }
+        if (!fs.existsSync(model.path) || !fs.statSync(model.path).isDirectory()) {
+            return null;
+        }
+        const files = fs.readdirSync(model.path);
+        const pth = files.find((f) => f.toLowerCase().endsWith('.pth'));
+        if (!pth) return null;
+        return path.join(model.path, pth);
+    }
+
+    private listIndexFilesInDirectory(dirPath: string): string[] {
+        if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) {
+            return [];
+        }
+        const files = fs.readdirSync(dirPath)
+            .filter((f) => {
+                const lower = f.toLowerCase();
+                const isIndex = lower.endsWith('.index') || lower.endsWith('.ivf');
+                if (!isIndex) return false;
+                // RVC inference should use "added_*.index" style, not "trained_*.index".
+                if (lower.includes('trained')) return false;
+                return true;
+            })
+            .map((f) => path.join(dirPath, f));
+        files.sort((a, b) => {
+            const an = path.basename(a).toLowerCase();
+            const bn = path.basename(b).toLowerCase();
+            const as = an.includes('added') ? 0 : 1;
+            const bs = bn.includes('added') ? 0 : 1;
+            if (as !== bs) return as - bs;
+            return an.localeCompare(bn);
+        });
+        return files;
+    }
+
     async listModels(): Promise<RvcModel[]> {
-        const modelsPath = path.join(this.installPath, 'models');
+        const modelsPath = this.getModelsPath();
 
         if (!fs.existsSync(modelsPath)) {
             return [];
@@ -153,42 +209,73 @@ export class RvcService {
         const entries = fs.readdirSync(modelsPath, { withFileTypes: true });
 
         for (const entry of entries) {
-            if (entry.isDirectory()) {
-                const modelDir = path.join(modelsPath, entry.name);
-                const modelPthPath = path.join(modelDir, 'model.pth');
-
-                // A valid RVC model must have model.pth
-                if (!fs.existsSync(modelPthPath)) {
-                    continue;
-                }
-
-                const hasIndex = fs.existsSync(path.join(modelDir, 'index.ivf'));
-
-                // Read optional meta.json
-                let meta: RvcModelMeta | undefined;
-                const metaPath = path.join(modelDir, 'meta.json');
-                if (fs.existsSync(metaPath)) {
-                    try {
-                        meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
-                    } catch {
-                        // Ignore meta parse errors
-                    }
-                }
-
+            // Support model file directly under models/ (e.g. ayako-02.pth)
+            if (entry.isFile() && entry.name.toLowerCase().endsWith('.pth')) {
+                const fullPath = path.join(modelsPath, entry.name);
+                const modelId = path.parse(entry.name).name;
+                const indexFiles = this.listIndexFilesInDirectory(path.dirname(fullPath));
                 models.push({
-                    id: entry.name,
-                    name: meta?.displayName || entry.name,
-                    path: modelDir,
-                    hasIndex,
-                    meta,
+                    id: modelId,
+                    name: modelId,
+                    path: fullPath,
+                    hasIndex: indexFiles.length > 0,
                 });
+                continue;
             }
+
+            if (!entry.isDirectory()) {
+                continue;
+            }
+
+            const modelDir = path.join(modelsPath, entry.name);
+            const files = fs.readdirSync(modelDir);
+            const pthFile = files.find((f) => f.toLowerCase().endsWith('.pth'));
+
+            // A valid RVC model directory must have at least one .pth file.
+            if (!pthFile) {
+                continue;
+            }
+
+            const hasIndex = this.listIndexFilesInDirectory(modelDir).length > 0;
+
+            // Read optional meta.json
+            let meta: RvcModelMeta | undefined;
+            const metaPath = path.join(modelDir, 'meta.json');
+            if (fs.existsSync(metaPath)) {
+                try {
+                    meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+                } catch {
+                    // Ignore meta parse errors
+                }
+            }
+
+            models.push({
+                id: entry.name,
+                name: meta?.displayName || entry.name,
+                path: modelDir,
+                hasIndex,
+                meta,
+            });
         }
 
         return models;
     }
 
-    async setModel(modelId: string): Promise<{ success: boolean; error?: RvcError }> {
+    async listModelIndexes(modelId: string): Promise<string[]> {
+        const models = await this.listModels();
+        const model = models.find((m) => m.id === modelId);
+        if (!model) {
+            return [];
+        }
+        const pthPath = this.findModelPthPath(model);
+        if (!pthPath) {
+            return [];
+        }
+        const modelDir = path.dirname(pthPath);
+        return this.listIndexFilesInDirectory(modelDir);
+    }
+
+    async setModel(modelId: string): Promise<{ success: boolean; error?: RvcError; speaker_count?: number }> {
         const models = await this.listModels();
         const model = models.find(m => m.id === modelId);
 
@@ -222,6 +309,13 @@ export class RvcService {
                         },
                     };
                 }
+                const result = await response.json().catch(() => ({} as any));
+                const speakerCountRaw = Number((result as any).speaker_count);
+                const speakerCount = Number.isFinite(speakerCountRaw) && speakerCountRaw > 0
+                    ? Math.floor(speakerCountRaw)
+                    : undefined;
+                this.activeModelId = modelId;
+                return { success: true, speaker_count: speakerCount };
             } catch (err) {
                 return {
                     success: false,
@@ -266,6 +360,8 @@ export class RvcService {
         try {
             const requestBody = {
                 model_id: params.modelId || this.activeModelId,
+                index_path: params.indexPath,
+                speaker_id: params.speakerId ?? 0,
                 input_path: params.inputPath,
                 input_base64: params.inputBase64,
                 f0_method: params.f0Method || 'rmvpe',
@@ -277,7 +373,9 @@ export class RvcService {
                 resample_sr: params.resampleSr ?? 0,
             };
 
-            console.log('[RvcService] Convert request:', { ...requestBody, input_base64: requestBody.input_base64 ? '(base64 data)' : undefined });
+            if (this.verboseLogs) {
+                console.log('[RvcService] Convert request:', { ...requestBody, input_base64: requestBody.input_base64 ? '(base64 data)' : undefined });
+            }
 
             const response = await fetch(`${endpoint}/convert`, {
                 method: 'POST',
@@ -306,14 +404,14 @@ export class RvcService {
             const wavPath = path.join(cacheDir, `rvc_${Date.now()}.wav`);
             fs.writeFileSync(wavPath, Buffer.from(audioBuffer));
 
-            const durationMs = this.estimateWavDuration(audioBuffer);
+            const wavInfo = this.parseWavHeader(audioBuffer);
 
             return {
                 success: true,
                 wavPath,
                 audioBase64: Buffer.from(audioBuffer).toString('base64'),
-                durationMs,
-                sampleRate: 44100,
+                durationMs: wavInfo.durationMs,
+                sampleRate: wavInfo.sampleRate,
             };
 
         } catch (err) {
@@ -327,10 +425,20 @@ export class RvcService {
         }
     }
 
-    private estimateWavDuration(buffer: ArrayBuffer): number {
+    private parseWavHeader(buffer: ArrayBuffer): { sampleRate: number; durationMs: number } {
+        if (buffer.byteLength < 44) {
+            return { sampleRate: 44100, durationMs: 0 };
+        }
+        const view = new DataView(buffer);
+        const sampleRate = view.getUint32(24, true);
+        const bitsPerSample = view.getUint16(34, true);
+        const numChannels = view.getUint16(22, true);
         const dataSize = buffer.byteLength - 44;
-        const bytesPerSecond = 44100 * 2;
-        return Math.round((dataSize / bytesPerSecond) * 1000);
+        const bytesPerSecond = sampleRate * numChannels * (bitsPerSample / 8);
+        const durationMs = bytesPerSecond > 0
+            ? Math.round((dataSize / bytesPerSecond) * 1000)
+            : 0;
+        return { sampleRate: sampleRate || 44100, durationMs };
     }
 
     // ========================================

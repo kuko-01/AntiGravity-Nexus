@@ -162,6 +162,49 @@ Napi::Value IsCapturing(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, capturing);
 }
 
+// Set mute state for a specific process audio session
+Napi::Value SetProcessMute(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Object result = Napi::Object::New(env);
+
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsBoolean()) {
+        result.Set("success", Napi::Boolean::New(env, false));
+        result.Set("error", Napi::String::New(env, "Invalid arguments: expected (pid: number, mute: boolean)"));
+        return result;
+    }
+
+    DWORD pid = info[0].As<Napi::Number>().Uint32Value();
+    bool mute = info[1].As<Napi::Boolean>().Value();
+
+    bool success = ProcessList::SetProcessMute(pid, mute);
+    result.Set("success", Napi::Boolean::New(env, success));
+    if (!success) {
+        result.Set("error", Napi::String::New(env, "Audio session for process not found or mute operation failed."));
+    }
+    return result;
+}
+
+// Get mute state for a specific process audio session
+Napi::Value GetProcessMute(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Object result = Napi::Object::New(env);
+
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        result.Set("success", Napi::Boolean::New(env, false));
+        result.Set("error", Napi::String::New(env, "Invalid arguments: expected (pid: number)"));
+        return result;
+    }
+
+    DWORD pid = info[0].As<Napi::Number>().Uint32Value();
+    bool muted = false;
+    bool found = ProcessList::GetProcessMute(pid, muted);
+
+    result.Set("success", Napi::Boolean::New(env, true));
+    result.Set("found", Napi::Boolean::New(env, found));
+    result.Set("muted", Napi::Boolean::New(env, muted));
+    return result;
+}
+
 // Initialize the module
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getAudioProcesses", Napi::Function::New(env, GetAudioProcesses));
@@ -169,6 +212,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startSystemCapture", Napi::Function::New(env, StartSystemCapture));
     exports.Set("stopCapture", Napi::Function::New(env, StopCapture));
     exports.Set("isCapturing", Napi::Function::New(env, IsCapturing));
+    exports.Set("setProcessMute", Napi::Function::New(env, SetProcessMute));
+    exports.Set("getProcessMute", Napi::Function::New(env, GetProcessMute));
     return exports;
 }
 

@@ -142,6 +142,7 @@ export interface TtsSynthesizeParams {
     noiseScale?: number;  // 0.1 - 1.0, default 0.6
     noiseScaleW?: number; // 0.1 - 1.0, default 0.8
     assistText?: string;  // prompt for emotion/tone guide
+    assistTextWeight?: number; // 0.0 - 2.0, default 1.0
 
     // Audio Enhancement (Post-Processing)
     postFilter?: boolean;      // Apply DeepFilterNet post-processing

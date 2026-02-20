@@ -1,5 +1,14 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
+const resolveRvcPaths = () => {
+    const localAppData = process.env.LOCALAPPDATA || `${process.env.USERPROFILE || ''}\\AppData\\Local`;
+    const rvcRoot = `${localAppData}\\AntiGravity\\tts\\rvc`;
+    return {
+        rvcRoot,
+        modelsPath: `${rvcRoot}\\models`,
+    };
+};
+
 // Renderer プロセスに安全に API を公開
 contextBridge.exposeInMainWorld('electronAPI', {
     // 画面ソース一覧を取得
@@ -43,9 +52,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
         return await ipcRenderer.invoke('get-audio-processes');
     },
 
+    // プロセスのミュート状態を設定
+    setProcessMute: async (pid: number, mute: boolean) => {
+        return await ipcRenderer.invoke('set-process-mute', pid, mute);
+    },
+
+    // プロセスのミュート状態を取得
+    getProcessMute: async (pid: number) => {
+        return await ipcRenderer.invoke('get-process-mute', pid);
+    },
+
     // プロセスの音声キャプチャを開始
     startProcessCapture: async (pid: number) => {
         return await ipcRenderer.invoke('start-process-capture', pid);
+    },
+
+    // プロセスの音声キャプチャを開始（リアルタイムPCMストリーム）
+    startProcessCaptureStream: async (pid: number) => {
+        return await ipcRenderer.invoke('start-process-capture-stream', pid);
     },
 
     // システム全体の音声キャプチャを開始 (New: Native WASAPI loopback)
@@ -58,15 +82,30 @@ contextBridge.exposeInMainWorld('electronAPI', {
         return await ipcRenderer.invoke('stop-process-capture');
     },
 
+    // プロセス音声ストリームを停止（RVC test mode用）
+    stopProcessCaptureStream: async () => {
+        return await ipcRenderer.invoke('stop-process-capture-stream');
+    },
+
     // プロセス音声データのリスナーを登録（旧方式・互換用）
     onProcessAudioData: (callback: (data: { buffer: number[]; channels: number; sampleRate: number; bytesPerSample: number }) => void) => {
         ipcRenderer.on('process-audio-data', (_event, data) => callback(data));
+    },
+
+    // プロセス音声ストリームのリスナーを登録（RVC test mode用）
+    onProcessAudioStream: (callback: (data: { buffer: number[]; channels: number; sampleRate: number; bytesPerSample: number }) => void) => {
+        ipcRenderer.on('process-audio-stream', (_event, data) => callback(data));
     },
 
     // プロセス音声データのリスナーを解除
     offProcessAudioData: () => {
         ipcRenderer.removeAllListeners('process-audio-data');
         ipcRenderer.removeAllListeners('process-audio-metadata');
+    },
+
+    // プロセス音声ストリームのリスナーを解除
+    offProcessAudioStream: () => {
+        ipcRenderer.removeAllListeners('process-audio-stream');
     },
 
     // プロセス音声メタデータのリスナーを登録（連続録音方式）
@@ -348,6 +387,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
         pitch?: number;
         intonation?: number;
         emotion?: string;
+        assistText?: string;
+        assistTextWeight?: number;
+        styleWeight?: number;
+        sdpRatio?: number;
+        noiseScale?: number;
+        noiseScaleW?: number;
+        postFilter?: boolean;
+        filterStrength?: number;
     }) => {
         return await ipcRenderer.invoke('tts-synthesize', params);
     },
@@ -441,8 +488,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
         return await ipcRenderer.invoke('rvc-uninstall');
     },
 
-    rvcStartServer: async (options?: { forceCpu?: boolean }) => {
+    rvcStartServer: async (options?: { forceCpu?: boolean; verboseLogs?: boolean }) => {
         return await ipcRenderer.invoke('rvc-start-server', options);
+    },
+
+    rvcSetVerboseLogs: async (enabled: boolean) => {
+        return await ipcRenderer.invoke('rvc-set-verbose-logs', enabled);
+    },
+
+    rvcGetVerboseLogs: async () => {
+        return await ipcRenderer.invoke('rvc-get-verbose-logs');
     },
 
     rvcStopServer: async () => {
@@ -455,6 +510,38 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
     rvcListModels: async () => {
         return await ipcRenderer.invoke('rvc-list-models');
+    },
+
+    rvcListModelIndexes: async (modelId: string) => {
+        return await ipcRenderer.invoke('rvc-list-model-indexes', modelId);
+    },
+
+    rvcOpenModelsFolder: async () => {
+        try {
+            return await ipcRenderer.invoke('rvc-open-models-folder');
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (!message.includes("No handler registered for 'rvc-open-models-folder'")) {
+                return { success: false, error: message };
+            }
+
+            // Backward-compatible fallback for older main process builds.
+            const { modelsPath, rvcRoot } = resolveRvcPaths();
+            const openModels = await ipcRenderer.invoke('open-folder', modelsPath);
+            if (openModels?.success) {
+                return { success: true, path: modelsPath };
+            }
+
+            const openRoot = await ipcRenderer.invoke('open-folder', rvcRoot);
+            if (openRoot?.success) {
+                return { success: true, path: rvcRoot };
+            }
+
+            return {
+                success: false,
+                error: openModels?.error || openRoot?.error || message,
+            };
+        }
     },
 
     rvcSetModel: async (modelId: string) => {

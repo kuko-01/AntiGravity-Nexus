@@ -240,7 +240,15 @@ export class RvcBootstrapper {
 
         const manifest = this.loadBundleManifest();
         if (!manifest) {
-            return { valid: false, error: 'manifest_bundle.json not found or invalid' };
+            const manifestPath = path.join(this.bundlePath, 'manifest_bundle.json');
+            const hasReadme = fs.existsSync(path.join(this.bundlePath, 'README.md'));
+            if (hasReadme) {
+                return {
+                    valid: false,
+                    error: `manifest_bundle.json not found or invalid at ${manifestPath}. Bundle appears unbuilt. Run: npm run bundle:rvc`
+                };
+            }
+            return { valid: false, error: `manifest_bundle.json not found or invalid at ${manifestPath}` };
         }
 
         // Verify required files exist

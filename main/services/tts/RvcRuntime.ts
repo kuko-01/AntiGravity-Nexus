@@ -37,6 +37,7 @@ export class RvcRuntime {
     private process: ChildProcess | null = null;
     private state: RvcRuntimeState = 'stopped';
     private port: number | null = null;
+    private verboseLogs = false;
     private healthCheckTimer: NodeJS.Timeout | null = null;
     private restartAttempts = 0;
     private lastError: RvcError | null = null;
@@ -67,6 +68,14 @@ export class RvcRuntime {
         return this.lastError;
     }
 
+    setVerboseLogs(enabled: boolean): void {
+        this.verboseLogs = !!enabled;
+    }
+
+    getVerboseLogs(): boolean {
+        return this.verboseLogs;
+    }
+
     setStateChangeHandler(handler: (state: RvcRuntimeState) => void): void {
         this.onStateChange = handler;
     }
@@ -77,6 +86,10 @@ export class RvcRuntime {
     async start(options?: RvcStartOptions): Promise<{ success: boolean; port?: number; error?: RvcError }> {
         if (this.state === 'running' || this.state === 'starting') {
             return { success: true, port: this.port || undefined };
+        }
+
+        if (typeof options?.verboseLogs === 'boolean') {
+            this.verboseLogs = options.verboseLogs;
         }
 
         this.setState('starting');
@@ -317,19 +330,43 @@ __name__ = '__main__'
 exec(compile(open(r'${serverScript.replace(/\\/g, '\\\\')}', encoding='utf-8-sig').read(), r'${serverScript.replace(/\\/g, '\\\\')}', 'exec'))
 `.trim().replace(/\n/g, '; ');
 
-        console.log(`[RvcRuntime] Starting server with injected sys.path: ${rvcDir}`);
+        console.log(`[RvcRuntime] Starting server with injected sys.path: ${rvcDir} (verboseLogs=${this.verboseLogs})`);
 
         this.process = spawn(pythonExe, ['-c', pythonBootstrap], {
             cwd: rvcDir,
             detached: false,
+            env: {
+                ...process.env,
+                RVC_MODELS_DIR: path.join(this.installPath, 'models'),
+                RVC_VERBOSE_LOG: this.verboseLogs ? '1' : '0',
+            },
             stdio: ['ignore', 'pipe', 'pipe'],
         });
 
         this.process.stdout?.pipe(logStream);
         this.process.stderr?.pipe(logStream);
 
-        this.process.stdout?.on('data', (d) => console.log(`[RVC stdout] ${d}`));
-        this.process.stderr?.on('data', (d) => console.error(`[RVC stderr] ${d}`));
+        this.process.stdout?.on('data', (d) => {
+            const text = d.toString();
+            if (this.verboseLogs) {
+                console.log(`[RVC stdout] ${text}`);
+                return;
+            }
+            if (/traceback|error|exception|failed/i.test(text)) {
+                console.warn(`[RVC stdout] ${text}`);
+            }
+        });
+        this.process.stderr?.on('data', (d) => {
+            const text = d.toString();
+            if (this.verboseLogs) {
+                console.error(`[RVC stderr] ${text}`);
+                return;
+            }
+            // In quiet mode, keep only actionable errors.
+            if (/traceback|error|exception|failed/i.test(text)) {
+                console.error(`[RVC stderr] ${text}`);
+            }
+        });
 
         this.process.on('exit', (code) => {
             console.log(`[RvcRuntime] Server exited with code ${code}`);

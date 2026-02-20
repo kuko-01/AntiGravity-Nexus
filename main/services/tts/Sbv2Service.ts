@@ -341,15 +341,156 @@ export class Sbv2Service {
     // Synthesis
     // ========================================
 
+    /**
+     * Split long text into chunks suitable for SBV2 synthesis (max ~90 chars).
+     * Removes newlines and splits at natural Japanese sentence boundaries.
+     */
+    private splitTextForSynthesis(rawText: string, maxLen: number = 90): string[] {
+        // Remove newlines and collapse whitespace
+        const cleaned = rawText.replace(/[\r\n]+/g, '').replace(/\s+/g, ' ').trim();
+        if (!cleaned) return [];
+        if (cleaned.length <= maxLen) return [cleaned];
+
+        const chunks: string[] = [];
+        let remaining = cleaned;
+
+        // Split priority: 。！？  then 、  then space  then force-cut
+        while (remaining.length > maxLen) {
+            let cutAt = -1;
+
+            // Try to find sentence-ending punctuation within maxLen
+            for (let i = maxLen - 1; i >= 10; i--) {
+                const ch = remaining[i];
+                if (ch === '。' || ch === '！' || ch === '？' || ch === '!' || ch === '?' || ch === '.' ) {
+                    cutAt = i + 1;
+                    break;
+                }
+            }
+
+            // Fallback: comma / clause boundary
+            if (cutAt < 0) {
+                for (let i = maxLen - 1; i >= 10; i--) {
+                    const ch = remaining[i];
+                    if (ch === '、' || ch === ',' || ch === '；' || ch === ';') {
+                        cutAt = i + 1;
+                        break;
+                    }
+                }
+            }
+
+            // Fallback: space
+            if (cutAt < 0) {
+                for (let i = maxLen - 1; i >= 10; i--) {
+                    if (remaining[i] === ' ' || remaining[i] === '　') {
+                        cutAt = i + 1;
+                        break;
+                    }
+                }
+            }
+
+            // Force cut
+            if (cutAt < 0) {
+                cutAt = maxLen;
+            }
+
+            const chunk = remaining.slice(0, cutAt).trim();
+            if (chunk) chunks.push(chunk);
+            remaining = remaining.slice(cutAt).trim();
+        }
+
+        if (remaining) chunks.push(remaining);
+        return chunks;
+    }
+
+    /**
+     * Synthesize a single text chunk (no splitting).
+     */
+    private async synthesizeChunk(params: TtsSynthesizeParams, endpoint: string): Promise<{ success: boolean; buffer?: ArrayBuffer; error?: TtsError }> {
+        const queryParams = new URLSearchParams();
+        queryParams.set('text', params.text);
+        if (params.modelId || this.activeModelId) {
+            queryParams.set('model_name', params.modelId || this.activeModelId || '');
+        }
+        if (params.style) {
+            queryParams.set('style', params.style);
+        }
+        if (params.speed !== undefined) {
+            queryParams.set('length', String(params.speed));
+        }
+
+        // V2.0 Params
+        if (params.styleWeight !== undefined) queryParams.set('style_weight', String(params.styleWeight));
+        if (params.sdpRatio !== undefined) queryParams.set('sdp_ratio', String(params.sdpRatio));
+        if (params.noiseScale !== undefined) queryParams.set('noise', String(params.noiseScale));
+        if (params.noiseScaleW !== undefined) queryParams.set('noisew', String(params.noiseScaleW));
+
+        if (params.assistText) {
+            queryParams.set('assist_text', params.assistText);
+            queryParams.set('assist_text_weight', String(params.assistTextWeight ?? 1.0));
+        }
+
+        if (params.postFilter !== undefined) {
+            queryParams.set('post_filter', String(params.postFilter));
+        }
+        if (params.filterStrength !== undefined) {
+            queryParams.set('filter_strength', String(params.filterStrength));
+        }
+
+        const requestUrl = `${endpoint}/voice?${queryParams.toString()}`;
+        console.log('[Sbv2Service] Synthesize chunk:', params.text.slice(0, 40) + (params.text.length > 40 ? '...' : ''));
+
+        const response = await fetch(requestUrl, { method: 'POST' });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            return {
+                success: false,
+                error: { code: 'E_SERVER_FAILED', message: `Synthesis failed: ${errorText}` },
+            };
+        }
+
+        return { success: true, buffer: await response.arrayBuffer() };
+    }
+
+    /**
+     * Concatenate multiple WAV buffers (assumes same format) into one.
+     */
+    private concatWavBuffers(buffers: ArrayBuffer[]): Buffer {
+        if (buffers.length === 1) return Buffer.from(buffers[0]);
+
+        // Extract raw PCM data from each WAV (skip 44-byte header)
+        const pcmChunks: Buffer[] = [];
+        let totalDataLen = 0;
+        for (const buf of buffers) {
+            const data = Buffer.from(buf).subarray(44);
+            pcmChunks.push(data);
+            totalDataLen += data.length;
+        }
+
+        // Build new WAV from first buffer's header
+        const firstHeader = Buffer.from(buffers[0]).subarray(0, 44);
+        const result = Buffer.alloc(44 + totalDataLen);
+        firstHeader.copy(result, 0, 0, 44);
+
+        // Update RIFF chunk size (offset 4, little-endian uint32)
+        result.writeUInt32LE(36 + totalDataLen, 4);
+        // Update data chunk size (offset 40, little-endian uint32)
+        result.writeUInt32LE(totalDataLen, 40);
+
+        let offset = 44;
+        for (const chunk of pcmChunks) {
+            chunk.copy(result, offset);
+            offset += chunk.length;
+        }
+
+        return result;
+    }
+
     async synthesize(params: TtsSynthesizeParams): Promise<TtsSynthesizeResult> {
-        // Check runtime
         if (this.runtime.getState() !== 'running') {
             return {
                 success: false,
-                error: {
-                    code: 'E_SERVER_FAILED',
-                    message: 'TTS server is not running',
-                },
+                error: { code: 'E_SERVER_FAILED', message: 'TTS server is not running' },
             };
         }
 
@@ -357,102 +498,53 @@ export class Sbv2Service {
         if (!endpoint) {
             return {
                 success: false,
-                error: {
-                    code: 'E_SERVER_FAILED',
-                    message: 'No server endpoint available',
-                },
+                error: { code: 'E_SERVER_FAILED', message: 'No server endpoint available' },
             };
         }
 
         try {
-            // Build synthesis request as query parameters (SBV2 API uses query params, not JSON body)
-            const queryParams = new URLSearchParams();
-            queryParams.set('text', params.text);
-            if (params.modelId || this.activeModelId) {
-                queryParams.set('model_name', params.modelId || this.activeModelId || '');
-            }
-            if (params.style) {
-                queryParams.set('style', params.style);
-            }
-            // SBV2 uses 'length' for speed (1.0 is normal, higher = slower)
-            if (params.speed !== undefined) {
-                queryParams.set('length', String(params.speed));
-            }
-            if (params.pitch !== undefined) {
-                // Pitch is handled by style vectors or separateparam?
-                // Standard SBV2 API doesn't have direct 'pitch' query param in default server_fastapi.py,
-                // but some forks do. Standard one usually relies on style. 
-                // IF server_fastapi.py doesn't support it, we might need to rely on SSML or style modification.
-                // However, based on user request, let's pass it if supported or used in modified server.
-                // Checking server_fastapi.py: It doesn't seem to have pitch/intonation params in the `voice` endpoint sig.
-                // Wait, user requirements said "Pitch", "Intonation".
-                // Let's check server_fastapi.py again.
-                // It has: sdp_ratio, noise, noisew, length, language, auto_split, split_interval, assist_text, assist_text_weight, style, style_weight.
-                // It DOES NOT have pitch or intonation.
-                // BUT, VITS2 models usually infer pitch/intonation from text/style.
-                // If user wants pitch/intonation control, we might need to modify server_fastapi.py deeper or use simple post-processing (unlikely for intonation).
-                // FOR NOW, we will implement the V2 params that ARE supported:
-            }
-
-            // V2.0 Params
-            if (params.styleWeight !== undefined) queryParams.set('style_weight', String(params.styleWeight));
-            if (params.sdpRatio !== undefined) queryParams.set('sdp_ratio', String(params.sdpRatio));
-            if (params.noiseScale !== undefined) queryParams.set('noise', String(params.noiseScale));
-            if (params.noiseScaleW !== undefined) queryParams.set('noisew', String(params.noiseScaleW));
-
-            if (params.assistText) {
-                queryParams.set('assist_text', params.assistText);
-                // We could also expose assist_text_weight, default to 1.0 or user defined?
-                // User spec didn't strictly ask for weight slider, but good to have default.
-                queryParams.set('assist_text_weight', '1.0');
-            }
-
-            // Audio Enhancement (Post-Processing)
-            if (params.postFilter !== undefined) {
-                queryParams.set('post_filter', String(params.postFilter));
-            }
-            if (params.filterStrength !== undefined) {
-                queryParams.set('filter_strength', String(params.filterStrength));
-            }
-
-            const requestUrl = `${endpoint}/voice?${queryParams.toString()}`;
-            console.log('[Sbv2Service] Synthesize Request Params:', Object.fromEntries(queryParams.entries()));
-            console.log(`[Sbv2Service] Sending Request: ${requestUrl}`);
-
-            const response = await fetch(requestUrl, {
-                method: 'POST',
-            });
-
-            if (!response.ok) {
-                const errorText = await response.text();
+            // Split long text into chunks, removing newlines
+            const chunks = this.splitTextForSynthesis(params.text);
+            if (chunks.length === 0) {
                 return {
                     success: false,
-                    error: {
-                        code: 'E_SERVER_FAILED',
-                        message: `Synthesis failed: ${errorText}`,
-                    },
+                    error: { code: 'E_SERVER_FAILED', message: 'Empty text after cleanup' },
                 };
             }
 
-            // Get audio data
-            const audioBuffer = await response.arrayBuffer();
+            console.log(`[Sbv2Service] Text split into ${chunks.length} chunk(s)`);
+
+            const wavBuffers: ArrayBuffer[] = [];
+            for (let i = 0; i < chunks.length; i++) {
+                const chunkParams = { ...params, text: chunks[i] };
+                const result = await this.synthesizeChunk(chunkParams, endpoint);
+                if (!result.success || !result.buffer) {
+                    return {
+                        success: false,
+                        error: result.error || { code: 'E_SERVER_FAILED', message: `Chunk ${i + 1}/${chunks.length} failed` },
+                    };
+                }
+                wavBuffers.push(result.buffer);
+            }
+
+            // Concatenate all WAV chunks
+            const combinedBuffer = this.concatWavBuffers(wavBuffers);
 
             // Save to cache
             const cacheDir = path.join(this.installPath, CACHE_DIR);
             fs.mkdirSync(cacheDir, { recursive: true });
-
             const wavPath = path.join(cacheDir, `synth_${Date.now()}.wav`);
-            fs.writeFileSync(wavPath, Buffer.from(audioBuffer));
+            fs.writeFileSync(wavPath, combinedBuffer);
 
-            // Parse WAV header for duration (simplified)
-            const durationMs = this.estimateWavDuration(audioBuffer);
+            const abuf = combinedBuffer.buffer.slice(combinedBuffer.byteOffset, combinedBuffer.byteOffset + combinedBuffer.byteLength) as ArrayBuffer;
+            const durationMs = this.estimateWavDuration(abuf);
 
             return {
                 success: true,
                 wavPath,
-                audioBase64: Buffer.from(audioBuffer).toString('base64'),
+                audioBase64: combinedBuffer.toString('base64'),
                 durationMs,
-                sampleRate: 44100, // Default, should be read from header
+                sampleRate: 44100,
             };
 
         } catch (err) {

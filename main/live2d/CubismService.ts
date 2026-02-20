@@ -42,33 +42,24 @@ export class CubismService {
 
     public startHost() {
         if (this.isRunning) return;
-
-        // Assuming AG.CubismHost.exe is in resources folder in prod, or specific path in dev
-        // For now, let's assume it's next to the executable or in a known location.
-        // The user spec assumes: C:\AG\Models\... as model path.
-        // But Host Path: "Process Model - Launched as external process".
-        // Use a fixed path or relative?
-        // Let's assume adjacent to main bundle or C:\AG\bin\AG.CubismHost.exe?
-        // Spec didn't enforce Host Path, but implied Controller launches it.
-        // I will assume standard resource path for now, but fallback to C:\AG\bin if needed.
-
-        let execPath = path.join((process as any).resourcesPath, 'CubismHost', 'AG.CubismHost.exe');
-        // Dev fallback
-        if (process.env.NODE_ENV === 'development') {
-            // Maybe in a 'bin' folder in project root?
-            execPath = path.join(process.cwd(), 'bin', 'AG.CubismHost.exe');
+        const externalHostMode = process.env.CUBISM_EXTERNAL_HOST === '1';
+        const execPath = this.resolveHostPath();
+        if (execPath) {
+            console.log(`[Cubism] Launching Host: ${execPath}`);
         }
 
-        console.log(`[Cubism] Launching Host: ${execPath}`);
-
         try {
-            // 1. Check if EXE exists
-            if (!fs.existsSync(execPath)) {
-                console.warn(`[Cubism] Host not found at: ${execPath}. Pending manual deployment.`);
-                // We still attempt to connect to pipes, because user might launch host manually.
-                // But we suppress the spawn attempt.
+            // 1. Spawn host only when executable is available
+            if (!execPath) {
+                if (externalHostMode) {
+                    console.warn('[Cubism] Host executable not found. External host mode is enabled; waiting for named pipes.');
+                    this.cmdPipe.connect();
+                    this.evtPipe.connect();
+                } else {
+                    console.warn('[Cubism] Host executable not found. Live2D host startup skipped (set CUBISM_EXTERNAL_HOST=1 to allow external pipe polling).');
+                }
             } else {
-                // 2. Spawn if found
+                // 2. Spawn host when found
                 this.hostProcess = child_process.spawn(execPath, [], { detached: false });
                 this.hostProcess.on('exit', (code) => {
                     console.log(`[Cubism] Host exited with code ${code}`);
@@ -78,15 +69,35 @@ export class CubismService {
                     setTimeout(() => this.startHost(), 5000);
                 });
                 this.isRunning = true;
+                // 3. Connect Pipes after spawn
+                this.cmdPipe.connect();
+                this.evtPipe.connect();
             }
-
-            // 3. Connect Pipes (with new 3s interval)
-            this.cmdPipe.connect();
-            this.evtPipe.connect();
 
         } catch (e) {
             console.error('[Cubism] Failed to launch host:', e);
         }
+    }
+
+    private resolveHostPath(): string | null {
+        const fromEnv = process.env.CUBISM_HOST_PATH;
+        if (fromEnv && fs.existsSync(fromEnv)) {
+            return fromEnv;
+        }
+
+        const candidates = [
+            path.join((process as any).resourcesPath, 'CubismHost', 'AG.CubismHost.exe'),
+            path.join(process.cwd(), 'resources', 'CubismHost', 'AG.CubismHost.exe'),
+            path.join(process.cwd(), 'bin', 'AG.CubismHost.exe')
+        ];
+
+        for (const candidate of candidates) {
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+        }
+
+        return null;
     }
 
     public sendCommand(type: string, name: string, payload: any = {}): string {

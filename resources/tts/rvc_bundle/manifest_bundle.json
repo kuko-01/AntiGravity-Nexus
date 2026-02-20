@@ -1,0 +1,35 @@
+{
+    "meta":  {
+                 "appType":  "rvc",
+                 "note":  "rvc_server.py uses model-aware realtime voice conversion backend (experimental)."
+             },
+    "dirs":  [
+                 {
+                     "path":  "wheels",
+                     "required":  true
+                 },
+                 {
+                     "path":  "models",
+                     "required":  true
+                 }
+             ],
+    "builtAt":  "2026-02-17T01:06:22Z",
+    "files":  [
+                  {
+                      "path":  "python_portable.zip",
+                      "sha256":  "928771994947bcbfa0d710d2cb385745d9a5ec48545af359ab28d088ea305edd",
+                      "size":  14752795
+                  },
+                  {
+                      "path":  "rvc_app.zip",
+                      "sha256":  "13e0548fe5b300985e985be2cfd402726e734a9d46cafdb428176ca372ca2029",
+                      "size":  156341
+                  },
+                  {
+                      "path":  "requirements.lock",
+                      "sha256":  "7567a88753475e52ea8c5685a0ab70747eece0023f91c7c4c0ff562b537d0ab1",
+                      "size":  353
+                  }
+              ],
+    "bundleVersion":  "2026.02.17-rvc-gpu-v1"
+}

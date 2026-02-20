@@ -142,6 +142,8 @@ export interface RvcConvertParams {
     inputPath?: string;         // WAV file path to convert
     inputBase64?: string;       // OR base64-encoded WAV
     modelId?: string;
+    indexPath?: string;         // optional index file path selected by user
+    speakerId?: number;         // speaker id (sid) for multi-speaker models, default: 0
     f0Method?: RvcF0Method;     // default: 'rmvpe'
     transpose?: number;         // semitones shift (-12 to +12), default: 0
     indexRate?: number;          // 0.0-1.0, how much to use index, default: 0.75
@@ -185,6 +187,7 @@ export interface RvcPreset {
 
 export interface RvcStartOptions {
     forceCpu?: boolean;
+    verboseLogs?: boolean;
 }
 
 // ========================================
@@ -207,6 +210,7 @@ export interface VoiceSynthesizeParams {
         noiseScale?: number;
         noiseScaleW?: number;
         assistText?: string;
+        assistTextWeight?: number;
         postFilter?: boolean;
         filterStrength?: number;
     };

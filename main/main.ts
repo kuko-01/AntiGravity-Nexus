@@ -328,22 +328,32 @@ let appAudioCapture: {
     startSystemCapture: (callback: (data: { buffer: Buffer; channels: number; sampleRate: number; bytesPerSample: number }) => void) => { success: boolean; error?: string };
     stopCapture: () => void;
     isCapturing: () => boolean;
+    setProcessMute: (pid: number, mute: boolean) => { success: boolean; error?: string };
+    getProcessMute: (pid: number) => { success: boolean; found: boolean; muted: boolean; error?: string };
 } | null = null;
 
 try {
-    let nativeModulePath: string;
     if (isDevelopment) {
-        nativeModulePath = path.join(__dirname, '../../native/app-audio-capture/build/Release/app_audio_capture.node');
+        const devCandidates = [
+            path.join(__dirname, '../../native/app-audio-capture/build/Release_alt/app_audio_capture.node'),
+            path.join(__dirname, '../../native/app-audio-capture/build/Release/app_audio_capture.node'),
+        ];
+        const nativeModulePath = devCandidates.find((p) => fs.existsSync(p));
+        if (nativeModulePath) {
+            appAudioCapture = require(nativeModulePath);
+            console.log('[Main] Loaded native app-audio-capture module from:', nativeModulePath);
+        } else {
+            console.warn('[Main] Native app-audio-capture module not found at:', devCandidates.join(' | '));
+        }
     } else {
         // パッケージ版: resourcesフォルダ直下に native フォルダをコピーする想定
-        nativeModulePath = path.join(process.resourcesPath, 'native/app-audio-capture/build/Release/app_audio_capture.node');
-    }
-
-    if (fs.existsSync(nativeModulePath)) {
-        appAudioCapture = require(nativeModulePath);
-        console.log('[Main] Loaded native app-audio-capture module from:', nativeModulePath);
-    } else {
-        console.warn('[Main] Native app-audio-capture module not found at:', nativeModulePath);
+        const nativeModulePath = path.join(process.resourcesPath, 'native/app-audio-capture/build/Release/app_audio_capture.node');
+        if (fs.existsSync(nativeModulePath)) {
+            appAudioCapture = require(nativeModulePath);
+            console.log('[Main] Loaded native app-audio-capture module from:', nativeModulePath);
+        } else {
+            console.warn('[Main] Native app-audio-capture module not found at:', nativeModulePath);
+        }
     }
 } catch (error) {
     console.error('[Main] Failed to load native app-audio-capture module:', error);
@@ -376,6 +386,30 @@ ipcMain.handle('get-audio-processes', async () => {
     } catch (error) {
         console.error('Get audio processes error:', error);
         return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('set-process-mute', async (_event, pid: number, mute: boolean) => {
+    try {
+        if (!appAudioCapture || typeof appAudioCapture.setProcessMute !== 'function') {
+            return { success: false, error: 'Native module does not support process mute control' };
+        }
+        return appAudioCapture.setProcessMute(pid, mute);
+    } catch (error) {
+        console.error('Set process mute error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('get-process-mute', async (_event, pid: number) => {
+    try {
+        if (!appAudioCapture || typeof appAudioCapture.getProcessMute !== 'function') {
+            return { success: false, found: false, muted: false, error: 'Native module does not support process mute control' };
+        }
+        return appAudioCapture.getProcessMute(pid);
+    } catch (error) {
+        console.error('Get process mute error:', error);
+        return { success: false, found: false, muted: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
 });
 
@@ -430,6 +464,61 @@ ipcMain.handle('start-process-capture', async (_event, pid: number) => {
         return { ...result, recordingPath: continuousRecordingPath };
     } catch (error) {
         console.error('Start process capture error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+// Start per-app capture and stream raw PCM chunks to the requesting renderer
+ipcMain.handle('start-process-capture-stream', async (event, pid: number) => {
+    try {
+        if (!appAudioCapture) {
+            return { success: false, error: 'Native module not loaded' };
+        }
+
+        if (appAudioCapture.isCapturing()) {
+            appAudioCapture.stopCapture();
+        }
+
+        const sender = event.sender;
+        const result = appAudioCapture.startCapture(pid, (data) => {
+            if (sender.isDestroyed()) return;
+            try {
+                if (data.bytesPerSample !== 2) {
+                    // Current native module outputs 16-bit PCM. Ignore incompatible formats.
+                    return;
+                }
+                const int16 = new Int16Array(
+                    data.buffer.buffer,
+                    data.buffer.byteOffset,
+                    Math.floor(data.buffer.byteLength / 2)
+                );
+                sender.send('process-audio-stream', {
+                    buffer: Array.from(int16),
+                    channels: data.channels,
+                    sampleRate: data.sampleRate,
+                    bytesPerSample: data.bytesPerSample,
+                });
+            } catch (streamError) {
+                console.error('[Main] process-audio-stream send error:', streamError);
+            }
+        });
+
+        return result;
+    } catch (error) {
+        console.error('Start process capture stream error:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('stop-process-capture-stream', async () => {
+    try {
+        if (!appAudioCapture) {
+            return { success: false, error: 'Native module not loaded' };
+        }
+        appAudioCapture.stopCapture();
+        return { success: true };
+    } catch (error) {
+        console.error('Stop process capture stream error:', error);
         return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
 });
@@ -939,6 +1028,15 @@ ipcMain.handle('open-folder', async (_event, fullPath: string) => {
     }
 });
 
+ipcMain.handle('open-app-volume-settings', async () => {
+    try {
+        await shell.openExternal('ms-settings:apps-volume');
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
 // 音声ファイルを読み込む（WAVヘッダーを解析してPCMデータのみ返す）
 ipcMain.handle('read-audio-file-deprecated', async (_event, filePath: string) => {
     try {
@@ -1179,7 +1277,7 @@ ipcMain.handle('nano:select-file', async (_event, extensions: string[], multi: b
 
         const result = await dialog.showOpenDialog({
             properties,
-            filters: [{ name: 'Images', extensions }]
+            filters: [{ name: 'Files', extensions }]
         });
         if (result.canceled || result.filePaths.length === 0) {
             return { success: false };
@@ -2058,6 +2156,392 @@ ipcMain.handle('tts-synthesize', async (_event, params: TtsSynthesizeParams) => 
     }
 });
 
+// Acting Engine output bundle save
+ipcMain.handle('tts-save-acting-bundle', async (_event, payload: any) => {
+    try {
+        const localBase = path.join(
+            process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Local'),
+            'AntiGravity',
+            'tts',
+            'sbv2',
+            'acting_output',
+        );
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const runDir = path.join(localBase, `run_${stamp}`);
+        const outputDir = path.join(runDir, 'output');
+        const rawDir = path.join(outputDir, 'raw_segments');
+        fs.mkdirSync(rawDir, { recursive: true });
+
+        const writeBase64Wav = (filePath: string, base64?: string) => {
+            if (!base64 || typeof base64 !== 'string') return;
+            fs.writeFileSync(filePath, Buffer.from(base64, 'base64'));
+        };
+
+        const inputText = String(payload?.inputText || '');
+        const segments = Array.isArray(payload?.segments) ? payload.segments : [];
+        const params = payload?.params ?? {};
+        const rawSegments = Array.isArray(payload?.rawSegments) ? payload.rawSegments : [];
+        const mergedAudioBase64 = typeof payload?.mergedAudioBase64 === 'string' ? payload.mergedAudioBase64 : '';
+        const finalAudioBase64 = typeof payload?.finalAudioBase64 === 'string' ? payload.finalAudioBase64 : '';
+
+        fs.writeFileSync(path.join(outputDir, 'input.txt'), inputText, 'utf-8');
+        fs.writeFileSync(path.join(outputDir, 'segments.json'), JSON.stringify(segments, null, 2), 'utf-8');
+        fs.writeFileSync(path.join(outputDir, 'params.json'), JSON.stringify(params, null, 2), 'utf-8');
+
+        const sortedRaw = [...rawSegments].sort((a: any, b: any) => Number(a?.index || 0) - Number(b?.index || 0));
+        for (let i = 0; i < sortedRaw.length; i++) {
+            const seg = sortedRaw[i];
+            const idx = Number.isFinite(Number(seg?.index)) ? Number(seg.index) : i;
+            const padded = String(Math.max(0, idx)).padStart(3, '0');
+            writeBase64Wav(path.join(rawDir, `seg_${padded}.wav`), seg?.audioBase64);
+        }
+
+        writeBase64Wav(path.join(outputDir, 'merged.wav'), mergedAudioBase64);
+        writeBase64Wav(path.join(outputDir, 'final.wav'), finalAudioBase64 || mergedAudioBase64);
+
+        return {
+            success: true,
+            outputDir,
+            runDir,
+            projectName: payload?.projectName || 'Voice Studio Acting Engine v1',
+        };
+    } catch (error) {
+        console.error('[TTS] Save acting bundle error:', error);
+        return { success: false, error: String(error) };
+    }
+});
+
+const getActingProfilesPath = (): string => {
+    return path.join(
+        process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Local'),
+        'AntiGravity',
+        'tts',
+        'sbv2',
+        'config',
+        'acting_profiles.json',
+    );
+};
+
+const getDefaultActingProfiles = () => {
+    const nowIso = new Date().toISOString();
+    const base = {
+        baselineStyle: 'ノーマル',
+        styleMap: {
+            neutral: 'ノーマル',
+            joy: 'るんるん',
+            sadness: 'よふかし',
+            fear: 'ささやきB',
+            anger: 'ノーマル',
+        },
+        confidenceThreshold: 0.55,
+        applyModeDefault: 'fixed_style',
+        analyzerModeDefault: 'hybrid',
+        classifierBlend: 0.45,
+        classifierTemperature: 1.0,
+        hybridClassifierScale: 2.4,
+        classifierFeatureGain: {
+            keyword: 1.0,
+            punctuation: 1.0,
+            negation: 1.0,
+            uncertainty: 1.0,
+            laughter: 1.0,
+            assertive: 1.0,
+            neutralContext: 1.0,
+        },
+        classifierEmotionBias: {
+            neutral: 0.0,
+            joy: 0.0,
+            sadness: 0.0,
+            anger: 0.0,
+            fear: 0.0,
+        },
+        prosodyLimits: {
+            speed: [0.9, 1.12],
+            pitch: [-12, 12],
+            intonation: [0.85, 1.25],
+            styleWeight: [0.95, 1.15],
+        },
+        prosodyDeltaByEmotion: {
+            neutral: { speed: 0, pitch: 0, intonation: 0, styleWeight: 0 },
+            joy: { speed: 0.07, pitch: 0, intonation: 0.12, styleWeight: 0.05 },
+            sadness: { speed: -0.10, pitch: 0, intonation: -0.10, styleWeight: 0 },
+            fear: { speed: -0.03, pitch: 0, intonation: 0.05, styleWeight: 0.03 },
+            anger: { speed: 0.03, pitch: 0, intonation: 0.15, styleWeight: 0.04 },
+        },
+        pauseMsByPunct: {
+            comma: 120,
+            period: 220,
+            exclamation: 160,
+            question: 200,
+            ellipsis: 350,
+            newline: 280,
+            default: 180,
+        },
+        pauseEmotionMultiplier: {
+            joy: 0.85,
+            anger: 0.70,
+            sadness: 1.25,
+            fear: 1.35,
+            neutral: 1.0,
+        },
+        intensityCurveByEmotion: {
+            neutral: { start: 0.95, end: 1.05 },
+            joy: { start: 1.0, end: 1.15 },
+            sadness: { start: 1.05, end: 0.95 },
+            anger: { start: 1.0, end: 1.10 },
+            fear: { start: 1.05, end: 1.15 },
+        },
+        emotionGain: {
+            joy: 1.0,
+            anger: 0.7,
+            sadness: 1.0,
+            fear: 1.0,
+            neutral: 1.0,
+        },
+        crossfadeMs: 20,
+        dspEnabledByDefault: true,
+    };
+    return [
+        {
+            id: 'default',
+            name: 'Default Safe Broadcast',
+            ...base,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+        },
+        {
+            id: 'preset_calm',
+            name: '落ち着き (Calm Narrator)',
+            ...base,
+            confidenceThreshold: 0.60,
+            classifierBlend: 0.40,
+            classifierTemperature: 1.15,
+            classifierFeatureGain: {
+                ...base.classifierFeatureGain,
+                punctuation: 0.75,
+                assertive: 0.8,
+                neutralContext: 1.15,
+            },
+            prosodyDeltaByEmotion: {
+                ...base.prosodyDeltaByEmotion,
+                joy: { speed: 0.04, pitch: 0, intonation: 0.08, styleWeight: 0.03 },
+                sadness: { speed: -0.07, pitch: 0, intonation: -0.08, styleWeight: 0.0 },
+                anger: { speed: 0.01, pitch: 0, intonation: 0.08, styleWeight: 0.02 },
+            },
+            pauseMsByPunct: {
+                ...base.pauseMsByPunct,
+                period: 240,
+                question: 220,
+                default: 195,
+            },
+            intensityCurveByEmotion: {
+                ...base.intensityCurveByEmotion,
+                neutral: { start: 0.92, end: 1.0 },
+                joy: { start: 0.97, end: 1.08 },
+            },
+            createdAt: nowIso,
+            updatedAt: nowIso,
+        },
+        {
+            id: 'preset_energetic',
+            name: '元気 (Energetic Streamer)',
+            ...base,
+            confidenceThreshold: 0.50,
+            classifierBlend: 0.55,
+            classifierTemperature: 0.85,
+            hybridClassifierScale: 2.8,
+            classifierFeatureGain: {
+                ...base.classifierFeatureGain,
+                keyword: 1.12,
+                punctuation: 1.25,
+                laughter: 1.25,
+            },
+            classifierEmotionBias: {
+                ...base.classifierEmotionBias,
+                joy: 0.12,
+                neutral: -0.08,
+            },
+            prosodyDeltaByEmotion: {
+                ...base.prosodyDeltaByEmotion,
+                joy: { speed: 0.10, pitch: 0, intonation: 0.16, styleWeight: 0.08 },
+                anger: { speed: 0.05, pitch: 0, intonation: 0.18, styleWeight: 0.05 },
+                fear: { speed: -0.01, pitch: 0, intonation: 0.09, styleWeight: 0.05 },
+            },
+            pauseMsByPunct: {
+                ...base.pauseMsByPunct,
+                comma: 95,
+                period: 190,
+                exclamation: 130,
+                default: 145,
+            },
+            emotionGain: {
+                ...base.emotionGain,
+                joy: 1.15,
+                anger: 0.85,
+            },
+            createdAt: nowIso,
+            updatedAt: nowIso,
+        },
+        {
+            id: 'preset_tense',
+            name: '不穏 (Tense / Dark)',
+            ...base,
+            confidenceThreshold: 0.56,
+            classifierBlend: 0.62,
+            classifierTemperature: 0.92,
+            hybridClassifierScale: 2.9,
+            classifierFeatureGain: {
+                ...base.classifierFeatureGain,
+                uncertainty: 1.3,
+                negation: 1.25,
+                punctuation: 1.05,
+            },
+            classifierEmotionBias: {
+                ...base.classifierEmotionBias,
+                fear: 0.18,
+                sadness: 0.10,
+                joy: -0.12,
+            },
+            styleMap: {
+                ...base.styleMap,
+                fear: 'ささやきB',
+                sadness: 'よふかし',
+            },
+            prosodyDeltaByEmotion: {
+                ...base.prosodyDeltaByEmotion,
+                fear: { speed: -0.06, pitch: 0, intonation: 0.06, styleWeight: 0.05 },
+                sadness: { speed: -0.12, pitch: 0, intonation: -0.12, styleWeight: 0.01 },
+                joy: { speed: 0.03, pitch: 0, intonation: 0.06, styleWeight: 0.03 },
+            },
+            pauseMsByPunct: {
+                ...base.pauseMsByPunct,
+                period: 255,
+                ellipsis: 420,
+                question: 240,
+                default: 205,
+            },
+            pauseEmotionMultiplier: {
+                ...base.pauseEmotionMultiplier,
+                fear: 1.45,
+                sadness: 1.30,
+            },
+            createdAt: nowIso,
+            updatedAt: nowIso,
+        },
+    ];
+};
+
+const mergeBuiltinActingProfiles = (profiles: any[]): any[] => {
+    const builtins = getDefaultActingProfiles();
+    const builtinsById = new Map(builtins.map((p) => [p.id, p]));
+    const existingById = new Map(
+        (Array.isArray(profiles) ? profiles : [])
+            .filter((p: any) => p && typeof p.id === 'string' && p.id.trim().length > 0)
+            .map((p: any) => [String(p.id), p]),
+    );
+
+    const mergedBuiltins = builtins.map((builtin) => existingById.get(builtin.id) || builtin);
+    const extras = Array.from(existingById.values())
+        .filter((p: any) => !builtinsById.has(p.id));
+    return [...mergedBuiltins, ...extras];
+};
+
+const readActingProfiles = (): any[] => {
+    const profilePath = getActingProfilesPath();
+    if (!fs.existsSync(profilePath)) {
+        return mergeBuiltinActingProfiles([]);
+    }
+    try {
+        const raw = JSON.parse(fs.readFileSync(profilePath, 'utf-8'));
+        const list = Array.isArray(raw) ? raw : [];
+        return mergeBuiltinActingProfiles(list);
+    } catch {
+        return mergeBuiltinActingProfiles([]);
+    }
+};
+
+const writeActingProfiles = (profiles: any[]) => {
+    const profilePath = getActingProfilesPath();
+    fs.mkdirSync(path.dirname(profilePath), { recursive: true });
+    fs.writeFileSync(profilePath, JSON.stringify(profiles, null, 2), 'utf-8');
+};
+
+ipcMain.handle('tts-acting-list-profiles', async () => {
+    try {
+        const profiles = readActingProfiles();
+        writeActingProfiles(profiles);
+        return { success: true, profiles };
+    } catch (error) {
+        console.error('[TTS] Acting profile list error:', error);
+        return { success: false, error: String(error), profiles: mergeBuiltinActingProfiles([]) };
+    }
+});
+
+ipcMain.handle('tts-acting-save-profile', async (_event, profile: any) => {
+    try {
+        const nowIso = new Date().toISOString();
+        const id = typeof profile?.id === 'string' && profile.id.trim().length > 0
+            ? profile.id.trim()
+            : `profile_${Date.now()}`;
+        const name = typeof profile?.name === 'string' && profile.name.trim().length > 0
+            ? profile.name.trim()
+            : 'Acting Profile';
+        const next = {
+            ...profile,
+            id,
+            name,
+            updatedAt: nowIso,
+            createdAt: profile?.createdAt || nowIso,
+        };
+
+        const profiles = readActingProfiles();
+        const idx = profiles.findIndex((p: any) => p?.id === id);
+        if (idx >= 0) {
+            profiles[idx] = next;
+        } else {
+            profiles.push(next);
+        }
+        writeActingProfiles(profiles);
+        return { success: true, profile: next };
+    } catch (error) {
+        console.error('[TTS] Acting profile save error:', error);
+        return { success: false, error: String(error) };
+    }
+});
+
+ipcMain.handle('tts-acting-delete-profile', async (_event, profileId: string) => {
+    try {
+        const id = String(profileId || '').trim();
+        if (!id) {
+            return { success: false, error: 'profileId is required' };
+        }
+        if (id === 'default' || id.startsWith('preset_')) {
+            return { success: false, error: 'bundled profile cannot be deleted' };
+        }
+        const profiles = mergeBuiltinActingProfiles(readActingProfiles().filter((p: any) => p?.id !== id));
+        writeActingProfiles(profiles);
+        return { success: true };
+    } catch (error) {
+        console.error('[TTS] Acting profile delete error:', error);
+        return { success: false, error: String(error) };
+    }
+});
+
+ipcMain.handle('tts-acting-reset-bundled-profiles', async () => {
+    try {
+        const bundled = getDefaultActingProfiles();
+        const bundledIds = new Set(bundled.map((p) => p.id));
+        const current = readActingProfiles();
+        const custom = current.filter((p: any) => !bundledIds.has(String(p?.id || '')));
+        const next = [...bundled, ...custom];
+        writeActingProfiles(next);
+        return { success: true, profiles: next };
+    } catch (error) {
+        console.error('[TTS] Acting profile reset bundled error:', error);
+        return { success: false, error: String(error) };
+    }
+});
+
 // プリセット一覧取得
 ipcMain.handle('tts-get-presets', async () => {
     try {
@@ -2294,13 +2778,39 @@ ipcMain.handle('rvc-uninstall', async () => {
 });
 
 // RVC サーバー開始
-ipcMain.handle('rvc-start-server', async (_event, options?: { forceCpu?: boolean }) => {
+ipcMain.handle('rvc-start-server', async (_event, options?: { forceCpu?: boolean; verboseLogs?: boolean }) => {
     try {
         const service = RvcService.getInstance(ttsResourcesPath);
         return await service.startServer(options);
     } catch (error) {
         console.error('[RVC] Start server error:', error);
         return { success: false, error: { code: 'E_SERVER_FAILED', message: String(error) } };
+    }
+});
+
+// RVC ログ出力設定
+ipcMain.handle('rvc-set-verbose-logs', async (_event, enabled: boolean) => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        service.setVerboseLogs(!!enabled);
+        return {
+            success: true,
+            verboseLogs: service.getVerboseLogs(),
+            requiresRestart: service.getStatus().runtimeState === 'running',
+        };
+    } catch (error) {
+        console.error('[RVC] Set verbose logs error:', error);
+        return { success: false, error: String(error) };
+    }
+});
+
+ipcMain.handle('rvc-get-verbose-logs', async () => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return { success: true, verboseLogs: service.getVerboseLogs() };
+    } catch (error) {
+        console.error('[RVC] Get verbose logs error:', error);
+        return { success: false, verboseLogs: false, error: String(error) };
     }
 });
 
@@ -2341,6 +2851,34 @@ ipcMain.handle('rvc-list-models', async () => {
     } catch (error) {
         console.error('[RVC] List models error:', error);
         return [];
+    }
+});
+
+// RVC モデルごとのインデックス一覧取得
+ipcMain.handle('rvc-list-model-indexes', async (_event, modelId: string) => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        return await service.listModelIndexes(modelId);
+    } catch (error) {
+        console.error('[RVC] List model indexes error:', error);
+        return [];
+    }
+});
+
+// RVC モデルフォルダを開く
+ipcMain.handle('rvc-open-models-folder', async () => {
+    try {
+        const service = RvcService.getInstance(ttsResourcesPath);
+        const modelsPath = service.getModelsPath();
+        fs.mkdirSync(modelsPath, { recursive: true });
+        const openError = await shell.openPath(modelsPath);
+        if (openError) {
+            return { success: false, error: openError };
+        }
+        return { success: true, path: modelsPath };
+    } catch (error) {
+        console.error('[RVC] Open models folder error:', error);
+        return { success: false, error: String(error) };
     }
 });
 

@@ -8,6 +8,22 @@
 
 // Use __uuidof instead of defining static GUIDs to avoid linker conflicts
 
+namespace {
+bool InitializeComForAudio(bool& shouldUninitialize) {
+    shouldUninitialize = false;
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (SUCCEEDED(hr)) {
+        shouldUninitialize = true;
+        return true;
+    }
+    if (hr == RPC_E_CHANGED_MODE) {
+        // COM is already initialized on this thread with a different model.
+        return true;
+    }
+    return false;
+}
+}
+
 std::wstring ProcessList::GetProcessName(DWORD pid) {
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!hProcess) return L"Unknown";
@@ -143,4 +159,201 @@ std::vector<AudioProcessInfo> ProcessList::GetAudioProcesses() {
     CoUninitialize();
 
     return result;
+}
+
+bool ProcessList::SetProcessMute(DWORD pid, bool mute) {
+    if (pid == 0) return false;
+
+    bool shouldUninitialize = false;
+    if (!InitializeComForAudio(shouldUninitialize)) {
+        return false;
+    }
+
+    bool found = false;
+    bool applied = false;
+
+    IMMDeviceEnumerator* deviceEnumerator = nullptr;
+    HRESULT hr = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator), (void**)&deviceEnumerator
+    );
+
+    if (SUCCEEDED(hr) && deviceEnumerator) {
+        IMMDeviceCollection* deviceCollection = nullptr;
+        hr = deviceEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &deviceCollection);
+
+        if (SUCCEEDED(hr) && deviceCollection) {
+            UINT deviceCount = 0;
+            deviceCollection->GetCount(&deviceCount);
+
+            for (UINT d = 0; d < deviceCount; d++) {
+                IMMDevice* device = nullptr;
+                if (FAILED(deviceCollection->Item(d, &device)) || !device) {
+                    continue;
+                }
+
+                IAudioSessionManager2* sessionManager = nullptr;
+                hr = device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&sessionManager);
+                device->Release();
+
+                if (FAILED(hr) || !sessionManager) {
+                    continue;
+                }
+
+                IAudioSessionEnumerator* sessionEnumerator = nullptr;
+                hr = sessionManager->GetSessionEnumerator(&sessionEnumerator);
+                sessionManager->Release();
+
+                if (FAILED(hr) || !sessionEnumerator) {
+                    continue;
+                }
+
+                int sessionCount = 0;
+                sessionEnumerator->GetCount(&sessionCount);
+
+                for (int i = 0; i < sessionCount; i++) {
+                    IAudioSessionControl* sessionControl = nullptr;
+                    if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl) {
+                        continue;
+                    }
+
+                    IAudioSessionControl2* sessionControl2 = nullptr;
+                    hr = sessionControl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&sessionControl2);
+                    if (SUCCEEDED(hr) && sessionControl2) {
+                        DWORD sessionPid = 0;
+                        hr = sessionControl2->GetProcessId(&sessionPid);
+                        sessionControl2->Release();
+
+                        if (SUCCEEDED(hr) && sessionPid == pid) {
+                            ISimpleAudioVolume* simpleVolume = nullptr;
+                            hr = sessionControl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&simpleVolume);
+                            if (SUCCEEDED(hr) && simpleVolume) {
+                                found = true;
+                                if (SUCCEEDED(simpleVolume->SetMute(mute, nullptr))) {
+                                    applied = true;
+                                }
+                                simpleVolume->Release();
+                            }
+                        }
+                    }
+
+                    sessionControl->Release();
+                }
+
+                sessionEnumerator->Release();
+            }
+
+            deviceCollection->Release();
+        }
+
+        deviceEnumerator->Release();
+    }
+
+    if (shouldUninitialize) {
+        CoUninitialize();
+    }
+
+    return found && applied;
+}
+
+bool ProcessList::GetProcessMute(DWORD pid, bool& muted) {
+    muted = false;
+    if (pid == 0) return false;
+
+    bool shouldUninitialize = false;
+    if (!InitializeComForAudio(shouldUninitialize)) {
+        return false;
+    }
+
+    bool found = false;
+    bool allMuted = true;
+
+    IMMDeviceEnumerator* deviceEnumerator = nullptr;
+    HRESULT hr = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator), (void**)&deviceEnumerator
+    );
+
+    if (SUCCEEDED(hr) && deviceEnumerator) {
+        IMMDeviceCollection* deviceCollection = nullptr;
+        hr = deviceEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &deviceCollection);
+
+        if (SUCCEEDED(hr) && deviceCollection) {
+            UINT deviceCount = 0;
+            deviceCollection->GetCount(&deviceCount);
+
+            for (UINT d = 0; d < deviceCount; d++) {
+                IMMDevice* device = nullptr;
+                if (FAILED(deviceCollection->Item(d, &device)) || !device) {
+                    continue;
+                }
+
+                IAudioSessionManager2* sessionManager = nullptr;
+                hr = device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&sessionManager);
+                device->Release();
+
+                if (FAILED(hr) || !sessionManager) {
+                    continue;
+                }
+
+                IAudioSessionEnumerator* sessionEnumerator = nullptr;
+                hr = sessionManager->GetSessionEnumerator(&sessionEnumerator);
+                sessionManager->Release();
+
+                if (FAILED(hr) || !sessionEnumerator) {
+                    continue;
+                }
+
+                int sessionCount = 0;
+                sessionEnumerator->GetCount(&sessionCount);
+
+                for (int i = 0; i < sessionCount; i++) {
+                    IAudioSessionControl* sessionControl = nullptr;
+                    if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl) {
+                        continue;
+                    }
+
+                    IAudioSessionControl2* sessionControl2 = nullptr;
+                    hr = sessionControl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&sessionControl2);
+                    if (SUCCEEDED(hr) && sessionControl2) {
+                        DWORD sessionPid = 0;
+                        hr = sessionControl2->GetProcessId(&sessionPid);
+                        sessionControl2->Release();
+
+                        if (SUCCEEDED(hr) && sessionPid == pid) {
+                            ISimpleAudioVolume* simpleVolume = nullptr;
+                            hr = sessionControl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&simpleVolume);
+                            if (SUCCEEDED(hr) && simpleVolume) {
+                                BOOL isMuted = FALSE;
+                                if (SUCCEEDED(simpleVolume->GetMute(&isMuted))) {
+                                    found = true;
+                                    if (!isMuted) {
+                                        allMuted = false;
+                                    }
+                                }
+                                simpleVolume->Release();
+                            }
+                        }
+                    }
+
+                    sessionControl->Release();
+                }
+
+                sessionEnumerator->Release();
+            }
+
+            deviceCollection->Release();
+        }
+
+        deviceEnumerator->Release();
+    }
+
+    if (shouldUninitialize) {
+        CoUninitialize();
+    }
+
+    if (found) {
+        muted = allMuted;
+    }
+    return found;
 }

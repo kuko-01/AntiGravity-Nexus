@@ -79,8 +79,12 @@ export const IPC_CHANNELS = {
     SAVE_LOGS: 'save-logs',
     LOAD_LOGS: 'load-logs',
     GET_AUDIO_PROCESSES: 'get-audio-processes',
+    SET_PROCESS_MUTE: 'set-process-mute',
+    GET_PROCESS_MUTE: 'get-process-mute',
     START_PROCESS_CAPTURE: 'start-process-capture',
+    START_PROCESS_CAPTURE_STREAM: 'start-process-capture-stream',
     STOP_PROCESS_CAPTURE: 'stop-process-capture',
+    STOP_PROCESS_CAPTURE_STREAM: 'stop-process-capture-stream',
     // TTS Training
     TTS_SLICE_AUDIO: 'tts-slice-audio',
     TTS_TRANSCRIBE_AUDIO: 'tts-transcribe-audio',
@@ -93,9 +97,12 @@ export const IPC_CHANNELS = {
     RVC_REPAIR: 'rvc-repair',
     RVC_UNINSTALL: 'rvc-uninstall',
     RVC_START_SERVER: 'rvc-start-server',
+    RVC_SET_VERBOSE_LOGS: 'rvc-set-verbose-logs',
+    RVC_GET_VERBOSE_LOGS: 'rvc-get-verbose-logs',
     RVC_STOP_SERVER: 'rvc-stop-server',
     RVC_GET_GPU_INFO: 'rvc-get-gpu-info',
     RVC_LIST_MODELS: 'rvc-list-models',
+    RVC_LIST_MODEL_INDEXES: 'rvc-list-model-indexes',
     RVC_SET_MODEL: 'rvc-set-model',
     RVC_CONVERT: 'rvc-convert',
     RVC_GET_PRESETS: 'rvc-get-presets',
@@ -123,11 +130,17 @@ export interface ElectronAPI {
     loadLogs: () => Promise<{ success: boolean; logs?: SerializedLogEntry[]; filePath?: string; canceled?: boolean; error?: string }>;
     // Per-App Audio Capture
     getAudioProcesses: () => Promise<{ success: boolean; processes?: AudioProcess[]; error?: string }>;
+    setProcessMute: (pid: number, mute: boolean) => Promise<{ success: boolean; error?: string }>;
+    getProcessMute: (pid: number) => Promise<{ success: boolean; found: boolean; muted: boolean; error?: string }>;
     startProcessCapture: (pid: number) => Promise<{ success: boolean; recordingPath?: string; error?: string }>;
+    startProcessCaptureStream: (pid: number) => Promise<{ success: boolean; error?: string }>;
     startSystemCapture: () => Promise<{ success: boolean; recordingPath?: string; error?: string }>;
     stopProcessCapture: () => Promise<{ success: boolean; finalRecordingPath?: string; error?: string }>;
+    stopProcessCaptureStream: () => Promise<{ success: boolean; error?: string }>;
     onProcessAudioData: (callback: (data: ProcessAudioData) => void) => void;
+    onProcessAudioStream: (callback: (data: ProcessAudioData) => void) => void;
     offProcessAudioData: () => void;
+    offProcessAudioStream: () => void;
     // 連続録音方式用API
     onProcessAudioMetadata: (callback: (data: { totalSamples: number; sampleRate: number; channels: number }) => void) => void;
     transcribeRecordingSegment: (startSample: number, endSample: number) => Promise<{ success: boolean; text?: string; words?: WordWithSpeaker[]; startSample?: number; endSample?: number; audioBuffer?: number[]; error?: string }>;
@@ -217,10 +230,14 @@ export interface ElectronAPI {
     rvcInstall: (options?: { dryRun?: boolean; force?: boolean }) => Promise<any>;
     rvcRepair: () => Promise<any>;
     rvcUninstall: () => Promise<any>;
-    rvcStartServer: (options?: { forceCpu?: boolean }) => Promise<any>;
+    rvcStartServer: (options?: { forceCpu?: boolean; verboseLogs?: boolean }) => Promise<any>;
+    rvcSetVerboseLogs: (enabled: boolean) => Promise<{ success: boolean; verboseLogs?: boolean; requiresRestart?: boolean; error?: string }>;
+    rvcGetVerboseLogs: () => Promise<{ success: boolean; verboseLogs: boolean; error?: string }>;
     rvcStopServer: () => Promise<any>;
     rvcGetGpuInfo: () => Promise<any>;
     rvcListModels: () => Promise<any[]>;
+    rvcListModelIndexes: (modelId: string) => Promise<string[]>;
+    rvcOpenModelsFolder: () => Promise<{ success: boolean; path?: string; error?: string }>;
     rvcSetModel: (modelId: string) => Promise<any>;
     rvcConvert: (params: RvcConvertParams) => Promise<any>;
     rvcGetPresets: () => Promise<RvcPreset[]>;

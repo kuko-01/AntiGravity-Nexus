@@ -13,6 +13,8 @@ struct AudioProcessInfo {
 class ProcessList {
 public:
     static std::vector<AudioProcessInfo> GetAudioProcesses();
+    static bool SetProcessMute(DWORD pid, bool mute);
+    static bool GetProcessMute(DWORD pid, bool& muted);
     
 private:
     static std::wstring GetProcessName(DWORD pid);

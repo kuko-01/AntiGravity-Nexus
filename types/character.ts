@@ -51,6 +51,7 @@ export interface CharacterConversationSettings {
 
 export interface CharacterLearningRequest {
     singingTrainingMode?: boolean;
+    separationPreference?: 'auto' | 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
 }
 
 export interface CharacterLearningResult {
@@ -61,7 +62,7 @@ export interface CharacterLearningResult {
     vocalWavPath?: string;
     accompanimentWavPath?: string;
     datasetInputPath?: string;
-    method?: 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+    method?: 'uvr-ultimate' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
     warning?: string;
     error?: string;
 }

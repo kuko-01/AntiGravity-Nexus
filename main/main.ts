@@ -3351,7 +3351,7 @@ const buildSingingLearningResultMessage = (result: {
     vocalWavPath?: string;
     accompanimentWavPath?: string;
     datasetInputPath?: string;
-    method?: 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+    method?: 'uvr-ultimate' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
     warning?: string;
     error?: string;
 }): string => {
@@ -3468,6 +3468,7 @@ ipcMain.handle('character-chat-send', async (_event, request: CharacterChatReque
                 const ingestResult = await learningService.ingestFromYouTube({
                     characterId: request.characterId || 'default',
                     sourceUrl: youtubeUrl,
+                    separationPreference: request.learning?.separationPreference,
                 });
                 const sessionId = request.sessionId || `char_learning_${Date.now()}`;
                 const responseText = buildSingingLearningResultMessage(ingestResult);

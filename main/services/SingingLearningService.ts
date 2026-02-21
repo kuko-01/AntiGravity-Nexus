@@ -5,11 +5,13 @@ import * as https from 'https';
 import AdmZip from 'adm-zip';
 import { Sbv2Service } from './tts/Sbv2Service';
 
-type SeparationMethod = 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+type SeparationMethod = 'uvr-ultimate' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+type SeparationPreference = 'auto' | SeparationMethod;
 
 export interface SingingLearningIngestParams {
     characterId: string;
     sourceUrl: string;
+    separationPreference?: SeparationPreference;
 }
 
 export interface SingingLearningIngestResult {
@@ -109,9 +111,14 @@ export class SingingLearningService {
         }
 
         let sourceAudioPath = downloaded.audioPath;
+        const separationPreference = this.normalizeSeparationPreference(params.separationPreference);
+        const separationPlan = this.buildSeparationPlan(separationPreference);
         const preWarnings: string[] = [];
         if (downloaded.warning) {
             preWarnings.push(downloaded.warning);
+        }
+        if (separationPreference !== 'auto') {
+            preWarnings.push(`Separation preference: ${separationPreference}.`);
         }
         const prepared = await this.prepareSourceAudioForSeparation(sourceAudioPath, runDir);
         if (prepared.warning) {
@@ -119,24 +126,27 @@ export class SingingLearningService {
         }
         sourceAudioPath = prepared.audioPath;
         const attemptErrors: string[] = [];
-        let separation = await this.trySeparateWithUvr(sourceAudioPath, vocalDir, instDir);
-        if (!separation.success && separation.error) {
-            attemptErrors.push(`uvr5: ${separation.error}`);
-        }
-        if (!separation.success) {
-            separation = await this.trySeparateWithDemucs(sourceAudioPath, vocalDir, instDir);
-            if (!separation.success && separation.error) {
-                attemptErrors.push(`demucs: ${separation.error}`);
-            } else if (separation.success && attemptErrors.length > 0) {
-                const existingWarning = separation.warning ? `${separation.warning} ` : '';
-                separation.warning = `${existingWarning}UVR5 was unavailable, switched to Demucs.`;
+        let separation: {
+            success: boolean;
+            method?: SeparationMethod;
+            vocalWavPath?: string;
+            accompanimentWavPath?: string;
+            warning?: string;
+            error?: string;
+        } = { success: false, error: 'No separator attempted.' };
+        for (const method of separationPlan) {
+            const attempt = await this.runSeparationByMethod(method, sourceAudioPath, vocalDir, instDir);
+            if (attempt.success) {
+                separation = attempt;
+                if (attemptErrors.length > 0) {
+                    const existingWarning = separation.warning ? `${separation.warning} ` : '';
+                    separation.warning = `${existingWarning}Fallback used after failures (${attemptErrors.join(' | ')}).`;
+                }
+                break;
             }
-        }
-        if (!separation.success) {
-            separation = await this.trySeparateWithFfmpegFallback(sourceAudioPath, vocalDir, instDir);
-            if (separation.success && attemptErrors.length > 0) {
-                const existingWarning = separation.warning ? `${separation.warning} ` : '';
-                separation.warning = `${existingWarning}High-quality separators failed (${attemptErrors.join(' | ')}).`;
+            separation = attempt;
+            if (attempt.error) {
+                attemptErrors.push(`${method}: ${attempt.error}`);
             }
         }
         if (!separation.success || !separation.vocalWavPath) {
@@ -151,6 +161,14 @@ export class SingingLearningService {
                     ? `${separation.error}${reasons}`
                     : `Failed to separate vocal track${reasons}`,
             };
+        }
+
+        const enhancedVocal = await this.enhanceSeparatedVocalTrack(separation.vocalWavPath, runDir);
+        if (enhancedVocal.vocalWavPath) {
+            separation.vocalWavPath = enhancedVocal.vocalWavPath;
+        }
+        if (enhancedVocal.warning) {
+            separation.warning = [separation.warning, enhancedVocal.warning].filter(Boolean).join(' ') || undefined;
         }
 
         const trainingCopyPath = path.join(
@@ -187,6 +205,7 @@ export class SingingLearningService {
             accompanimentWavPath: separation.accompanimentWavPath,
             datasetInputPath,
             method: separation.method,
+            separationPreference,
             createdAt: new Date().toISOString(),
         });
 
@@ -210,6 +229,47 @@ export class SingingLearningService {
         } catch (error) {
             console.warn('[SingingLearning] Failed to write metadata:', error);
         }
+    }
+
+    private normalizeSeparationPreference(value: string | undefined): SeparationPreference {
+        const normalized = String(value || '').trim().toLowerCase();
+        if (normalized === 'uvr-ultimate' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback') {
+            return normalized;
+        }
+        return 'auto';
+    }
+
+    private buildSeparationPlan(preference: SeparationPreference): SeparationMethod[] {
+        const defaultPlan: SeparationMethod[] = ['uvr-ultimate', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+        if (preference === 'auto') {
+            return defaultPlan;
+        }
+        return [preference, ...defaultPlan.filter((method) => method !== preference)];
+    }
+
+    private async runSeparationByMethod(
+        method: SeparationMethod,
+        sourceAudioPath: string,
+        vocalDir: string,
+        accompanimentDir: string,
+    ): Promise<{
+        success: boolean;
+        method?: SeparationMethod;
+        vocalWavPath?: string;
+        accompanimentWavPath?: string;
+        warning?: string;
+        error?: string;
+    }> {
+        if (method === 'uvr-ultimate') {
+            return this.trySeparateWithUvrUltimate(sourceAudioPath, vocalDir, accompanimentDir);
+        }
+        if (method === 'demucs') {
+            return this.trySeparateWithDemucs(sourceAudioPath, vocalDir, accompanimentDir);
+        }
+        if (method === 'uvr5') {
+            return this.trySeparateWithUvr(sourceAudioPath, vocalDir, accompanimentDir);
+        }
+        return this.trySeparateWithFfmpegFallback(sourceAudioPath, vocalDir, accompanimentDir);
     }
 
     private async copyToSbv2DatasetInput(characterId: string, vocalWavPath: string): Promise<string> {
@@ -377,6 +437,149 @@ export class SingingLearningService {
         };
     }
 
+    private async trySeparateWithUvrUltimate(
+        sourceAudioPath: string,
+        vocalDir: string,
+        accompanimentDir: string,
+    ): Promise<{
+        success: boolean;
+        method?: SeparationMethod;
+        vocalWavPath?: string;
+        accompanimentWavPath?: string;
+        warning?: string;
+        error?: string;
+    }> {
+        const runner = await this.resolveUvrUltimateRuntime();
+        if (!runner.success || !runner.pythonExe) {
+            return {
+                success: false,
+                error: runner.error || 'Ultimate Vocal Remover runtime is unavailable.',
+            };
+        }
+
+        const ffmpegTools = await this.ensureFfmpegTools();
+        if (!ffmpegTools.ffmpegPath) {
+            return {
+                success: false,
+                error: ffmpegTools.error || 'ffmpeg not found. UVR Ultimate requires ffmpeg.',
+            };
+        }
+
+        const workDir = path.join(path.dirname(sourceAudioPath), 'uvr_ultimate_work');
+        const outputDir = path.join(workDir, 'output');
+        const modelFileDir = path.join(this.baseDir, 'runtime', 'uvr_models');
+        fs.mkdirSync(workDir, { recursive: true });
+        fs.mkdirSync(outputDir, { recursive: true });
+        fs.mkdirSync(modelFileDir, { recursive: true });
+
+        const pythonScript = `
+import json
+from audio_separator.separator import Separator
+
+input_path = r'''${sourceAudioPath.replace(/\\/g, '\\\\')}'''
+output_dir = r'''${outputDir.replace(/\\/g, '\\\\')}'''
+model_file_dir = r'''${modelFileDir.replace(/\\/g, '\\\\')}'''
+model_candidates = [
+    'UVR_MDXNET_KARA_2.onnx',
+    'UVR-MDX-NET-Inst_HQ_3.onnx',
+    '2_HP-UVR.pth',
+]
+output_names = {
+    'Vocals': 'vocals_uvr_ultimate',
+    'Instrumental': 'accompaniment_uvr_ultimate',
+}
+
+errors = []
+for model_name in model_candidates:
+    try:
+        separator = Separator(
+            log_level=30,
+            model_file_dir=model_file_dir,
+            output_dir=output_dir,
+            output_format='WAV',
+        )
+        separator.load_model(model_filename=model_name)
+        output_files = separator.separate(input_path, output_names)
+        print(json.dumps({
+            'ok': True,
+            'model': model_name,
+            'outputs': output_files,
+        }, ensure_ascii=False))
+        raise SystemExit(0)
+    except Exception as ex:
+        errors.append({'model': model_name, 'error': str(ex)})
+
+print(json.dumps({'ok': False, 'errors': errors}, ensure_ascii=False))
+raise SystemExit(1)
+`.trim();
+
+        const uvrEnv = this.buildEnvWithAdditionalPath(path.dirname(ffmpegTools.ffmpegPath), {
+            ...(runner.env || process.env),
+            PYTHONUTF8: '1',
+            PYTHONIOENCODING: 'utf-8',
+        });
+        const result = await this.runCommand(runner.pythonExe, ['-c', pythonScript], {
+            cwd: workDir,
+            env: uvrEnv,
+            timeoutMs: 120 * 60 * 1000,
+        });
+        try {
+            const logPath = path.join(workDir, `uvr_ultimate_${Date.now()}.log`);
+            const payload = [
+                `code=${result.code}`,
+                '',
+                '[stderr]',
+                result.stderr || '',
+                '',
+                '[stdout]',
+                result.stdout || '',
+            ].join('\n');
+            fs.writeFileSync(logPath, payload, 'utf-8');
+        } catch {
+            // Ignore log write failures.
+        }
+
+        const vocalStem = this.findStemFile(outputDir, ['vocals_uvr_ultimate', 'main_vocal', 'vocals', 'vocal']);
+        if (!vocalStem) {
+            const details = this.takeTail([result.stderr, result.stdout].filter(Boolean).join('\n'), 900);
+            return {
+                success: false,
+                error: details
+                    ? `UVR Ultimate failed: ${details}`
+                    : this.formatCommandFailure('UVR Ultimate', result),
+            };
+        }
+        const accompanimentStem = this.findStemFile(
+            outputDir,
+            ['accompaniment_uvr_ultimate', 'instrumental', 'no_vocals', 'others'],
+            { allowAnyWavFallback: false },
+        );
+        const vocalCopyPath = path.join(vocalDir, `vocal_uvr_ultimate_${Date.now()}.wav`);
+        fs.copyFileSync(vocalStem, vocalCopyPath);
+
+        let accompanimentCopyPath: string | undefined;
+        if (accompanimentStem) {
+            accompanimentCopyPath = path.join(accompanimentDir, `accompaniment_uvr_ultimate_${Date.now()}.wav`);
+            fs.copyFileSync(accompanimentStem, accompanimentCopyPath);
+        }
+
+        const report = this.tryParseLastJsonLine<{ ok?: boolean; model?: string }>(result.stdout || '');
+        const warnings: string[] = [];
+        if (runner.warning) warnings.push(runner.warning);
+        if (ffmpegTools.warning) warnings.push(ffmpegTools.warning);
+        if (report?.model) warnings.push(`UVR Ultimate model: ${report.model}`);
+        if (!result.success) warnings.push(`UVR Ultimate exited with code ${result.code}, but stem files were produced and reused.`);
+        if (!accompanimentCopyPath) warnings.push('UVR Ultimate extracted vocals but accompaniment stem was not found.');
+
+        return {
+            success: true,
+            method: 'uvr-ultimate',
+            vocalWavPath: vocalCopyPath,
+            accompanimentWavPath: accompanimentCopyPath,
+            warning: warnings.length > 0 ? warnings.join(' ') : undefined,
+        };
+    }
+
     private async trySeparateWithUvr(
         sourceAudioPath: string,
         vocalDir: string,
@@ -520,14 +723,33 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         fs.mkdirSync(outputRoot, { recursive: true });
 
         const modelCandidates = ['htdemucs_ft', 'htdemucs'];
+        const profileCandidates: Array<{
+            id: string;
+            args: string[];
+            timeoutMs: number;
+        }> = [
+            {
+                id: 'hq',
+                args: ['--shifts', '2', '--overlap', '0.35', '--float32'],
+                timeoutMs: 120 * 60 * 1000,
+            },
+            {
+                id: 'balanced',
+                args: ['--shifts', '1', '--overlap', '0.25'],
+                timeoutMs: 90 * 60 * 1000,
+            },
+        ];
         let lastError = '';
         for (const modelName of modelCandidates) {
-            for (let attempt = 1; attempt <= 2; attempt += 1) {
+            for (let profileIndex = 0; profileIndex < profileCandidates.length; profileIndex += 1) {
+                const profile = profileCandidates[profileIndex];
+                const attempt = profileIndex + 1;
                 const args = runner.argsPrefix.concat([
                     '--two-stems',
                     'vocals',
                     '-n',
                     modelName,
+                    ...profile.args,
                     '-o',
                     outputRoot,
                     sourceAudioPath,
@@ -535,12 +757,13 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                 const result = await this.runCommand(runner.command, args, {
                     cwd: workDir,
                     env: demucsEnv,
-                    timeoutMs: 90 * 60 * 1000,
+                    timeoutMs: profile.timeoutMs,
                 });
                 try {
-                    const logPath = path.join(workDir, `demucs_${modelName}_attempt${attempt}.log`);
+                    const logPath = path.join(workDir, `demucs_${modelName}_${profile.id}_attempt${attempt}.log`);
                     const payload = [
                         `model=${modelName}`,
+                        `profile=${profile.id}`,
                         `attempt=${attempt}`,
                         `code=${result.code}`,
                         '',
@@ -576,10 +799,12 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                     if (runner.warning) warnings.push(runner.warning);
                     if (ffmpegTools.warning) warnings.push(ffmpegTools.warning);
                     if (!result.success) {
-                        warnings.push(`Demucs exited with code ${result.code}, but stem files were produced and reused.`);
+                        warnings.push(`Demucs exited with code ${result.code}, but stem files were produced and reused (${modelName}/${profile.id}).`);
                     }
                     if (attempt > 1) {
-                        warnings.push(`Demucs succeeded after retry (${modelName}, attempt ${attempt}).`);
+                        warnings.push(`Demucs succeeded after retry (${modelName}, profile ${profile.id}, attempt ${attempt}).`);
+                    } else {
+                        warnings.push(`Demucs quality profile: ${modelName}/${profile.id}.`);
                     }
                     if (!accompanimentCopyPath) {
                         warnings.push('Demucs extracted vocals but accompaniment stem was not found.');
@@ -594,9 +819,9 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                 }
 
                 if (!result.success) {
-                    lastError = this.formatCommandFailure(`Demucs(${modelName}) attempt ${attempt}`, result);
+                    lastError = this.formatCommandFailure(`Demucs(${modelName}/${profile.id}) attempt ${attempt}`, result);
                 } else {
-                    lastError = `Demucs(${modelName}) attempt ${attempt} finished but vocals.wav was not found.`;
+                    lastError = `Demucs(${modelName}/${profile.id}) attempt ${attempt} finished but vocals.wav was not found.`;
                 }
             }
         }
@@ -604,6 +829,100 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         return {
             success: false,
             error: lastError || 'Demucs separation failed.',
+        };
+    }
+
+    private async resolveUvrUltimateRuntime(): Promise<{
+        success: boolean;
+        pythonExe?: string;
+        env?: NodeJS.ProcessEnv;
+        warning?: string;
+        error?: string;
+    }> {
+        const runtimeRoot = path.join(this.baseDir, 'runtime');
+        const venvRoot = path.join(runtimeRoot, 'uvr_ultimate_venv');
+        const venvPython = path.join(venvRoot, 'Scripts', 'python.exe');
+        fs.mkdirSync(runtimeRoot, { recursive: true });
+        const warnings: string[] = [];
+
+        if (!fs.existsSync(venvPython)) {
+            const manifest = this.loadRvcManifest();
+            const manifestPython = manifest?.pythonPath ? this.resolvePythonExecutable(manifest.pythonPath) : null;
+            const systemPython = await this.resolveExecutable('python');
+            const basePython = systemPython || manifestPython;
+            if (!basePython) {
+                return {
+                    success: false,
+                    error: 'Python runtime not found. Install Python 3 and make it available in PATH.',
+                };
+            }
+
+            const createVenv = await this.createIsolatedVenv(venvRoot, basePython);
+            if (!createVenv.success || !fs.existsSync(venvPython)) {
+                return {
+                    success: false,
+                    error: `Failed to create UVR Ultimate runtime: ${createVenv.error || 'unknown'}`,
+                };
+            }
+            if (createVenv.warning) {
+                warnings.push(createVenv.warning);
+            }
+        }
+
+        const probe = await this.runCommand(venvPython, ['-c', 'from audio_separator.separator import Separator; print("ok")'], {
+            timeoutMs: 30_000,
+        });
+        if (probe.success) {
+            return {
+                success: true,
+                pythonExe: venvPython,
+                warning: warnings.length > 0 ? warnings.join(' ') : undefined,
+            };
+        }
+
+        const pipCheck = await this.runCommand(venvPython, ['-m', 'pip', '--version'], {
+            timeoutMs: 20_000,
+        });
+        if (!pipCheck.success) {
+            const ensurePip = await this.runCommand(venvPython, ['-m', 'ensurepip', '--upgrade'], {
+                timeoutMs: 3 * 60 * 1000,
+            });
+            if (!ensurePip.success) {
+                return {
+                    success: false,
+                    error: `pip is unavailable in UVR Ultimate runtime: ${this.takeTail(ensurePip.stderr || ensurePip.stdout, 700)}`,
+                };
+            }
+        }
+
+        await this.runCommand(venvPython, ['-m', 'pip', 'install', '-U', 'pip', 'setuptools', 'wheel'], {
+            timeoutMs: 10 * 60 * 1000,
+        });
+        const install = await this.runCommand(venvPython, ['-m', 'pip', 'install', '-U', 'audio-separator'], {
+            timeoutMs: 60 * 60 * 1000,
+        });
+        if (!install.success) {
+            return {
+                success: false,
+                error: `Failed to install UVR Ultimate runtime: ${this.takeTail(install.stderr || install.stdout, 900)}`,
+            };
+        }
+
+        const verify = await this.runCommand(venvPython, ['-c', 'from audio_separator.separator import Separator; print("ok")'], {
+            timeoutMs: 30_000,
+        });
+        if (!verify.success) {
+            return {
+                success: false,
+                error: 'UVR Ultimate installation completed but audio_separator import failed.',
+            };
+        }
+
+        warnings.push('UVR Ultimate runtime was auto-installed into isolated environment.');
+        return {
+            success: true,
+            pythonExe: venvPython,
+            warning: warnings.join(' '),
         };
     }
 
@@ -879,7 +1198,7 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             '-y',
             '-i', sourceAudioPath,
             '-vn',
-            '-af', 'pan=mono|c0=0.5*c0+0.5*c1,highpass=f=120,lowpass=f=10000',
+            '-af', 'pan=mono|c0=0.5*c0+0.5*c1,highpass=f=90,lowpass=f=12000,afftdn=nr=8:nf=-45:tn=1,dynaudnorm=f=250:g=11:p=0.95:m=6,alimiter=limit=0.98',
             '-ar', '44100',
             '-ac', '1',
             vocalPath,
@@ -950,8 +1269,62 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             warning: [
                 ffmpegTools.warning,
                 accompanimentResult.success
-                    ? 'Used ffmpeg fallback separation (center/side approximation).'
+                    ? 'Used ffmpeg fallback separation (center/side approximation) with cleanup filters.'
                     : 'Used ffmpeg fallback vocal extraction; accompaniment export failed.',
+            ].filter(Boolean).join(' '),
+        };
+    }
+
+    private async enhanceSeparatedVocalTrack(
+        vocalWavPath: string,
+        runDir: string,
+    ): Promise<{ vocalWavPath?: string; warning?: string }> {
+        const sourcePath = String(vocalWavPath || '').trim();
+        if (!sourcePath || !fs.existsSync(sourcePath)) {
+            return { warning: 'Skipped vocal enhancement because separated vocal WAV was not found.' };
+        }
+
+        const ffmpegTools = await this.ensureFfmpegTools();
+        if (!ffmpegTools.ffmpegPath) {
+            return {
+                warning: ffmpegTools.error
+                    ? `Skipped vocal enhancement: ffmpeg unavailable (${ffmpegTools.error}).`
+                    : 'Skipped vocal enhancement: ffmpeg unavailable.',
+            };
+        }
+
+        const enhancedDir = path.join(runDir, 'enhanced');
+        fs.mkdirSync(enhancedDir, { recursive: true });
+        const enhancedPath = path.join(enhancedDir, `vocal_enhanced_${Date.now()}.wav`);
+        const filters = [
+            'highpass=f=80',
+            'lowpass=f=14000',
+            'afftdn=nr=7:nf=-45:tn=1',
+            'dynaudnorm=f=250:g=9:p=0.95:m=6',
+            'alimiter=limit=0.98',
+        ].join(',');
+
+        const result = await this.runCommand(ffmpegTools.ffmpegPath, [
+            '-y',
+            '-i', sourcePath,
+            '-vn',
+            '-af', filters,
+            '-ar', '44100',
+            '-ac', '1',
+            enhancedPath,
+        ], { timeoutMs: 20 * 60 * 1000 });
+
+        if (!result.success || !fs.existsSync(enhancedPath)) {
+            return {
+                warning: `Vocal enhancement failed; using original separation (${this.takeTail(result.stderr || result.stdout, 320)}).`,
+            };
+        }
+
+        return {
+            vocalWavPath: enhancedPath,
+            warning: [
+                ffmpegTools.warning,
+                'Applied vocal cleanup (high/low pass + FFT denoise + dynamic normalize + limiter).',
             ].filter(Boolean).join(' '),
         };
     }
@@ -1669,6 +2042,25 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         }
 
         return sources;
+    }
+
+    private tryParseLastJsonLine<T>(value: string): T | null {
+        const lines = String(value || '')
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean);
+        for (let i = lines.length - 1; i >= 0; i -= 1) {
+            const line = lines[i];
+            if (!line.startsWith('{') || !line.endsWith('}')) {
+                continue;
+            }
+            try {
+                return JSON.parse(line) as T;
+            } catch {
+                // Ignore parse failures and keep searching previous lines.
+            }
+        }
+        return null;
     }
 
     private formatCommandFailure(label: string, result: CommandResult): string {

@@ -57,6 +57,7 @@ interface StoredUserProfile {
 
 interface StoredVoiceEnhanceSettings {
     singingTrainingMode?: boolean;
+    separationPreference?: 'auto' | 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
     forceSingingMode?: boolean;
     autoEmotionRefine?: boolean;
     enhanceFinalAudio?: boolean;
@@ -93,6 +94,7 @@ const DEFAULT_CHARACTER_VOICE_SETTINGS: StoredCharacterVoiceSettings = {
 };
 const DEFAULT_VOICE_ENHANCE_SETTINGS: StoredVoiceEnhanceSettings = {
     singingTrainingMode: false,
+    separationPreference: 'auto',
     forceSingingMode: false,
     autoEmotionRefine: true,
     enhanceFinalAudio: true,
@@ -128,6 +130,9 @@ const CharacterStudioScreen: React.FC = () => {
     const [voiceEnabled, setVoiceEnabled] = useState<boolean>(true);
     const [voiceMode, setVoiceMode] = useState<'sbv2' | 'sbv2+rvc'>('sbv2+rvc');
     const [singingTrainingMode, setSingingTrainingMode] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.singingTrainingMode === true);
+    const [singingSeparationPreference, setSingingSeparationPreference] = useState<'auto' | 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback'>(
+        DEFAULT_VOICE_ENHANCE_SETTINGS.separationPreference || 'auto',
+    );
     const [forceSingingMode, setForceSingingMode] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.forceSingingMode || false);
     const [autoEmotionRefine, setAutoEmotionRefine] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.autoEmotionRefine !== false);
     const [enhanceFinalAudio, setEnhanceFinalAudio] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.enhanceFinalAudio !== false);
@@ -230,8 +235,18 @@ const CharacterStudioScreen: React.FC = () => {
         const nextEmotionIntensityHint = Number.isFinite(nextEmotionIntensityHintRaw)
             ? Math.max(0, Math.min(1, nextEmotionIntensityHintRaw))
             : (DEFAULT_VOICE_ENHANCE_SETTINGS.emotionIntensityHint || 0.55);
+        const nextSeparationPreference = (
+            settings?.separationPreference === 'auto'
+            || settings?.separationPreference === 'uvr-ultimate'
+            || settings?.separationPreference === 'demucs'
+            || settings?.separationPreference === 'uvr5'
+            || settings?.separationPreference === 'ffmpeg-fallback'
+        )
+            ? settings.separationPreference
+            : (DEFAULT_VOICE_ENHANCE_SETTINGS.separationPreference || 'auto');
         return {
             singingTrainingMode: settings?.singingTrainingMode === true,
+            separationPreference: nextSeparationPreference,
             forceSingingMode: settings?.forceSingingMode === true,
             autoEmotionRefine: settings?.autoEmotionRefine !== false,
             enhanceFinalAudio: settings?.enhanceFinalAudio !== false,
@@ -245,6 +260,7 @@ const CharacterStudioScreen: React.FC = () => {
     const applyVoiceEnhanceSettings = (settings?: StoredVoiceEnhanceSettings) => {
         const normalized = normalizeVoiceEnhanceSettings(settings);
         setSingingTrainingMode(normalized.singingTrainingMode === true);
+        setSingingSeparationPreference(normalized.separationPreference || 'auto');
         setForceSingingMode(normalized.forceSingingMode || false);
         setAutoEmotionRefine(normalized.autoEmotionRefine !== false);
         setEnhanceFinalAudio(normalized.enhanceFinalAudio !== false);
@@ -257,6 +273,7 @@ const CharacterStudioScreen: React.FC = () => {
     const buildVoiceEnhanceSettingsFromState = (): StoredVoiceEnhanceSettings => (
         normalizeVoiceEnhanceSettings({
             singingTrainingMode,
+            separationPreference: singingSeparationPreference,
             forceSingingMode,
             autoEmotionRefine,
             enhanceFinalAudio,
@@ -725,6 +742,7 @@ const CharacterStudioScreen: React.FC = () => {
         }
 
         parts.push(`learn=${singingTrainingMode ? 'on' : 'off'}`);
+        parts.push(`sep=${singingSeparationPreference}`);
         parts.push(`singing=${forceSingingMode ? 'forced' : 'auto'}`);
         parts.push(`refine=${autoEmotionRefine ? 'on' : 'off'}`);
         parts.push(`enhance=${enhanceFinalAudio ? 'on' : 'off'}`);
@@ -847,6 +865,7 @@ const CharacterStudioScreen: React.FC = () => {
                 settings: conversationSettings,
                 learning: {
                     singingTrainingMode,
+                    separationPreference: singingSeparationPreference,
                 },
                 withVoice: voiceEnabled,
                 voice: {
@@ -1175,6 +1194,26 @@ const CharacterStudioScreen: React.FC = () => {
                         />
                         Singing learning mode (YouTube URL)
                     </label>
+
+                    <label
+                        style={{ display: 'block', fontSize: '12px', marginBottom: '6px' }}
+                        title="歌唱学習の分離エンジン優先順です。Autoは UVR Ultimate → Demucs → UVR5 → FFmpeg の順に試します。"
+                    >
+                        Singing Separation Engine
+                    </label>
+                    <select
+                        value={singingSeparationPreference}
+                        onChange={(e) => setSingingSeparationPreference(
+                            e.target.value as 'auto' | 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback',
+                        )}
+                        style={{ width: '100%', marginBottom: '10px' }}
+                    >
+                        <option value="auto">Auto (Recommended)</option>
+                        <option value="uvr-ultimate">UVR Ultimate</option>
+                        <option value="demucs">Demucs</option>
+                        <option value="uvr5">UVR5 (RVC)</option>
+                        <option value="ffmpeg-fallback">FFmpeg fallback</option>
+                    </select>
 
                     <label
                         style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}

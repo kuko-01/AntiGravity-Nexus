@@ -4,6 +4,11 @@ import { spawn } from 'child_process';
 import * as https from 'https';
 import AdmZip from 'adm-zip';
 import { Sbv2Service } from './tts/Sbv2Service';
+import {
+    SeparationQualityLibrary,
+    SeparationStemQualityMetrics,
+    SeparationStemQualityScore,
+} from './audio/SeparationQualityLibrary';
 
 type SeparationMethod = 'uvr-ultimate' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
 type SeparationPreference = 'auto' | SeparationMethod;
@@ -28,6 +33,28 @@ export interface SingingLearningIngestResult {
     error?: string;
 }
 
+export interface SingingLearningSeparationMethodView {
+    method: SeparationMethod;
+    scoreEma: number;
+    successCount: number;
+    failureCount: number;
+    successRate: number;
+    leakageEma: number;
+    speechActivityEma: number;
+    rmsDbEma: number;
+    updatedAt: string;
+}
+
+export interface SingingLearningSeparationProfileView {
+    success: boolean;
+    characterId: string;
+    preferredMethod: SeparationMethod;
+    updatedAt: string;
+    methods: SingingLearningSeparationMethodView[];
+    profilePath: string;
+    error?: string;
+}
+
 interface RvcInstallManifest {
     pythonPath: string;
     rvcPath: string;
@@ -40,6 +67,49 @@ interface CommandResult {
     stderr: string;
 }
 
+interface SeparationAttempt {
+    success: boolean;
+    method?: SeparationMethod;
+    vocalWavPath?: string;
+    accompanimentWavPath?: string;
+    warning?: string;
+    error?: string;
+}
+
+interface SeparationQualityCandidate extends Required<Pick<SeparationAttempt, 'method' | 'vocalWavPath'>> {
+    accompanimentWavPath?: string;
+    warning?: string;
+}
+
+interface ScoredSeparationCandidate {
+    candidate: SeparationQualityCandidate;
+    score: SeparationStemQualityScore;
+    vocalMetrics: SeparationStemQualityMetrics;
+    finalScore: number;
+}
+
+interface PersistentMethodSeparationProfile {
+    scoreEma: number;
+    successCount: number;
+    failureCount: number;
+    leakageEma: number;
+    speechActivityEma: number;
+    rmsDbEma: number;
+    updatedAt: string;
+}
+
+interface PersistentCharacterSeparationProfile {
+    id: string;
+    preferredMethod?: SeparationMethod;
+    methods: Record<SeparationMethod, PersistentMethodSeparationProfile>;
+    updatedAt: string;
+}
+
+interface PersistedSeparationProfileStore {
+    version: number;
+    entries: Record<string, PersistentCharacterSeparationProfile>;
+}
+
 export class SingingLearningService {
     private static instance: SingingLearningService | null = null;
 
@@ -47,6 +117,10 @@ export class SingingLearningService {
     private readonly rvcInstallDir: string;
     private readonly sbv2InstallDir: string;
     private readonly ttsResourcesPath: string;
+    private readonly separationProfileStorePath: string;
+    private readonly separationProfiles = new Map<string, PersistentCharacterSeparationProfile>();
+    private separationProfilesDirty = false;
+    private separationProfilesLastPersistAt = 0;
 
     private constructor(ttsResourcesPath: string) {
         const localAppData = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Local');
@@ -54,7 +128,9 @@ export class SingingLearningService {
         this.rvcInstallDir = path.join(localAppData, 'AntiGravity', 'tts', 'rvc');
         this.sbv2InstallDir = path.join(localAppData, 'AntiGravity', 'tts', 'sbv2');
         this.ttsResourcesPath = ttsResourcesPath;
+        this.separationProfileStorePath = path.join(this.baseDir, 'separation_quality_profiles.json');
         fs.mkdirSync(this.baseDir, { recursive: true });
+        this.loadSeparationProfiles();
     }
 
     static getInstance(ttsResourcesPath: string): SingingLearningService {
@@ -71,6 +147,56 @@ export class SingingLearningService {
         const match = source.match(regex);
         if (!match || !match[1]) return null;
         return match[1];
+    }
+
+    getSeparationProfile(characterIdRaw: string): SingingLearningSeparationProfileView {
+        try {
+            const characterId = this.normalizeId(characterIdRaw, 'character_default');
+            const profile = this.getOrCreateCharacterSeparationProfile(characterId);
+            const methods: SeparationMethod[] = ['uvr-ultimate', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+            const methodViews: SingingLearningSeparationMethodView[] = methods.map((method) => {
+                const methodProfile = profile.methods[method];
+                const attempts = methodProfile.successCount + methodProfile.failureCount;
+                const successRate = attempts > 0 ? methodProfile.successCount / attempts : 0;
+                return {
+                    method,
+                    scoreEma: this.roundNumber(methodProfile.scoreEma, 2),
+                    successCount: methodProfile.successCount,
+                    failureCount: methodProfile.failureCount,
+                    successRate: this.roundNumber(successRate, 4),
+                    leakageEma: this.roundNumber(methodProfile.leakageEma, 4),
+                    speechActivityEma: this.roundNumber(methodProfile.speechActivityEma, 4),
+                    rmsDbEma: this.roundNumber(methodProfile.rmsDbEma, 2),
+                    updatedAt: methodProfile.updatedAt,
+                };
+            });
+            return {
+                success: true,
+                characterId,
+                preferredMethod: profile.preferredMethod || this.resolvePreferredMethod(profile),
+                updatedAt: profile.updatedAt,
+                methods: methodViews,
+                profilePath: this.separationProfileStorePath,
+            };
+        } catch (error) {
+            return {
+                success: false,
+                characterId: this.normalizeId(characterIdRaw, 'character_default'),
+                preferredMethod: 'uvr-ultimate',
+                updatedAt: new Date(0).toISOString(),
+                methods: [],
+                profilePath: this.separationProfileStorePath,
+                error: error instanceof Error ? error.message : String(error),
+            };
+        }
+    }
+
+    resetSeparationProfile(characterIdRaw: string): SingingLearningSeparationProfileView {
+        const characterId = this.normalizeId(characterIdRaw, 'character_default');
+        this.separationProfiles.delete(characterId);
+        this.separationProfilesDirty = true;
+        this.persistSeparationProfiles(true);
+        return this.getSeparationProfile(characterId);
     }
 
     async ingestFromYouTube(params: SingingLearningIngestParams): Promise<SingingLearningIngestResult> {
@@ -112,7 +238,7 @@ export class SingingLearningService {
 
         let sourceAudioPath = downloaded.audioPath;
         const separationPreference = this.normalizeSeparationPreference(params.separationPreference);
-        const separationPlan = this.buildSeparationPlan(separationPreference);
+        const separationPlan = this.buildSeparationPlan(separationPreference, characterId);
         const preWarnings: string[] = [];
         if (downloaded.warning) {
             preWarnings.push(downloaded.warning);
@@ -126,29 +252,93 @@ export class SingingLearningService {
         }
         sourceAudioPath = prepared.audioPath;
         const attemptErrors: string[] = [];
-        let separation: {
-            success: boolean;
-            method?: SeparationMethod;
-            vocalWavPath?: string;
-            accompanimentWavPath?: string;
-            warning?: string;
-            error?: string;
-        } = { success: false, error: 'No separator attempted.' };
-        for (const method of separationPlan) {
+        const failedMethods: SeparationMethod[] = [];
+        const methodsForInitialPass = separationPreference === 'auto'
+            ? separationPlan.filter((method) => method !== 'ffmpeg-fallback')
+            : separationPlan;
+        const successfulCandidates: SeparationQualityCandidate[] = [];
+        let separation: SeparationAttempt = { success: false, error: 'No separator attempted.' };
+
+        for (const method of methodsForInitialPass) {
             const attempt = await this.runSeparationByMethod(method, sourceAudioPath, vocalDir, instDir);
             if (attempt.success) {
-                separation = attempt;
-                if (attemptErrors.length > 0) {
-                    const existingWarning = separation.warning ? `${separation.warning} ` : '';
-                    separation.warning = `${existingWarning}Fallback used after failures (${attemptErrors.join(' | ')}).`;
+                if (attempt.vocalWavPath) {
+                    successfulCandidates.push({
+                        method: attempt.method || method,
+                        vocalWavPath: attempt.vocalWavPath,
+                        accompanimentWavPath: attempt.accompanimentWavPath,
+                        warning: attempt.warning,
+                    });
                 }
-                break;
+                if (separationPreference !== 'auto') {
+                    separation = attempt;
+                    break;
+                }
+                continue;
             }
             separation = attempt;
             if (attempt.error) {
                 attemptErrors.push(`${method}: ${attempt.error}`);
+                failedMethods.push(method);
             }
         }
+
+        if (separationPreference === 'auto' && successfulCandidates.length > 0) {
+            try {
+                const selected = await this.selectBestSeparationCandidate(successfulCandidates, runDir, characterId);
+                separation = {
+                    success: true,
+                    method: selected.candidate.method,
+                    vocalWavPath: selected.candidate.vocalWavPath,
+                    accompanimentWavPath: selected.candidate.accompanimentWavPath,
+                    warning: selected.warning,
+                };
+                if (selected.scoredCandidates && selected.scoredCandidates.length > 0) {
+                    this.updateSeparationProfileFromScoredCandidates(characterId, selected.scoredCandidates);
+                } else {
+                    this.updateSeparationProfileForSuccess(characterId, selected.candidate.method);
+                }
+            } catch (error) {
+                const first = successfulCandidates[0];
+                separation = {
+                    success: true,
+                    method: first.method,
+                    vocalWavPath: first.vocalWavPath,
+                    accompanimentWavPath: first.accompanimentWavPath,
+                    warning: [
+                        first.warning,
+                        `Automatic candidate scoring failed: ${error instanceof Error ? error.message : String(error)}`,
+                    ].filter(Boolean).join(' '),
+                };
+                this.updateSeparationProfileForSuccess(characterId, first.method);
+            }
+        } else if (separation.success && separation.method) {
+            this.updateSeparationProfileForSuccess(characterId, separation.method);
+        }
+
+        if ((!separation.success || !separation.vocalWavPath) && methodsForInitialPass.length < separationPlan.length) {
+            const fallbackMethod = separationPlan.find((method) => !methodsForInitialPass.includes(method));
+            if (fallbackMethod) {
+                const fallbackAttempt = await this.runSeparationByMethod(fallbackMethod, sourceAudioPath, vocalDir, instDir);
+                separation = fallbackAttempt;
+                if (!fallbackAttempt.success && fallbackAttempt.error) {
+                    attemptErrors.push(`${fallbackMethod}: ${fallbackAttempt.error}`);
+                    failedMethods.push(fallbackMethod);
+                } else if (fallbackAttempt.success && fallbackAttempt.method) {
+                    this.updateSeparationProfileForSuccess(characterId, fallbackAttempt.method);
+                }
+            }
+        }
+
+        if (failedMethods.length > 0) {
+            this.updateSeparationProfileForFailures(characterId, failedMethods);
+        }
+
+        if (separation.success && separation.vocalWavPath && attemptErrors.length > 0) {
+            const existingWarning = separation.warning ? `${separation.warning} ` : '';
+            separation.warning = `${existingWarning}Other separators failed (${attemptErrors.join(' | ')}).`;
+        }
+
         if (!separation.success || !separation.vocalWavPath) {
             const reasons = attemptErrors.length > 0 ? ` (${attemptErrors.join(' | ')})` : '';
             return {
@@ -231,6 +421,270 @@ export class SingingLearningService {
         }
     }
 
+    private getDefaultMethodSeparationProfile(method: SeparationMethod): PersistentMethodSeparationProfile {
+        const now = new Date().toISOString();
+        const initialScore: Record<SeparationMethod, number> = {
+            'uvr-ultimate': 78,
+            demucs: 76,
+            uvr5: 72,
+            'ffmpeg-fallback': 58,
+        };
+        return {
+            scoreEma: initialScore[method],
+            successCount: 0,
+            failureCount: 0,
+            leakageEma: 0.22,
+            speechActivityEma: 0.24,
+            rmsDbEma: -18,
+            updatedAt: now,
+        };
+    }
+
+    private getDefaultCharacterSeparationProfile(characterId: string): PersistentCharacterSeparationProfile {
+        return {
+            id: characterId,
+            preferredMethod: 'uvr-ultimate',
+            methods: {
+                'uvr-ultimate': this.getDefaultMethodSeparationProfile('uvr-ultimate'),
+                demucs: this.getDefaultMethodSeparationProfile('demucs'),
+                uvr5: this.getDefaultMethodSeparationProfile('uvr5'),
+                'ffmpeg-fallback': this.getDefaultMethodSeparationProfile('ffmpeg-fallback'),
+            },
+            updatedAt: new Date().toISOString(),
+        };
+    }
+
+    private sanitizeCharacterSeparationProfile(
+        raw: Partial<PersistentCharacterSeparationProfile>,
+        fallbackId: string,
+    ): PersistentCharacterSeparationProfile {
+        const base = this.getDefaultCharacterSeparationProfile(fallbackId);
+        const methodsRaw = (raw.methods || {}) as Partial<Record<SeparationMethod, Partial<PersistentMethodSeparationProfile>>>;
+        const sanitizeMethod = (method: SeparationMethod): PersistentMethodSeparationProfile => {
+            const source = methodsRaw[method] || {};
+            const fallback = base.methods[method];
+            return {
+                scoreEma: this.clampNumber(Number(source.scoreEma), 0, 100, fallback.scoreEma),
+                successCount: this.clampInteger(Number(source.successCount), 0, 1_000_000, fallback.successCount),
+                failureCount: this.clampInteger(Number(source.failureCount), 0, 1_000_000, fallback.failureCount),
+                leakageEma: this.clampNumber(Number(source.leakageEma), 0, 1, fallback.leakageEma),
+                speechActivityEma: this.clampNumber(Number(source.speechActivityEma), 0, 1, fallback.speechActivityEma),
+                rmsDbEma: this.clampNumber(Number(source.rmsDbEma), -80, 0, fallback.rmsDbEma),
+                updatedAt: String(source.updatedAt || fallback.updatedAt),
+            };
+        };
+
+        const normalizedId = this.normalizeId(String(raw.id || fallbackId), fallbackId);
+        const profile: PersistentCharacterSeparationProfile = {
+            id: normalizedId,
+            preferredMethod: this.normalizeSeparationMethod(raw.preferredMethod) || base.preferredMethod,
+            methods: {
+                'uvr-ultimate': sanitizeMethod('uvr-ultimate'),
+                demucs: sanitizeMethod('demucs'),
+                uvr5: sanitizeMethod('uvr5'),
+                'ffmpeg-fallback': sanitizeMethod('ffmpeg-fallback'),
+            },
+            updatedAt: String(raw.updatedAt || base.updatedAt),
+        };
+        profile.preferredMethod = this.resolvePreferredMethod(profile);
+        return profile;
+    }
+
+    private loadSeparationProfiles(): void {
+        if (!fs.existsSync(this.separationProfileStorePath)) {
+            return;
+        }
+        try {
+            const raw = fs.readFileSync(this.separationProfileStorePath, 'utf-8');
+            const parsed = JSON.parse(raw) as Partial<PersistedSeparationProfileStore>;
+            const entries = parsed?.entries;
+            if (!entries || typeof entries !== 'object') {
+                return;
+            }
+            for (const [characterIdRaw, profileRaw] of Object.entries(entries)) {
+                const characterId = this.normalizeId(characterIdRaw, 'character_default');
+                const normalized = this.sanitizeCharacterSeparationProfile(profileRaw, characterId);
+                this.separationProfiles.set(characterId, normalized);
+            }
+        } catch (error) {
+            console.warn('[SingingLearning] Failed to load separation profiles:', error);
+        }
+    }
+
+    private persistSeparationProfiles(force: boolean = false): void {
+        if (!this.separationProfilesDirty) {
+            return;
+        }
+        const now = Date.now();
+        if (!force && now - this.separationProfilesLastPersistAt < 1500) {
+            return;
+        }
+        try {
+            const entries: Record<string, PersistentCharacterSeparationProfile> = {};
+            for (const [characterId, profile] of this.separationProfiles.entries()) {
+                entries[characterId] = profile;
+            }
+            const payload: PersistedSeparationProfileStore = {
+                version: 1,
+                entries,
+            };
+            fs.writeFileSync(this.separationProfileStorePath, JSON.stringify(payload, null, 2), 'utf-8');
+            this.separationProfilesDirty = false;
+            this.separationProfilesLastPersistAt = now;
+        } catch (error) {
+            console.warn('[SingingLearning] Failed to persist separation profiles:', error);
+        }
+    }
+
+    private getOrCreateCharacterSeparationProfile(characterIdRaw: string): PersistentCharacterSeparationProfile {
+        const characterId = this.normalizeId(characterIdRaw, 'character_default');
+        const existing = this.separationProfiles.get(characterId);
+        if (existing) {
+            return existing;
+        }
+        const created = this.getDefaultCharacterSeparationProfile(characterId);
+        this.separationProfiles.set(characterId, created);
+        this.separationProfilesDirty = true;
+        this.persistSeparationProfiles();
+        return created;
+    }
+
+    private normalizeSeparationMethod(value: unknown): SeparationMethod | undefined {
+        const normalized = String(value || '').trim().toLowerCase();
+        if (normalized === 'uvr-ultimate' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback') {
+            return normalized;
+        }
+        return undefined;
+    }
+
+    private resolvePreferredMethod(profile: PersistentCharacterSeparationProfile): SeparationMethod {
+        const methods: SeparationMethod[] = ['uvr-ultimate', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+        let bestMethod: SeparationMethod = methods[0];
+        let bestScore = -Infinity;
+        for (const method of methods) {
+            const methodProfile = profile.methods[method];
+            const attempts = methodProfile.successCount + methodProfile.failureCount;
+            const successRate = (methodProfile.successCount + 1) / (attempts + 2);
+            const score = methodProfile.scoreEma + (successRate - 0.5) * 8;
+            if (score > bestScore) {
+                bestScore = score;
+                bestMethod = method;
+            }
+        }
+        return bestMethod;
+    }
+
+    private getMethodPriorScore(characterIdRaw: string, method: SeparationMethod): number {
+        const profile = this.getOrCreateCharacterSeparationProfile(characterIdRaw);
+        const methodProfile = profile.methods[method];
+        const attempts = methodProfile.successCount + methodProfile.failureCount;
+        const successRate = (methodProfile.successCount + 1) / (attempts + 2);
+        const scoreBias = (methodProfile.scoreEma - 72) * 0.08;
+        const successBias = (successRate - 0.5) * 6;
+        return this.clampNumber(scoreBias + successBias, -6, 6, 0);
+    }
+
+    private updateSeparationProfileFromScoredCandidates(
+        characterIdRaw: string,
+        scoredCandidates: ScoredSeparationCandidate[],
+    ): void {
+        for (const entry of scoredCandidates) {
+            this.updateSeparationProfileForSuccess(
+                characterIdRaw,
+                entry.candidate.method,
+                {
+                    score: entry.score.score,
+                    leakageCorrelation: entry.score.leakageCorrelation,
+                    metrics: entry.vocalMetrics,
+                },
+                false,
+            );
+        }
+        this.persistSeparationProfiles();
+    }
+
+    private updateSeparationProfileForSuccess(
+        characterIdRaw: string,
+        method: SeparationMethod,
+        observed?: {
+            score?: number;
+            leakageCorrelation?: number;
+            metrics?: SeparationStemQualityMetrics;
+        },
+        persist: boolean = true,
+    ): void {
+        const profile = this.getOrCreateCharacterSeparationProfile(characterIdRaw);
+        const methodProfile = profile.methods[method];
+        const now = new Date().toISOString();
+        const nextScore = this.clampNumber(
+            Number(observed?.score),
+            0,
+            100,
+            methodProfile.scoreEma,
+        );
+        methodProfile.scoreEma = this.clampNumber(
+            this.ema(methodProfile.scoreEma, nextScore, 0.22),
+            0,
+            100,
+            methodProfile.scoreEma,
+        );
+        if (typeof observed?.leakageCorrelation === 'number') {
+            methodProfile.leakageEma = this.clampNumber(
+                this.ema(methodProfile.leakageEma, observed.leakageCorrelation, 0.2),
+                0,
+                1,
+                methodProfile.leakageEma,
+            );
+        }
+        if (observed?.metrics) {
+            methodProfile.speechActivityEma = this.clampNumber(
+                this.ema(methodProfile.speechActivityEma, observed.metrics.speechActivityRatio, 0.2),
+                0,
+                1,
+                methodProfile.speechActivityEma,
+            );
+            methodProfile.rmsDbEma = this.clampNumber(
+                this.ema(methodProfile.rmsDbEma, observed.metrics.rmsDb, 0.2),
+                -80,
+                0,
+                methodProfile.rmsDbEma,
+            );
+        }
+        methodProfile.successCount += 1;
+        methodProfile.updatedAt = now;
+        profile.preferredMethod = this.resolvePreferredMethod(profile);
+        profile.updatedAt = now;
+        this.separationProfiles.set(profile.id, profile);
+        this.separationProfilesDirty = true;
+        if (persist) {
+            this.persistSeparationProfiles();
+        }
+    }
+
+    private updateSeparationProfileForFailures(characterIdRaw: string, methods: SeparationMethod[]): void {
+        if (methods.length === 0) {
+            return;
+        }
+        const profile = this.getOrCreateCharacterSeparationProfile(characterIdRaw);
+        const uniqueMethods = Array.from(new Set(methods));
+        const now = new Date().toISOString();
+        for (const method of uniqueMethods) {
+            const methodProfile = profile.methods[method];
+            methodProfile.failureCount += 1;
+            methodProfile.scoreEma = this.clampNumber(
+                this.ema(methodProfile.scoreEma, Math.max(0, methodProfile.scoreEma - 6), 0.12),
+                0,
+                100,
+                methodProfile.scoreEma,
+            );
+            methodProfile.updatedAt = now;
+        }
+        profile.preferredMethod = this.resolvePreferredMethod(profile);
+        profile.updatedAt = now;
+        this.separationProfilesDirty = true;
+        this.persistSeparationProfiles();
+    }
+
     private normalizeSeparationPreference(value: string | undefined): SeparationPreference {
         const normalized = String(value || '').trim().toLowerCase();
         if (normalized === 'uvr-ultimate' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback') {
@@ -239,10 +693,28 @@ export class SingingLearningService {
         return 'auto';
     }
 
-    private buildSeparationPlan(preference: SeparationPreference): SeparationMethod[] {
+    private buildSeparationPlan(preference: SeparationPreference, characterId: string): SeparationMethod[] {
         const defaultPlan: SeparationMethod[] = ['uvr-ultimate', 'demucs', 'uvr5', 'ffmpeg-fallback'];
         if (preference === 'auto') {
-            return defaultPlan;
+            const profile = this.getOrCreateCharacterSeparationProfile(characterId);
+            const baselineBias: Record<SeparationMethod, number> = {
+                'uvr-ultimate': 2.5,
+                demucs: 2,
+                uvr5: 1,
+                'ffmpeg-fallback': -10,
+            };
+            const ranked = [...defaultPlan].sort((a, b) => {
+                const aMethod = profile.methods[a];
+                const bMethod = profile.methods[b];
+                const aAttempts = aMethod.successCount + aMethod.failureCount;
+                const bAttempts = bMethod.successCount + bMethod.failureCount;
+                const aSuccessRate = (aMethod.successCount + 1) / (aAttempts + 2);
+                const bSuccessRate = (bMethod.successCount + 1) / (bAttempts + 2);
+                const aPriority = aMethod.scoreEma + (aSuccessRate - 0.5) * 8 + baselineBias[a];
+                const bPriority = bMethod.scoreEma + (bSuccessRate - 0.5) * 8 + baselineBias[b];
+                return bPriority - aPriority;
+            });
+            return ranked;
         }
         return [preference, ...defaultPlan.filter((method) => method !== preference)];
     }
@@ -270,6 +742,142 @@ export class SingingLearningService {
             return this.trySeparateWithUvr(sourceAudioPath, vocalDir, accompanimentDir);
         }
         return this.trySeparateWithFfmpegFallback(sourceAudioPath, vocalDir, accompanimentDir);
+    }
+
+    private async selectBestSeparationCandidate(
+        candidates: SeparationQualityCandidate[],
+        runDir: string,
+        characterId: string,
+    ): Promise<{ candidate: SeparationQualityCandidate; warning?: string; scoredCandidates?: ScoredSeparationCandidate[] }> {
+        if (candidates.length === 0) {
+            throw new Error('No successful separation candidates to score.');
+        }
+        if (candidates.length <= 1) {
+            return {
+                candidate: candidates[0],
+                warning: candidates[0]?.warning,
+                scoredCandidates: [],
+            };
+        }
+
+        const ffmpegTools = await this.ensureFfmpegTools();
+        if (!ffmpegTools.ffmpegPath) {
+            const fallback = candidates[0];
+            return {
+                candidate: fallback,
+                warning: [
+                    fallback.warning,
+                    'Candidate quality analysis skipped because ffmpeg was unavailable.',
+                    ffmpegTools.error,
+                ].filter(Boolean).join(' '),
+                scoredCandidates: [],
+            };
+        }
+
+        const analysisDir = path.join(runDir, 'analysis');
+        fs.mkdirSync(analysisDir, { recursive: true });
+
+        const scoredCandidates: ScoredSeparationCandidate[] = [];
+        const analysisWarnings: string[] = [];
+        for (let index = 0; index < candidates.length; index += 1) {
+            const candidate = candidates[index];
+            const vocalAnalysisPath = path.join(analysisDir, `candidate_${index + 1}_${candidate.method}_vocal_mono16.wav`);
+            const vocalPrepared = await this.renderAnalysisMonoPcm16(
+                ffmpegTools.ffmpegPath,
+                candidate.vocalWavPath,
+                vocalAnalysisPath,
+            );
+            if (!vocalPrepared) {
+                analysisWarnings.push(`analysis_preprocess_failed(${candidate.method})`);
+                continue;
+            }
+
+            try {
+                const vocalMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(vocalAnalysisPath);
+                let leakageCorrelation: number | undefined;
+                if (candidate.accompanimentWavPath && fs.existsSync(candidate.accompanimentWavPath)) {
+                    const accompanimentAnalysisPath = path.join(
+                        analysisDir,
+                        `candidate_${index + 1}_${candidate.method}_accompaniment_mono16.wav`,
+                    );
+                    const accompanimentPrepared = await this.renderAnalysisMonoPcm16(
+                        ffmpegTools.ffmpegPath,
+                        candidate.accompanimentWavPath,
+                        accompanimentAnalysisPath,
+                    );
+                    if (accompanimentPrepared) {
+                        leakageCorrelation = SeparationQualityLibrary.estimateLeakageCorrelation(
+                            vocalAnalysisPath,
+                            accompanimentAnalysisPath,
+                        );
+                    }
+                }
+                const score = SeparationQualityLibrary.scoreFromMetrics(vocalMetrics, leakageCorrelation);
+                const prior = this.getMethodPriorScore(characterId, candidate.method);
+                const finalScore = this.clampNumber(score.score + prior, 0, 100, score.score);
+                scoredCandidates.push({
+                    candidate,
+                    score,
+                    vocalMetrics,
+                    finalScore,
+                });
+            } catch (error) {
+                analysisWarnings.push(
+                    `quality_analysis_failed(${candidate.method}): ${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
+        }
+
+        if (scoredCandidates.length === 0) {
+            const fallback = candidates[0];
+            return {
+                candidate: fallback,
+                warning: [
+                    fallback.warning,
+                    ffmpegTools.warning,
+                    'Candidate quality analysis failed; kept first successful separator.',
+                    analysisWarnings.length > 0 ? `Details: ${analysisWarnings.slice(0, 2).join(' | ')}` : undefined,
+                ].filter(Boolean).join(' '),
+                scoredCandidates: [],
+            };
+        }
+
+        scoredCandidates.sort((a, b) => b.finalScore - a.finalScore);
+        const best = scoredCandidates[0];
+        const ranking = scoredCandidates
+            .map((entry) => `${entry.candidate.method}:${entry.finalScore.toFixed(2)}(raw=${entry.score.score.toFixed(2)})`)
+            .join(', ');
+        const scoreDetail = `Selected ${best.candidate.method} by automatic quality ranking (score=${best.finalScore.toFixed(2)}, raw=${best.score.score.toFixed(2)}, rms=${best.vocalMetrics.rmsDb.toFixed(2)}dB, speech=${best.vocalMetrics.speechActivityRatio.toFixed(2)}).`;
+
+        return {
+            candidate: best.candidate,
+            warning: [
+                best.candidate.warning,
+                ffmpegTools.warning,
+                scoreDetail,
+                `Ranking: ${ranking}.`,
+                analysisWarnings.length > 0 ? `Analyzer warnings: ${analysisWarnings.slice(0, 2).join(' | ')}` : undefined,
+            ].filter(Boolean).join(' '),
+            scoredCandidates,
+        };
+    }
+
+    private async renderAnalysisMonoPcm16(
+        ffmpegPath: string,
+        inputPath: string,
+        outputPath: string,
+    ): Promise<boolean> {
+        const convert = await this.runCommand(ffmpegPath, [
+            '-y',
+            '-i', inputPath,
+            '-vn',
+            '-ac', '1',
+            '-ar', '22050',
+            '-c:a', 'pcm_s16le',
+            '-t', '120',
+            outputPath,
+        ], { timeoutMs: 20 * 60 * 1000 });
+        return convert.success && fs.existsSync(outputPath);
     }
 
     private async copyToSbv2DatasetInput(characterId: string, vocalWavPath: string): Promise<string> {
@@ -474,43 +1082,96 @@ export class SingingLearningService {
 
         const pythonScript = `
 import json
+import os
 from audio_separator.separator import Separator
 
 input_path = r'''${sourceAudioPath.replace(/\\/g, '\\\\')}'''
 output_dir = r'''${outputDir.replace(/\\/g, '\\\\')}'''
 model_file_dir = r'''${modelFileDir.replace(/\\/g, '\\\\')}'''
-model_candidates = [
+dereverb_dir = os.path.join(output_dir, 'dereverb')
+os.makedirs(dereverb_dir, exist_ok=True)
+
+# Stage 1 model candidates ordered by quality (SDR benchmark, 2024-2025)
+# BS-RoFormer ~13 dB > Mel-RoFormer ~10 dB > Kim_Vocal ~9 dB > MDX-Net ~8.5 dB
+vocal_model_candidates = [
+    'model_bs_roformer_ep_317_sdr_12.9755.ckpt',
+    'mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt',
+    'Kim_Vocal_2.onnx',
+    'UVR-MDX-NET-Voc_FT.onnx',
     'UVR_MDXNET_KARA_2.onnx',
-    'UVR-MDX-NET-Inst_HQ_3.onnx',
+    'UVR-MDX-NET-Inst_HQ_4.onnx',
     '2_HP-UVR.pth',
 ]
 output_names = {
     'Vocals': 'vocals_uvr_ultimate',
     'Instrumental': 'accompaniment_uvr_ultimate',
 }
+# Stage 2: de-reverb model candidates (applied to extracted vocals)
+dereverb_model_candidates = [
+    'Reverb_HQ_By_FoxJoy.onnx',
+    'UVR-De-Echo-Normal.pth',
+]
 
 errors = []
-for model_name in model_candidates:
+vocal_file = None
+inst_file = None
+used_model = None
+
+# Stage 1 - Vocal / Instrumental separation
+for model_name in vocal_model_candidates:
     try:
-        separator = Separator(
+        sep = Separator(
             log_level=30,
             model_file_dir=model_file_dir,
             output_dir=output_dir,
             output_format='WAV',
         )
-        separator.load_model(model_filename=model_name)
-        output_files = separator.separate(input_path, output_names)
-        print(json.dumps({
-            'ok': True,
-            'model': model_name,
-            'outputs': output_files,
-        }, ensure_ascii=False))
-        raise SystemExit(0)
+        sep.load_model(model_filename=model_name)
+        output_files = sep.separate(input_path, output_names)
+        voc = [f for f in output_files if 'vocal' in os.path.basename(f).lower()]
+        inst = [f for f in output_files if any(k in os.path.basename(f).lower() for k in ['instrumental', 'accompaniment', 'no_vocal', 'inst'])]
+        if voc:
+            vocal_file = voc[0]
+            inst_file = inst[0] if inst else None
+            used_model = model_name
+            break
     except Exception as ex:
-        errors.append({'model': model_name, 'error': str(ex)})
+        errors.append({'stage': 'vocal', 'model': model_name, 'error': str(ex)})
 
-print(json.dumps({'ok': False, 'errors': errors}, ensure_ascii=False))
-raise SystemExit(1)
+if vocal_file is None:
+    print(json.dumps({'ok': False, 'errors': errors}, ensure_ascii=False))
+    raise SystemExit(1)
+
+# Stage 2 - De-reverb on extracted vocals (optional; skip on failure)
+dereverbed_file = vocal_file
+dereverb_model_used = None
+for dr_model in dereverb_model_candidates:
+    try:
+        dr_sep = Separator(
+            log_level=30,
+            model_file_dir=model_file_dir,
+            output_dir=dereverb_dir,
+            output_format='WAV',
+        )
+        dr_sep.load_model(model_filename=dr_model)
+        dr_outputs = dr_sep.separate(vocal_file)
+        if not dr_outputs:
+            continue
+        no_reverb = [f for f in dr_outputs if any(k in os.path.basename(f).lower() for k in ['no reverb', 'noreverb', 'no_reverb', 'dry'])]
+        dereverbed_file = no_reverb[0] if no_reverb else dr_outputs[0]
+        dereverb_model_used = dr_model
+        break
+    except Exception as ex:
+        errors.append({'stage': 'dereverb', 'model': dr_model, 'error': str(ex)})
+
+print(json.dumps({
+    'ok': True,
+    'model': used_model,
+    'dereverb_model': dereverb_model_used,
+    'vocal_file': dereverbed_file,
+    'inst_file': inst_file,
+}, ensure_ascii=False))
+raise SystemExit(0)
 `.trim();
 
         const uvrEnv = this.buildEnvWithAdditionalPath(path.dirname(ffmpegTools.ffmpegPath), {
@@ -539,7 +1200,21 @@ raise SystemExit(1)
             // Ignore log write failures.
         }
 
-        const vocalStem = this.findStemFile(outputDir, ['vocals_uvr_ultimate', 'main_vocal', 'vocals', 'vocal']);
+        const report = this.tryParseLastJsonLine<{
+            ok?: boolean;
+            model?: string;
+            dereverb_model?: string;
+            vocal_file?: string;
+            inst_file?: string;
+        }>(result.stdout || '');
+
+        // Prefer the explicit paths returned by the script; fall back to directory scanning.
+        let vocalStem: string | undefined;
+        if (report?.vocal_file && fs.existsSync(report.vocal_file)) {
+            vocalStem = report.vocal_file;
+        } else {
+            vocalStem = this.findStemFile(outputDir, ['vocals_uvr_ultimate', 'main_vocal', 'vocals', 'vocal']);
+        }
         if (!vocalStem) {
             const details = this.takeTail([result.stderr, result.stdout].filter(Boolean).join('\n'), 900);
             return {
@@ -549,11 +1224,18 @@ raise SystemExit(1)
                     : this.formatCommandFailure('UVR Ultimate', result),
             };
         }
-        const accompanimentStem = this.findStemFile(
-            outputDir,
-            ['accompaniment_uvr_ultimate', 'instrumental', 'no_vocals', 'others'],
-            { allowAnyWavFallback: false },
-        );
+
+        let accompanimentStem: string | undefined;
+        if (report?.inst_file && fs.existsSync(report.inst_file)) {
+            accompanimentStem = report.inst_file;
+        } else {
+            accompanimentStem = this.findStemFile(
+                outputDir,
+                ['accompaniment_uvr_ultimate', 'instrumental', 'no_vocals', 'others'],
+                { allowAnyWavFallback: false },
+            );
+        }
+
         const vocalCopyPath = path.join(vocalDir, `vocal_uvr_ultimate_${Date.now()}.wav`);
         fs.copyFileSync(vocalStem, vocalCopyPath);
 
@@ -563,11 +1245,11 @@ raise SystemExit(1)
             fs.copyFileSync(accompanimentStem, accompanimentCopyPath);
         }
 
-        const report = this.tryParseLastJsonLine<{ ok?: boolean; model?: string }>(result.stdout || '');
         const warnings: string[] = [];
         if (runner.warning) warnings.push(runner.warning);
         if (ffmpegTools.warning) warnings.push(ffmpegTools.warning);
-        if (report?.model) warnings.push(`UVR Ultimate model: ${report.model}`);
+        if (report?.model) warnings.push(`UVR Ultimate vocal model: ${report.model}`);
+        if (report?.dereverb_model) warnings.push(`De-reverb: ${report.dereverb_model}`);
         if (!result.success) warnings.push(`UVR Ultimate exited with code ${result.code}, but stem files were produced and reused.`);
         if (!accompanimentCopyPath) warnings.push('UVR Ultimate extracted vocals but accompaniment stem was not found.');
 
@@ -1296,15 +1978,35 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         const enhancedDir = path.join(runDir, 'enhanced');
         fs.mkdirSync(enhancedDir, { recursive: true });
         const enhancedPath = path.join(enhancedDir, `vocal_enhanced_${Date.now()}.wav`);
-        const filters = [
+        const defaultFilters = [
             'highpass=f=80',
             'lowpass=f=14000',
             'afftdn=nr=7:nf=-45:tn=1',
             'dynaudnorm=f=250:g=9:p=0.95:m=6',
             'alimiter=limit=0.98',
         ].join(',');
+        let filters = defaultFilters;
+        let metricsSummary = '';
 
-        const result = await this.runCommand(ffmpegTools.ffmpegPath, [
+        const analysisDir = path.join(runDir, 'analysis');
+        fs.mkdirSync(analysisDir, { recursive: true });
+        const analysisMonoPath = path.join(analysisDir, `vocal_enhance_input_${Date.now()}.wav`);
+        const analysisPrepared = await this.renderAnalysisMonoPcm16(
+            ffmpegTools.ffmpegPath,
+            sourcePath,
+            analysisMonoPath,
+        );
+        if (analysisPrepared) {
+            try {
+                const metrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(analysisMonoPath);
+                filters = SeparationQualityLibrary.buildAdaptiveFilterChain(metrics);
+                metricsSummary = `Adaptive cleanup tuned from analysis (rms=${metrics.rmsDb.toFixed(2)}dB, low=${metrics.lowBandRatio.toFixed(2)}, high=${metrics.highBandRatio.toFixed(2)}, speech=${metrics.speechActivityRatio.toFixed(2)}).`;
+            } catch {
+                // Keep default filters when analysis fails.
+            }
+        }
+
+        let result = await this.runCommand(ffmpegTools.ffmpegPath, [
             '-y',
             '-i', sourcePath,
             '-vn',
@@ -1313,6 +2015,18 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             '-ac', '1',
             enhancedPath,
         ], { timeoutMs: 20 * 60 * 1000 });
+
+        if ((!result.success || !fs.existsSync(enhancedPath)) && filters !== defaultFilters) {
+            result = await this.runCommand(ffmpegTools.ffmpegPath, [
+                '-y',
+                '-i', sourcePath,
+                '-vn',
+                '-af', defaultFilters,
+                '-ar', '44100',
+                '-ac', '1',
+                enhancedPath,
+            ], { timeoutMs: 20 * 60 * 1000 });
+        }
 
         if (!result.success || !fs.existsSync(enhancedPath)) {
             return {
@@ -1324,7 +2038,8 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             vocalWavPath: enhancedPath,
             warning: [
                 ffmpegTools.warning,
-                'Applied vocal cleanup (high/low pass + FFT denoise + dynamic normalize + limiter).',
+                metricsSummary || undefined,
+                'Applied vocal cleanup (adaptive high/low pass + FFT denoise + dynamic normalize + limiter).',
             ].filter(Boolean).join(' '),
         };
     }
@@ -2061,6 +2776,33 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             }
         }
         return null;
+    }
+
+    private ema(previous: number, next: number, alpha: number): number {
+        const a = this.clampNumber(alpha, 0.01, 1, 0.2);
+        return (previous * (1 - a)) + (next * a);
+    }
+
+    private roundNumber(value: number, digits: number): number {
+        if (!Number.isFinite(value)) return 0;
+        const safeDigits = this.clampInteger(digits, 0, 6, 2);
+        const scale = 10 ** safeDigits;
+        return Math.round(value * scale) / scale;
+    }
+
+    private clampNumber(value: number, min: number, max: number, fallback: number): number {
+        if (!Number.isFinite(value)) return fallback;
+        if (value < min) return min;
+        if (value > max) return max;
+        return value;
+    }
+
+    private clampInteger(value: number, min: number, max: number, fallback: number): number {
+        if (!Number.isFinite(value)) return fallback;
+        const rounded = Math.floor(value);
+        if (rounded < min) return min;
+        if (rounded > max) return max;
+        return rounded;
     }
 
     private formatCommandFailure(label: string, result: CommandResult): string {

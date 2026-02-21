@@ -3617,6 +3617,42 @@ ipcMain.handle('character-chat-reset', async (_event, sessionId: string) => {
     }
 });
 
+ipcMain.handle('character-learning-get-separation-profile', async (_event, characterId: string) => {
+    try {
+        const learningService = SingingLearningService.getInstance(ttsResourcesPath);
+        return learningService.getSeparationProfile(String(characterId || 'character_default'));
+    } catch (error) {
+        console.error('[SingingLearning] get-separation-profile error:', error);
+        return {
+            success: false,
+            characterId: String(characterId || 'character_default'),
+            preferredMethod: 'uvr-ultimate',
+            updatedAt: new Date(0).toISOString(),
+            methods: [],
+            profilePath: '',
+            error: String(error),
+        };
+    }
+});
+
+ipcMain.handle('character-learning-reset-separation-profile', async (_event, characterId: string) => {
+    try {
+        const learningService = SingingLearningService.getInstance(ttsResourcesPath);
+        return learningService.resetSeparationProfile(String(characterId || 'character_default'));
+    } catch (error) {
+        console.error('[SingingLearning] reset-separation-profile error:', error);
+        return {
+            success: false,
+            characterId: String(characterId || 'character_default'),
+            preferredMethod: 'uvr-ultimate',
+            updatedAt: new Date(0).toISOString(),
+            methods: [],
+            profilePath: '',
+            error: String(error),
+        };
+    }
+});
+
 ipcMain.handle('util:select-directory', async () => {
     const result = await dialog.showOpenDialog({
         properties: ['openDirectory']

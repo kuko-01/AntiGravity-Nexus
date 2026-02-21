@@ -57,6 +57,28 @@ export interface AppState {
     isResearching: boolean;
 }
 
+export interface CharacterLearningSeparationMethodProfile {
+    method: 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    scoreEma: number;
+    successCount: number;
+    failureCount: number;
+    successRate: number;
+    leakageEma: number;
+    speechActivityEma: number;
+    rmsDbEma: number;
+    updatedAt: string;
+}
+
+export interface CharacterLearningSeparationProfileResponse {
+    success: boolean;
+    characterId: string;
+    preferredMethod: 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    updatedAt: string;
+    methods: CharacterLearningSeparationMethodProfile[];
+    profilePath: string;
+    error?: string;
+}
+
 // 音声を出力しているプロセス情報
 export interface AudioProcess {
     pid: number;
@@ -254,6 +276,8 @@ export interface ElectronAPI {
     // AI Character Chat
     characterChatSend: (params: CharacterChatRequest) => Promise<CharacterChatResponse>;
     characterChatReset: (sessionId: string) => Promise<{ success: boolean; error?: string }>;
+    characterLearningGetSeparationProfile: (characterId: string) => Promise<CharacterLearningSeparationProfileResponse>;
+    characterLearningResetSeparationProfile: (characterId: string) => Promise<CharacterLearningSeparationProfileResponse>;
 }
 
 // Nano Studio Types

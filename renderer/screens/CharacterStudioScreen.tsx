@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import type { CharacterChatResponse, CharacterConversationSettings } from '../../types/character';
 import type { RvcModel } from '../../types/rvc';
 import type { TtsModel } from '../../types/tts';
+import type { CharacterLearningSeparationProfileResponse } from '../../types';
 
 type MessageRole = 'user' | 'assistant' | 'system';
 
@@ -67,7 +68,16 @@ interface StoredVoiceEnhanceSettings {
     emotionIntensityHint?: number;
 }
 
+type SeparationMethodId = 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+
 const DEFAULT_CHARACTER_ID = 'aozuki_fox_v1';
+const SEPARATION_METHOD_ORDER: SeparationMethodId[] = ['uvr-ultimate', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+const SEPARATION_METHOD_LABELS: Record<SeparationMethodId, string> = {
+    'uvr-ultimate': 'UVR Ultimate',
+    demucs: 'Demucs',
+    uvr5: 'UVR5',
+    'ffmpeg-fallback': 'FFmpeg fallback',
+};
 const DEFAULT_CHARACTER_PROFILE: StoredCharacterProfile = {
     nameKanji: '蒼月キツネ案内人',
     nameKana: 'あおつききつねあんないにん',
@@ -126,6 +136,10 @@ const CharacterStudioScreen: React.FC = () => {
     const [isSending, setIsSending] = useState<boolean>(false);
     const [lastError, setLastError] = useState<string>('');
     const [copyStatus, setCopyStatus] = useState<string>('');
+    const [separationProfile, setSeparationProfile] = useState<CharacterLearningSeparationProfileResponse | null>(null);
+    const [separationProfileStatus, setSeparationProfileStatus] = useState<string>('');
+    const [isSeparationProfileLoading, setIsSeparationProfileLoading] = useState<boolean>(false);
+    const [isSeparationProfileResetting, setIsSeparationProfileResetting] = useState<boolean>(false);
 
     const [voiceEnabled, setVoiceEnabled] = useState<boolean>(true);
     const [voiceMode, setVoiceMode] = useState<'sbv2' | 'sbv2+rvc'>('sbv2+rvc');
@@ -192,6 +206,16 @@ const CharacterStudioScreen: React.FC = () => {
         () => Boolean(characterProfiles[characterId.trim()]),
         [characterProfiles, characterId],
     );
+    const separationProfileMethods = useMemo(() => {
+        const methods = separationProfile?.methods;
+        if (!Array.isArray(methods) || methods.length === 0) {
+            return [];
+        }
+        const byMethod = new Map(methods.map((method) => [method.method, method]));
+        return SEPARATION_METHOD_ORDER
+            .map((method) => byMethod.get(method))
+            .filter((method): method is NonNullable<typeof method> => Boolean(method));
+    }, [separationProfile]);
     const conversationSettings = useMemo<CharacterConversationSettings>(() => ({
         character: {
             nameKanji: characterNameKanji.trim() || undefined,
@@ -570,9 +594,76 @@ const CharacterStudioScreen: React.FC = () => {
         }
     };
 
+    const fetchSeparationProfile = async (
+        targetCharacterIdRaw?: string,
+        options?: { silent?: boolean },
+    ) => {
+        const targetCharacterId = String(targetCharacterIdRaw || characterId || DEFAULT_CHARACTER_ID).trim() || DEFAULT_CHARACTER_ID;
+        if (!window.electronAPI?.characterLearningGetSeparationProfile) {
+            setSeparationProfile(null);
+            if (!options?.silent) {
+                setSeparationProfileStatus('Separation profile API is unavailable.');
+            }
+            return;
+        }
+
+        setIsSeparationProfileLoading(true);
+        if (!options?.silent) {
+            setSeparationProfileStatus('Loading separation quality memory...');
+        }
+        try {
+            const response = await window.electronAPI.characterLearningGetSeparationProfile(targetCharacterId);
+            setSeparationProfile(response);
+            if (options?.silent) {
+                return;
+            }
+            if (response.success) {
+                setSeparationProfileStatus(`Loaded separation memory: ${response.characterId}`);
+            } else {
+                setSeparationProfileStatus(`Failed to load memory: ${response.error || 'unknown error'}`);
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (!options?.silent) {
+                setSeparationProfileStatus(`Failed to load memory: ${message}`);
+            }
+        } finally {
+            setIsSeparationProfileLoading(false);
+        }
+    };
+
+    const resetSeparationProfile = async () => {
+        const targetCharacterId = characterId.trim() || DEFAULT_CHARACTER_ID;
+        if (!window.electronAPI?.characterLearningResetSeparationProfile) {
+            setSeparationProfileStatus('Separation profile reset API is unavailable.');
+            return;
+        }
+        setIsSeparationProfileResetting(true);
+        setSeparationProfileStatus('Resetting separation quality memory...');
+        try {
+            const response = await window.electronAPI.characterLearningResetSeparationProfile(targetCharacterId);
+            setSeparationProfile(response);
+            if (response.success) {
+                setSeparationProfileStatus(`Reset separation memory: ${response.characterId}`);
+            } else {
+                setSeparationProfileStatus(`Failed to reset memory: ${response.error || 'unknown error'}`);
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            setSeparationProfileStatus(`Failed to reset memory: ${message}`);
+        } finally {
+            setIsSeparationProfileResetting(false);
+        }
+    };
+
     useEffect(() => {
         void refreshVoiceOptions();
     }, [apiAvailable]);
+
+    useEffect(() => {
+        if (!apiAvailable) return;
+        void fetchSeparationProfile(characterId, { silent: true });
+    }, [apiAvailable, characterId]);
 
     useEffect(() => {
         try {
@@ -1110,6 +1201,64 @@ const CharacterStudioScreen: React.FC = () => {
                     {!profileStatus && (
                         <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginBottom: '12px' }}>
                             {hasSavedProfileForCurrentCharacter ? 'Saved profile exists for this Character ID.' : 'No saved profile for this Character ID yet.'}
+                        </div>
+                    )}
+
+                    <h4 style={{ margin: '2px 0 8px 0', fontSize: '13px' }}>Singing Separation Memory</h4>
+                    <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                        <button
+                            onClick={() => { void fetchSeparationProfile(characterId); }}
+                            disabled={isSeparationProfileLoading || !apiAvailable}
+                            style={{ flex: 1, padding: '6px 8px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-surface)', color: 'var(--color-text)', opacity: isSeparationProfileLoading ? 0.7 : 1 }}
+                            title="このキャラクターの分離品質メモリを再読み込みします。"
+                        >
+                            {isSeparationProfileLoading ? 'Loading...' : 'Refresh Memory'}
+                        </button>
+                        <button
+                            onClick={() => { void resetSeparationProfile(); }}
+                            disabled={isSeparationProfileResetting || !apiAvailable}
+                            style={{ flex: 1, padding: '6px 8px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-surface)', color: 'var(--color-text)', opacity: isSeparationProfileResetting ? 0.7 : 1 }}
+                            title="このキャラクターの分離品質メモリを初期化します。"
+                        >
+                            {isSeparationProfileResetting ? 'Resetting...' : 'Reset Memory'}
+                        </button>
+                    </div>
+                    {separationProfileStatus && (
+                        <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginBottom: '8px' }}>
+                            {separationProfileStatus}
+                        </div>
+                    )}
+                    {separationProfile?.success && (
+                        <div style={{ marginBottom: '12px', border: '1px solid var(--color-border)', borderRadius: '8px', padding: '8px', background: 'rgba(15, 23, 42, 0.25)' }}>
+                            <div style={{ fontSize: '11px', marginBottom: '4px' }}>
+                                Preferred: <b>{SEPARATION_METHOD_LABELS[separationProfile.preferredMethod]}</b>
+                            </div>
+                            <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginBottom: '4px' }}>
+                                Updated: {new Date(separationProfile.updatedAt).toLocaleString()}
+                            </div>
+                            <div style={{ fontSize: '10px', color: 'var(--color-text-secondary)', marginBottom: '8px', wordBreak: 'break-all' }}>
+                                Store: {separationProfile.profilePath || '(not saved yet)'}
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                {separationProfileMethods.map((methodProfile) => (
+                                    <div key={methodProfile.method} style={{ border: '1px solid var(--color-border)', borderRadius: '6px', padding: '6px', background: 'rgba(15, 23, 42, 0.35)' }}>
+                                        <div style={{ fontSize: '11px', marginBottom: '2px' }}>
+                                            {SEPARATION_METHOD_LABELS[methodProfile.method as SeparationMethodId]}
+                                        </div>
+                                        <div style={{ fontSize: '10px', color: 'var(--color-text-secondary)' }}>
+                                            score={methodProfile.scoreEma.toFixed(2)} | success={methodProfile.successCount} | fail={methodProfile.failureCount}
+                                        </div>
+                                        <div style={{ fontSize: '10px', color: 'var(--color-text-secondary)' }}>
+                                            rate={(methodProfile.successRate * 100).toFixed(1)}% | leakage={methodProfile.leakageEma.toFixed(3)} | speech={methodProfile.speechActivityEma.toFixed(3)}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                    {!separationProfile?.success && separationProfile?.error && (
+                        <div style={{ fontSize: '11px', color: '#fca5a5', marginBottom: '12px' }}>
+                            {separationProfile.error}
                         </div>
                     )}
 

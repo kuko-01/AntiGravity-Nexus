@@ -584,6 +584,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
         return await ipcRenderer.invoke('character-chat-reset', sessionId);
     },
 
+    characterLearningGetSeparationProfile: async (characterId: string) => {
+        return await ipcRenderer.invoke('character-learning-get-separation-profile', characterId);
+    },
+
+    characterLearningResetSeparationProfile: async (characterId: string) => {
+        return await ipcRenderer.invoke('character-learning-reset-separation-profile', characterId);
+    },
+
     utilSelectDirectory: async () => {
         return await ipcRenderer.invoke('util:select-directory');
     },

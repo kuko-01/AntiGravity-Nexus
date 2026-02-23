@@ -157,9 +157,11 @@ export interface RvcConvertParams {
 export interface RvcConvertResult {
     success: boolean;
     wavPath?: string;
+    archivedPath?: string;
     audioBase64?: string;
     durationMs?: number;
     sampleRate?: number;
+    learningProfileId?: string;
     warning?: string;
     error?: RvcError;
 }

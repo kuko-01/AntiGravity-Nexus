@@ -264,6 +264,7 @@ export class SingingLearningService {
             ? separationPlan.filter((method) => method !== 'ffmpeg-fallback')
             : separationPlan;
         const successfulCandidates: SeparationQualityCandidate[] = [];
+        let enhancementAlternativeCandidates: SeparationQualityCandidate[] = [];
         let separation: SeparationAttempt = { success: false, error: 'No separator attempted.' };
 
         for (const method of methodsForInitialPass) {
@@ -301,6 +302,10 @@ export class SingingLearningService {
                     warning: selected.warning,
                 };
                 if (selected.scoredCandidates && selected.scoredCandidates.length > 0) {
+                    enhancementAlternativeCandidates = selected.scoredCandidates
+                        .map((entry) => entry.candidate)
+                        .filter((candidate) => candidate.vocalWavPath !== selected.candidate.vocalWavPath)
+                        .slice(0, 2);
                     this.updateSeparationProfileFromScoredCandidates(characterId, selected.scoredCandidates);
                 } else {
                     this.updateSeparationProfileForSuccess(characterId, selected.candidate.method);
@@ -360,7 +365,12 @@ export class SingingLearningService {
             };
         }
 
-        const enhancedVocal = await this.enhanceSeparatedVocalTrack(separation.vocalWavPath, runDir);
+        const enhancedVocal = await this.enhanceSeparatedVocalTrack(
+            separation.vocalWavPath,
+            runDir,
+            separation.accompanimentWavPath,
+            enhancementAlternativeCandidates,
+        );
         if (enhancedVocal.vocalWavPath) {
             separation.vocalWavPath = enhancedVocal.vocalWavPath;
         }
@@ -2151,6 +2161,8 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
     private async enhanceSeparatedVocalTrack(
         vocalWavPath: string,
         runDir: string,
+        accompanimentWavPath?: string,
+        alternativeCandidates: SeparationQualityCandidate[] = [],
     ): Promise<{ vocalWavPath?: string; warning?: string }> {
         const sourcePath = String(vocalWavPath || '').trim();
         if (!sourcePath || !fs.existsSync(sourcePath)) {
@@ -2173,24 +2185,279 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             'highpass=f=80',
             'lowpass=f=14000',
             'afftdn=nr=7:nf=-45:tn=1',
+            'anlmdn=s=6:p=0.002:r=0.006:m=15',
+            'adeclick=t=3:w=55:o=75:a=2:m=a',
             'dynaudnorm=f=250:g=9:p=0.95:m=6',
             'alimiter=limit=0.98',
         ].join(',');
         let filters = defaultFilters;
         let metricsSummary = '';
+        const enhancementNotes: string[] = [];
+        let cleanupInputPath = sourcePath;
+        let preparedAccMonoPath: string | undefined;
+        let leakageForCleanupTuning: number | undefined;
 
         const analysisDir = path.join(runDir, 'analysis');
         fs.mkdirSync(analysisDir, { recursive: true });
-        const analysisMonoPath = path.join(analysisDir, `vocal_enhance_input_${Date.now()}.wav`);
-        const analysisPrepared = await this.renderAnalysisMonoPcm16(
-            ffmpegTools.ffmpegPath,
-            sourcePath,
-            analysisMonoPath,
+        const stamp = Date.now();
+        const preparedVocalMonoPath = path.join(analysisDir, `vocal_enhance_input_full_${stamp}.wav`);
+        const preparedVocalMono = await this.runCommand(ffmpegTools.ffmpegPath, [
+            '-y',
+            '-i', sourcePath,
+            '-vn',
+            '-ac', '1',
+            '-ar', '44100',
+            '-c:a', 'pcm_s16le',
+            preparedVocalMonoPath,
+        ], { timeoutMs: 20 * 60 * 1000 });
+        const analysisPrepared = preparedVocalMono.success && fs.existsSync(preparedVocalMonoPath);
+
+        if (analysisPrepared && accompanimentWavPath && fs.existsSync(accompanimentWavPath)) {
+            preparedAccMonoPath = path.join(analysisDir, `vocal_enhance_acc_full_${stamp}.wav`);
+            if (!fs.existsSync(preparedAccMonoPath)) {
+                const preparedAccMono = await this.runCommand(ffmpegTools.ffmpegPath, [
+                    '-y',
+                    '-i', accompanimentWavPath,
+                    '-vn',
+                    '-ac', '1',
+                    '-ar', '44100',
+                    '-c:a', 'pcm_s16le',
+                    preparedAccMonoPath,
+                ], { timeoutMs: 20 * 60 * 1000 });
+                if (!preparedAccMono.success || !fs.existsSync(preparedAccMonoPath)) {
+                    preparedAccMonoPath = undefined;
+                }
+            }
+        }
+
+        if (analysisPrepared && alternativeCandidates.length > 0) {
+            const altCandidate = alternativeCandidates.find((candidate) => {
+                const p = String(candidate?.vocalWavPath || '').trim();
+                return !!p && fs.existsSync(p) && path.resolve(p) !== path.resolve(sourcePath);
+            });
+            if (altCandidate) {
+                const altMonoPath = path.join(analysisDir, `vocal_alt_${altCandidate.method}_${stamp}.wav`);
+                const altPrepared = await this.runCommand(ffmpegTools.ffmpegPath, [
+                    '-y',
+                    '-i', altCandidate.vocalWavPath,
+                    '-vn',
+                    '-ac', '1',
+                    '-ar', '44100',
+                    '-c:a', 'pcm_s16le',
+                    altMonoPath,
+                ], { timeoutMs: 20 * 60 * 1000 });
+
+                let altAccMonoPath: string | undefined;
+                if (altPrepared.success && altCandidate.accompanimentWavPath && fs.existsSync(altCandidate.accompanimentWavPath)) {
+                    altAccMonoPath = path.join(analysisDir, `vocal_alt_acc_${altCandidate.method}_${stamp}.wav`);
+                    const altAccPrepared = await this.runCommand(ffmpegTools.ffmpegPath, [
+                        '-y',
+                        '-i', altCandidate.accompanimentWavPath,
+                        '-vn',
+                        '-ac', '1',
+                        '-ar', '44100',
+                        '-c:a', 'pcm_s16le',
+                        altAccMonoPath,
+                    ], { timeoutMs: 20 * 60 * 1000 });
+                    if (!altAccPrepared.success || !fs.existsSync(altAccMonoPath)) {
+                        altAccMonoPath = undefined;
+                    }
+                }
+
+                if (altPrepared.success && fs.existsSync(altMonoPath)) {
+                    const ensemblePath = path.join(enhancedDir, `vocal_ensemble_${Date.now()}.wav`);
+                    try {
+                        const beforeMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(preparedVocalMonoPath);
+                        const beforeLeak = preparedAccMonoPath && fs.existsSync(preparedAccMonoPath)
+                            ? SeparationQualityLibrary.estimateLeakageCorrelation(preparedVocalMonoPath, preparedAccMonoPath)
+                            : 0;
+                        const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
+
+                        const ensembleSummary = SeparationQualityLibrary.mergeVocalCandidatesWithReferenceMonoPcm16Wav(
+                            preparedVocalMonoPath,
+                            altMonoPath,
+                            ensemblePath,
+                            preparedAccMonoPath,
+                            altAccMonoPath,
+                        );
+
+                        const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(ensemblePath);
+                        const afterLeak = preparedAccMonoPath && fs.existsSync(preparedAccMonoPath)
+                            ? SeparationQualityLibrary.estimateLeakageCorrelation(ensemblePath, preparedAccMonoPath)
+                            : 0;
+                        const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
+
+                        const improved = (
+                            afterScore.score >= beforeScore.score + 1.0
+                            || afterLeak <= beforeLeak - 0.02
+                            || (afterScore.score >= beforeScore.score - 0.5 && afterMetrics.lowBandRatio <= beforeMetrics.lowBandRatio - 0.02)
+                        );
+
+                        if (improved) {
+                            cleanupInputPath = ensemblePath;
+                            leakageForCleanupTuning = afterLeak;
+                            enhancementNotes.push(
+                                `Vocal ensemble applied (${path.basename(sourcePath)} + ${altCandidate.method}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, corr=${ensembleSummary.avgInterCandidateCorrelation.toFixed(3)}, w=${ensembleSummary.avgPrimaryWeight.toFixed(2)}/${ensembleSummary.avgSecondaryWeight.toFixed(2)}).`,
+                            );
+                        } else {
+                            try { if (fs.existsSync(ensemblePath)) fs.unlinkSync(ensemblePath); } catch {}
+                            enhancementNotes.push(
+                                `Vocal ensemble not adopted (${altCandidate.method}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}).`,
+                            );
+                        }
+                    } catch (error) {
+                        try { if (fs.existsSync(ensemblePath)) fs.unlinkSync(ensemblePath); } catch {}
+                        enhancementNotes.push(`Vocal ensemble skipped (${error instanceof Error ? error.message : String(error)}).`);
+                    }
+                }
+            }
+        }
+
+        if (analysisPrepared && preparedAccMonoPath && fs.existsSync(preparedAccMonoPath)) {
+                const debleedPath = path.join(enhancedDir, `vocal_debleed_ref_${stamp}.wav`);
+                try {
+                    const beforeMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(preparedVocalMonoPath);
+                    const beforeLeak = SeparationQualityLibrary.estimateLeakageCorrelation(
+                        preparedVocalMonoPath,
+                        preparedAccMonoPath,
+                    );
+                    const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
+
+                    const debleedSummary = SeparationQualityLibrary.reduceBleedWithReferenceMonoPcm16Wav(
+                        preparedVocalMonoPath,
+                        preparedAccMonoPath,
+                        debleedPath,
+                    );
+
+                    const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(debleedPath);
+                    const afterLeak = SeparationQualityLibrary.estimateLeakageCorrelation(
+                        debleedPath,
+                        preparedAccMonoPath,
+                    );
+                    const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
+                    leakageForCleanupTuning = afterLeak;
+
+                    const improved = (
+                        afterScore.score >= beforeScore.score + 1.5
+                        || afterLeak <= beforeLeak - 0.03
+                        || (afterScore.score > beforeScore.score && afterMetrics.highBandRatio <= beforeMetrics.highBandRatio)
+                    );
+
+                    if (improved) {
+                        cleanupInputPath = debleedPath;
+                        enhancementNotes.push(
+                            `Reference de-bleed applied (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, avgGain=${debleedSummary.avgAbsLeakGain.toFixed(3)}).`,
+                        );
+                    } else {
+                        try { if (fs.existsSync(debleedPath)) fs.unlinkSync(debleedPath); } catch {}
+                        enhancementNotes.push(
+                            `Reference de-bleed not adopted (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}).`,
+                        );
+                    }
+                } catch (error) {
+                    enhancementNotes.push(`Reference de-bleed skipped (${error instanceof Error ? error.message : String(error)}).`);
+                }
+        }
+
+        if (preparedAccMonoPath && fs.existsSync(preparedAccMonoPath) && fs.existsSync(cleanupInputPath)) {
+            const musicOnlyTrimPath = path.join(enhancedDir, `vocal_music_only_removed_${stamp}.wav`);
+            try {
+                let musicRemovalInputPath = cleanupInputPath;
+                if (musicRemovalInputPath === sourcePath && analysisPrepared) {
+                    // Demucs/UVR outputs may be float WAV. Use the pre-rendered mono PCM16 version for
+                    // reference-based music-only trimming when no prior de-bleed artifact was adopted.
+                    musicRemovalInputPath = preparedVocalMonoPath;
+                }
+
+                if (!fs.existsSync(musicRemovalInputPath)) {
+                    throw new Error(`Music-only removal input not found: ${musicRemovalInputPath}`);
+                }
+
+                const beforeMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(musicRemovalInputPath);
+                const beforeLeak = SeparationQualityLibrary.estimateLeakageCorrelation(musicRemovalInputPath, preparedAccMonoPath);
+                const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
+                const trimSummary = SeparationQualityLibrary.removeMusicOnlySectionsWithReferenceMonoPcm16Wav(
+                    musicRemovalInputPath,
+                    preparedAccMonoPath,
+                    musicOnlyTrimPath,
+                );
+                const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(musicOnlyTrimPath);
+                const afterLeak = SeparationQualityLibrary.estimateLeakageCorrelation(musicOnlyTrimPath, preparedAccMonoPath);
+                const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
+
+                const removedEnough = trimSummary.removedDurationMs >= 500;
+                const outputStillUsable = trimSummary.outputDurationMs >= 15_000
+                    && trimSummary.outputDurationMs >= Math.round(trimSummary.outputDurationMs + trimSummary.removedDurationMs > 0
+                        ? (trimSummary.outputDurationMs + trimSummary.removedDurationMs) * 0.18
+                        : 15_000);
+                const improved = outputStillUsable && (
+                    afterScore.score >= beforeScore.score + 1.0
+                    || afterLeak <= beforeLeak - 0.025
+                    || (removedEnough && afterScore.score >= beforeScore.score - 1.0)
+                );
+
+                if (improved) {
+                    if (cleanupInputPath !== sourcePath) {
+                        try { if (fs.existsSync(cleanupInputPath)) fs.unlinkSync(cleanupInputPath); } catch {}
+                    }
+                    cleanupInputPath = musicOnlyTrimPath;
+                    leakageForCleanupTuning = afterLeak;
+                    enhancementNotes.push(
+                        `Music-only section removal applied (removed ${trimSummary.removedDurationMs}ms in ${trimSummary.removedSegments} segments, output ${trimSummary.outputDurationMs}ms, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}).`,
+                    );
+                } else {
+                    try { if (fs.existsSync(musicOnlyTrimPath)) fs.unlinkSync(musicOnlyTrimPath); } catch {}
+                    enhancementNotes.push(
+                        `Music-only section removal not adopted (removed ${trimSummary.removedDurationMs}ms, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}).`,
+                    );
+                }
+            } catch (error) {
+                enhancementNotes.push(`Music-only section removal skipped (${error instanceof Error ? error.message : String(error)}).`);
+                try { if (fs.existsSync(musicOnlyTrimPath)) fs.unlinkSync(musicOnlyTrimPath); } catch {}
+            }
+        }
+
+        const analysisMonoPath = cleanupInputPath !== sourcePath
+            ? cleanupInputPath
+            : (analysisPrepared ? preparedVocalMonoPath : path.join(analysisDir, `vocal_enhance_input_${stamp}.wav`));
+        const analysisReady = (
+            (cleanupInputPath !== sourcePath && fs.existsSync(analysisMonoPath))
+            || (cleanupInputPath === sourcePath && analysisPrepared)
+            || await this.renderAnalysisMonoPcm16(
+                ffmpegTools.ffmpegPath,
+                cleanupInputPath,
+                analysisMonoPath,
+            )
         );
-        if (analysisPrepared) {
+        if (analysisReady) {
             try {
                 const metrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(analysisMonoPath);
                 filters = SeparationQualityLibrary.buildAdaptiveFilterChain(metrics);
+                const lowBleedRisk = (
+                    metrics.lowBandRatio > 0.33
+                    || (typeof leakageForCleanupTuning === 'number' && leakageForCleanupTuning > 0.16)
+                );
+                if (lowBleedRisk) {
+                    const extraHighpassHz = Math.max(
+                        100,
+                        Math.min(
+                            220,
+                            Math.round(
+                                105
+                                + Math.max(0, metrics.lowBandRatio - 0.28) * 320
+                                + Math.max(0, (leakageForCleanupTuning ?? 0) - 0.12) * 220,
+                            ),
+                        ),
+                    );
+                    filters = [
+                        `highpass=f=${extraHighpassHz}:poles=2`,
+                        'agate=threshold=0.010:ratio=2.5:attack=8:release=120:makeup=1',
+                        filters,
+                    ].join(',');
+                    enhancementNotes.push(
+                        `Low-end bleed guard enabled (extra highpass=${extraHighpassHz}Hz${typeof leakageForCleanupTuning === 'number' ? `, leakage=${leakageForCleanupTuning.toFixed(3)}` : ''}).`,
+                    );
+                }
                 metricsSummary = `Adaptive cleanup tuned from analysis (rms=${metrics.rmsDb.toFixed(2)}dB, low=${metrics.lowBandRatio.toFixed(2)}, high=${metrics.highBandRatio.toFixed(2)}, speech=${metrics.speechActivityRatio.toFixed(2)}).`;
             } catch {
                 // Keep default filters when analysis fails.
@@ -2199,7 +2466,7 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
 
         let result = await this.runCommand(ffmpegTools.ffmpegPath, [
             '-y',
-            '-i', sourcePath,
+            '-i', cleanupInputPath,
             '-vn',
             '-af', filters,
             '-ar', '44100',
@@ -2210,7 +2477,7 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         if ((!result.success || !fs.existsSync(enhancedPath)) && filters !== defaultFilters) {
             result = await this.runCommand(ffmpegTools.ffmpegPath, [
                 '-y',
-                '-i', sourcePath,
+                '-i', cleanupInputPath,
                 '-vn',
                 '-af', defaultFilters,
                 '-ar', '44100',
@@ -2229,8 +2496,9 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             vocalWavPath: enhancedPath,
             warning: [
                 ffmpegTools.warning,
+                ...enhancementNotes,
                 metricsSummary || undefined,
-                'Applied vocal cleanup (adaptive high/low pass + FFT denoise + dynamic normalize + limiter).',
+                'Applied vocal cleanup (reference de-bleed + adaptive cleanup + denoise + dynamic normalize + limiter).',
             ].filter(Boolean).join(' '),
         };
     }

@@ -683,6 +683,7 @@ const VoiceStudioScreen: React.FC = () => {
     const [rvcTestSpectralDenoise, setRvcTestSpectralDenoise] = useState(false);
     const [rvcTestSpectralStrength, setRvcTestSpectralStrength] = useState(0.62);
     const [rvcTestSpectralFloor, setRvcTestSpectralFloor] = useState(0.10);
+    const [rvcAdvancedUiSettingsHydrated, setRvcAdvancedUiSettingsHydrated] = useState(false);
     const [rvcTestCallRelayEnabled, setRvcTestCallRelayEnabled] = useState(false);
     const [selectedRvcTestCallOutputDeviceId, setSelectedRvcTestCallOutputDeviceId] = useState('');
     const [rvcTestChunkMs, setRvcTestChunkMs] = useState(1200);
@@ -2391,10 +2392,15 @@ const VoiceStudioScreen: React.FC = () => {
             setRvcResampleSr(clampInt(Number(parsed?.resampleSr), 0, 192000, 0));
         } catch {
             // Ignore corrupted persisted UI settings.
+        } finally {
+            setRvcAdvancedUiSettingsHydrated(true);
         }
     }, []);
 
     useEffect(() => {
+        if (!rvcAdvancedUiSettingsHydrated) {
+            return;
+        }
         try {
             const payload: StoredRvcAdvancedUiSettings = {
                 speakerId: clampInt(rvcSpeakerId, 0, 127, 0),
@@ -2410,6 +2416,7 @@ const VoiceStudioScreen: React.FC = () => {
             // Ignore storage failures.
         }
     }, [
+        rvcAdvancedUiSettingsHydrated,
         rvcSpeakerId,
         rvcTranspose,
         rvcIndexRate,
@@ -4113,6 +4120,9 @@ const VoiceStudioScreen: React.FC = () => {
                         lastAudioUrl = await readAudioAsDataUrl(res.wavPath);
                     }
                     addLog(`RVC conversion complete [${i + 1}/${total}]${res.wavPath ? ': ' + res.wavPath : ''}`);
+                    if (res.archivedPath) {
+                        addLog(`RVC archive saved: ${res.archivedPath}`);
+                    }
                     if (res.warning) {
                         addLog(`RVC quality safeguard: ${res.warning}`);
                     }

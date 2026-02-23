@@ -1103,7 +1103,10 @@ export class VoicePipelineService {
                     }
 
                     const rvcStarted = Date.now();
-                    const rvcResult = await this.rvc.convert(params.rvc);
+                    const rvcResult = await this.rvc.convert({
+                        ...params.rvc,
+                        autoHighPitchQualityProtect: params.rvc?.autoHighPitchQualityProtect ?? true,
+                    });
 
                     if (!rvcResult.success) {
                         return {
@@ -1113,6 +1116,12 @@ export class VoicePipelineService {
                                 message: rvcResult.error?.message || 'RVC conversion failed',
                             },
                         };
+                    }
+                    if (rvcResult.warning) {
+                        console.log('[VoicePipeline][RVC]', rvcResult.warning);
+                    }
+                    if (rvcResult.archivedPath) {
+                        console.log('[VoicePipeline][RVC] archived:', rvcResult.archivedPath);
                     }
 
                     const enhanced = this.applyAudioEnhancements(
@@ -1183,6 +1192,7 @@ export class VoicePipelineService {
                         ...(params.rvc || {}),
                         inputPath: rvcInputPath,
                         inputBase64: rvcInputBase64,
+                        autoHighPitchQualityProtect: params.rvc?.autoHighPitchQualityProtect ?? true,
                     });
 
                     if (!rvcResult.success) {
@@ -1194,6 +1204,12 @@ export class VoicePipelineService {
                                 message: rvcResult.error?.message || 'RVC stage failed',
                             },
                         };
+                    }
+                    if (rvcResult.warning) {
+                        console.log('[VoicePipeline][RVC]', rvcResult.warning);
+                    }
+                    if (rvcResult.archivedPath) {
+                        console.log('[VoicePipeline][RVC] archived:', rvcResult.archivedPath);
                     }
 
                     const enhanced = this.applyAudioEnhancements(

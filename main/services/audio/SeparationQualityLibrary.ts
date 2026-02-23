@@ -96,6 +96,40 @@ export interface SeparationVocalEnsembleSummary {
     outputDurationMs: number;
 }
 
+export interface SeparationMixtureReprojectionSummary {
+    frameCount: number;
+    estimatedLagSamples: number;
+    estimatedLagMs: number;
+    avgVocalGain: number;
+    avgAccompanimentGain: number;
+    avgVocalResidualWeight: number;
+    avgReconErrorBefore: number;
+    avgReconErrorAfter: number;
+    bgmOnlySuppressedFrames: number;
+    lowBleedGuardFrames: number;
+    outputDurationMs: number;
+}
+
+export interface SeparationSubbandReprojectionSummary {
+    frameCount: number;
+    estimatedLagSamples: number;
+    estimatedLagMs: number;
+    avgLowMask: number;
+    avgMidMask: number;
+    avgHighMask: number;
+    bgmOnlySuppressedFrames: number;
+    lowBleedGuardFrames: number;
+    outputDurationMs: number;
+}
+
+export interface SeparationMixtureConsistencyEstimate {
+    lagSamples: number;
+    lagMs: number;
+    normalizedError: number;
+    lowBandResidualRatio: number;
+    sumCorrelation: number;
+}
+
 export class SeparationQualityLibrary {
     static analyzeMonoPcm16Wav(filePath: string): SeparationStemQualityMetrics {
         const parsed = this.parseMonoPcm16Wav(filePath);
@@ -244,6 +278,93 @@ export class SeparationQualityLibrary {
         return this.roundNumber(Math.abs(correlation), 6);
     }
 
+    static estimateMixtureConsistencyMonoPcm16Wav(
+        mixturePath: string,
+        vocalPath: string,
+        accompanimentPath: string,
+    ): SeparationMixtureConsistencyEstimate {
+        const mix = this.parseMonoPcm16Wav(mixturePath);
+        const vocal = this.parseMonoPcm16Wav(vocalPath);
+        const accompaniment = this.parseMonoPcm16Wav(accompanimentPath);
+        if (mix.sampleRate !== vocal.sampleRate || mix.sampleRate !== accompaniment.sampleRate) {
+            throw new Error(`Sample rate mismatch for mixture consistency: mix=${mix.sampleRate}, vocal=${vocal.sampleRate}, accompaniment=${accompaniment.sampleRate}`);
+        }
+
+        const maxLag = this.clampInt(Math.round(mix.sampleRate * 0.12), 256, 8192, 4096);
+        const lagSamples = this.estimateMixtureLagSamples(mix.samples, vocal.samples, accompaniment.samples, maxLag);
+        const mixStart = lagSamples < 0 ? -lagSamples : 0;
+        const stemStart = lagSamples > 0 ? lagSamples : 0;
+        const n = Math.min(
+            mix.samples.length - mixStart,
+            vocal.samples.length - stemStart,
+            accompaniment.samples.length - stemStart,
+        );
+        if (n < 2048) {
+            return {
+                lagSamples,
+                lagMs: this.roundNumber((lagSamples / mix.sampleRate) * 1000, 2),
+                normalizedError: 1,
+                lowBandResidualRatio: 1,
+                sumCorrelation: 0,
+            };
+        }
+
+        const sampleCap = Math.min(n, mix.sampleRate * 180); // cap at ~3 min for analysis cost
+        const analysisStart = Math.max(0, Math.floor((n - sampleCap) / 2));
+        const stride = Math.max(1, Math.floor(sampleCap / 220000));
+        const alpha = 1 - Math.exp((-2 * Math.PI * 180) / mix.sampleRate);
+        const alphaStep = 1 - Math.pow(1 - alpha, stride);
+        let xSq = 0;
+        let ySq = 0;
+        let eSq = 0;
+        let xy = 0;
+        let lowX = 0;
+        let lowE = 0;
+        let lowXSq = 0;
+        let lowESq = 0;
+        let count = 0;
+        for (let j = analysisStart; j < analysisStart + sampleCap; j += stride) {
+            const mi = mixStart + j;
+            const si = stemStart + j;
+            const x = mix.samples[mi] / INT16_MAX;
+            const y = (vocal.samples[si] + accompaniment.samples[si]) / INT16_MAX;
+            const e = x - y;
+            xSq += x * x;
+            ySq += y * y;
+            eSq += e * e;
+            xy += x * y;
+
+            lowX += alphaStep * (x - lowX);
+            lowE += alphaStep * (e - lowE);
+            lowXSq += lowX * lowX;
+            lowESq += lowE * lowE;
+            count += 1;
+        }
+
+        if (count < 64 || xSq <= 1e-10) {
+            return {
+                lagSamples,
+                lagMs: this.roundNumber((lagSamples / mix.sampleRate) * 1000, 2),
+                normalizedError: 1,
+                lowBandResidualRatio: 1,
+                sumCorrelation: 0,
+            };
+        }
+
+        const rmsX = Math.sqrt(xSq / count);
+        const rmsE = Math.sqrt(eSq / count);
+        const lowRmsX = Math.sqrt(lowXSq / Math.max(1, count));
+        const lowRmsE = Math.sqrt(lowESq / Math.max(1, count));
+        const corr = (xSq > 1e-10 && ySq > 1e-10) ? (xy / Math.sqrt(xSq * ySq)) : 0;
+        return {
+            lagSamples,
+            lagMs: this.roundNumber((lagSamples / mix.sampleRate) * 1000, 2),
+            normalizedError: this.roundNumber(rmsE / Math.max(1e-8, rmsX), 5),
+            lowBandResidualRatio: this.roundNumber(lowRmsE / Math.max(1e-8, lowRmsX), 5),
+            sumCorrelation: this.roundNumber(Math.abs(corr), 5),
+        };
+    }
+
     static scoreFromMetrics(
         metrics: SeparationStemQualityMetrics,
         leakageCorrelation?: number,
@@ -281,9 +402,17 @@ export class SeparationQualityLibrary {
             notes.push('spiky_dynamics');
         }
 
+        if (metrics.lowBandRatio > 0.28) {
+            score -= Math.min(6, (metrics.lowBandRatio - 0.28) * 35);
+            notes.push('low_bed');
+        }
         if (metrics.lowBandRatio > 0.36) {
             score -= Math.min(16, (metrics.lowBandRatio - 0.36) * 90);
             notes.push('low_rumble');
+        }
+        if (metrics.highBandRatio > 0.58) {
+            score -= Math.min(5, (metrics.highBandRatio - 0.58) * 20);
+            notes.push('high_residue');
         }
         if (metrics.highBandRatio > 0.75) {
             score -= Math.min(14, (metrics.highBandRatio - 0.75) * 50);
@@ -303,6 +432,10 @@ export class SeparationQualityLibrary {
         }
 
         if (typeof leakageCorrelation === 'number') {
+            if (leakageCorrelation > 0.10) {
+                score -= Math.min(8, (leakageCorrelation - 0.10) * 20);
+                notes.push('bleed_residue');
+            }
             if (leakageCorrelation > 0.28) {
                 score -= Math.min(22, (leakageCorrelation - 0.28) * 85);
                 notes.push('high_bleed');
@@ -1014,6 +1147,645 @@ export class SeparationQualityLibrary {
         };
     }
 
+    static refineWithOriginalMixtureMonoPcm16Wav(
+        mixturePath: string,
+        vocalPath: string,
+        accompanimentPath: string,
+        outputVocalPath: string,
+        outputAccompanimentPath?: string,
+    ): SeparationMixtureReprojectionSummary {
+        const mix = this.parseMonoPcm16Wav(mixturePath);
+        const vocal = this.parseMonoPcm16Wav(vocalPath);
+        const accompaniment = this.parseMonoPcm16Wav(accompanimentPath);
+        if (mix.sampleRate !== vocal.sampleRate || mix.sampleRate !== accompaniment.sampleRate) {
+            throw new Error(`Sample rate mismatch for mixture reprojection: mix=${mix.sampleRate}, vocal=${vocal.sampleRate}, accompaniment=${accompaniment.sampleRate}`);
+        }
+
+        const stemLength = Math.min(vocal.samples.length, accompaniment.samples.length);
+        if (stemLength < 2048 || mix.samples.length < 2048) {
+            fs.copyFileSync(vocalPath, outputVocalPath);
+            if (outputAccompanimentPath) {
+                fs.copyFileSync(accompanimentPath, outputAccompanimentPath);
+            }
+            return {
+                frameCount: 0,
+                estimatedLagSamples: 0,
+                estimatedLagMs: 0,
+                avgVocalGain: 1,
+                avgAccompanimentGain: 1,
+                avgVocalResidualWeight: 0.5,
+                avgReconErrorBefore: 0,
+                avgReconErrorAfter: 0,
+                bgmOnlySuppressedFrames: 0,
+                lowBleedGuardFrames: 0,
+                outputDurationMs: vocal.durationMs,
+            };
+        }
+
+        const maxLag = this.clampInt(Math.round(mix.sampleRate * 0.12), 256, 8192, 4096);
+        const lagSamples = this.estimateMixtureLagSamples(mix.samples, vocal.samples, accompaniment.samples, maxLag);
+        const mixStart = lagSamples < 0 ? -lagSamples : 0;
+        const stemStart = lagSamples > 0 ? lagSamples : 0;
+        const n = Math.min(
+            mix.samples.length - mixStart,
+            vocal.samples.length - stemStart,
+            accompaniment.samples.length - stemStart,
+        );
+        if (n < 2048) {
+            fs.copyFileSync(vocalPath, outputVocalPath);
+            if (outputAccompanimentPath) {
+                fs.copyFileSync(accompanimentPath, outputAccompanimentPath);
+            }
+            return {
+                frameCount: 0,
+                estimatedLagSamples: lagSamples,
+                estimatedLagMs: this.roundNumber((lagSamples / mix.sampleRate) * 1000, 2),
+                avgVocalGain: 1,
+                avgAccompanimentGain: 1,
+                avgVocalResidualWeight: 0.5,
+                avgReconErrorBefore: 0,
+                avgReconErrorAfter: 0,
+                bgmOnlySuppressedFrames: 0,
+                lowBleedGuardFrames: 0,
+                outputDurationMs: vocal.durationMs,
+            };
+        }
+
+        const sr = mix.sampleRate;
+        const frameLen = this.clampInt(Math.round(sr * 0.032), 1024, 4096, 2048);
+        const hop = this.clampInt(Math.round(sr * 0.012), 256, frameLen, 512);
+        const frameCount = Math.max(1, Math.floor((n - frameLen) / hop) + 1);
+        const centers = new Int32Array(frameCount);
+        const vocalGainFrames = new Float32Array(frameCount);
+        const accGainFrames = new Float32Array(frameCount);
+        const vocalResidualWeightFrames = new Float32Array(frameCount);
+        const suppressVocalFrames = new Float32Array(frameCount);
+        const lowBleedCancelFrames = new Float32Array(frameCount);
+
+        let vocalGainSum = 0;
+        let accGainSum = 0;
+        let vocalWeightSum = 0;
+        let bgmOnlySuppressedFrames = 0;
+        let lowBleedGuardFrames = 0;
+        let reconErrBeforeSqSum = 0;
+        let reconErrAfterSqSumApprox = 0;
+
+        for (let fi = 0; fi < frameCount; fi += 1) {
+            const start = fi * hop;
+            const end = Math.min(n, start + frameLen);
+            const center = Math.min(n - 1, start + Math.floor((end - start) / 2));
+            centers[fi] = center;
+
+            let vv = 0;
+            let aa = 0;
+            let xx = 0;
+            let xv = 0;
+            let xa = 0;
+            let va = 0;
+            let vPeak = 0;
+            let aPeak = 0;
+            let xPeak = 0;
+            let lowV = 0;
+            let lowA = 0;
+            let lowX = 0;
+            let lowVSq = 0;
+            let lowASq = 0;
+            let lowXSq = 0;
+            let lowVA = 0;
+            let prevV = vocal.samples[stemStart + start] / INT16_MAX;
+            let zcV = 0;
+
+            for (let j = start; j < end; j += 1) {
+                const mi = mixStart + j;
+                const si = stemStart + j;
+                const x = mix.samples[mi] / INT16_MAX;
+                const v = vocal.samples[si] / INT16_MAX;
+                const a = accompaniment.samples[si] / INT16_MAX;
+                xx += x * x;
+                vv += v * v;
+                aa += a * a;
+                xv += x * v;
+                xa += x * a;
+                va += v * a;
+                const ax = Math.abs(x);
+                const av = Math.abs(v);
+                const aaAbs = Math.abs(a);
+                if (ax > xPeak) xPeak = ax;
+                if (av > vPeak) vPeak = av;
+                if (aaAbs > aPeak) aPeak = aaAbs;
+                lowV += (2 * Math.PI * 180 / sr) * (v - lowV);
+                lowA += (2 * Math.PI * 180 / sr) * (a - lowA);
+                lowX += (2 * Math.PI * 180 / sr) * (x - lowX);
+                lowVSq += lowV * lowV;
+                lowASq += lowA * lowA;
+                lowXSq += lowX * lowX;
+                lowVA += lowV * lowA;
+                if (j > start && ((v >= 0 && prevV < 0) || (v < 0 && prevV >= 0))) {
+                    zcV += 1;
+                }
+                prevV = v;
+            }
+
+            const len = Math.max(1, end - start);
+            const vRms = Math.sqrt(vv / len);
+            const aRms = Math.sqrt(aa / len);
+            const xRms = Math.sqrt(xx / len);
+            const lowVRms = Math.sqrt(lowVSq / len);
+            const lowARms = Math.sqrt(lowASq / len);
+            const lowXRms = Math.sqrt(lowXSq / len);
+            const zcrV = len > 1 ? zcV / (len - 1) : 0;
+            const corrVA = (vv > 1e-12 && aa > 1e-12) ? Math.abs(va) / Math.sqrt(vv * aa) : 0;
+            const corrLowVA = (lowVSq > 1e-12 && lowASq > 1e-12) ? Math.abs(lowVA) / Math.sqrt(lowVSq * lowASq) : 0;
+
+            let gV = vv > 1e-10 ? (xv / vv) : 1;
+            let gA = aa > 1e-10 ? (xa / aa) : 1;
+            gV = this.clampNumber(gV, 0.60, 1.45, 1);
+            gA = this.clampNumber(gA, 0.60, 1.45, 1);
+
+            const dominance = vRms / (aRms + 1e-9);
+            const voiceLike = (vRms > Math.max(0.0045, xRms * 0.10)) && zcrV >= 0.005 && zcrV <= 0.40;
+            const likelyBgmOnly = aRms > 0.008 && (
+                (!voiceLike && dominance < 0.86)
+                || (dominance < 0.62 && corrVA > 0.16)
+                || (dominance < 0.72 && lowVRms / (lowARms + 1e-9) < 0.75 && corrLowVA > 0.22)
+            );
+            let suppressVocal = 1;
+            if (likelyBgmOnly) {
+                const strength = this.clampNumber(
+                    (0.90 - dominance) * 1.25
+                    + Math.max(0, corrVA - 0.14) * 1.35
+                    + Math.max(0, corrLowVA - 0.18) * 1.1,
+                    0,
+                    1.2,
+                    0,
+                );
+                suppressVocal = this.clampNumber(1 - (0.62 * strength), 0.18, 1, 1);
+                if (suppressVocal < 0.98) bgmOnlySuppressedFrames += 1;
+            }
+
+            const lowBleedHeavy = aRms > 0.009
+                && (lowVRms / (lowARms + 1e-9)) < 0.82
+                && corrLowVA > 0.24
+                && lowXRms > 0.006;
+            let lowBleedCancel = 0;
+            if (lowBleedHeavy) {
+                lowBleedCancel = this.clampNumber(
+                    0.06
+                    + Math.max(0, 0.82 - (lowVRms / (lowARms + 1e-9))) * 0.40
+                    + Math.max(0, corrLowVA - 0.24) * 0.28,
+                    0,
+                    0.28,
+                    0,
+                );
+                if (lowBleedCancel > 0.01) lowBleedGuardFrames += 1;
+            }
+
+            const baseWeight = Math.pow(Math.abs(gV) * vRms, 1.25)
+                / (Math.pow(Math.abs(gV) * vRms, 1.25) + Math.pow(Math.abs(gA) * aRms, 1.25) + 1e-9);
+            const vocalResidualWeight = this.clampNumber(
+                (baseWeight * suppressVocal) + (voiceLike ? 0.08 : -0.04),
+                0.03,
+                0.97,
+                0.5,
+            );
+
+            // Approximate reconstruction error after reprojection (before sample-level low-end guard)
+            const reconBefore = xRms > 1e-7
+                ? Math.sqrt(Math.max(0, xx + vv + aa - (2 * xv) - (2 * xa) + (2 * va)) / len)
+                : 0;
+            const reconAfterApprox = xRms * 0.02; // residual redistribution enforces near mixture-consistency
+
+            vocalGainFrames[fi] = gV;
+            accGainFrames[fi] = gA;
+            vocalResidualWeightFrames[fi] = vocalResidualWeight;
+            suppressVocalFrames[fi] = suppressVocal;
+            lowBleedCancelFrames[fi] = lowBleedCancel;
+            vocalGainSum += gV;
+            accGainSum += gA;
+            vocalWeightSum += vocalResidualWeight;
+            reconErrBeforeSqSum += reconBefore * reconBefore;
+            reconErrAfterSqSumApprox += reconAfterApprox * reconAfterApprox;
+        }
+
+        // Smooth controls to avoid zipper noise.
+        const gVSmooth = new Float32Array(frameCount);
+        const gASmooth = new Float32Array(frameCount);
+        const wVSmooth = new Float32Array(frameCount);
+        const supSmooth = new Float32Array(frameCount);
+        const lowCancelSmooth = new Float32Array(frameCount);
+        for (let i = 0; i < frameCount; i += 1) {
+            const i0 = Math.max(0, i - 1);
+            const i1 = i;
+            const i2 = Math.min(frameCount - 1, i + 1);
+            gVSmooth[i] = (vocalGainFrames[i0] * 0.18) + (vocalGainFrames[i1] * 0.64) + (vocalGainFrames[i2] * 0.18);
+            gASmooth[i] = (accGainFrames[i0] * 0.18) + (accGainFrames[i1] * 0.64) + (accGainFrames[i2] * 0.18);
+            wVSmooth[i] = (vocalResidualWeightFrames[i0] * 0.20) + (vocalResidualWeightFrames[i1] * 0.60) + (vocalResidualWeightFrames[i2] * 0.20);
+            supSmooth[i] = (suppressVocalFrames[i0] * 0.20) + (suppressVocalFrames[i1] * 0.60) + (suppressVocalFrames[i2] * 0.20);
+            lowCancelSmooth[i] = (lowBleedCancelFrames[i0] * 0.20) + (lowBleedCancelFrames[i1] * 0.60) + (lowBleedCancelFrames[i2] * 0.20);
+        }
+
+        const outVocal = new Int16Array(vocal.samples.length);
+        const outAcc = new Int16Array(accompaniment.samples.length);
+        outVocal.set(vocal.samples);
+        outAcc.set(accompaniment.samples);
+
+        let frameIdx = 0;
+        let lowVState = 0;
+        let lowAState = 0;
+        let reconErrAfterSqExact = 0;
+        let exactCount = 0;
+        const lowAlpha = 1 - Math.exp((-2 * Math.PI * 180) / sr);
+        for (let j = 0; j < n; j += 1) {
+            while (frameIdx + 1 < frameCount && j > centers[frameIdx + 1]) {
+                frameIdx += 1;
+            }
+
+            let gV = gVSmooth[frameIdx];
+            let gA = gASmooth[frameIdx];
+            let wVFrame = wVSmooth[frameIdx];
+            let suppressVocal = supSmooth[frameIdx];
+            let lowCancel = lowCancelSmooth[frameIdx];
+            if (frameIdx + 1 < frameCount) {
+                const c0 = centers[frameIdx];
+                const c1 = centers[frameIdx + 1];
+                const t = c1 > c0 ? (j - c0) / (c1 - c0) : 0;
+                gV = (gVSmooth[frameIdx] * (1 - t)) + (gVSmooth[frameIdx + 1] * t);
+                gA = (gASmooth[frameIdx] * (1 - t)) + (gASmooth[frameIdx + 1] * t);
+                wVFrame = (wVSmooth[frameIdx] * (1 - t)) + (wVSmooth[frameIdx + 1] * t);
+                suppressVocal = (supSmooth[frameIdx] * (1 - t)) + (supSmooth[frameIdx + 1] * t);
+                lowCancel = (lowCancelSmooth[frameIdx] * (1 - t)) + (lowCancelSmooth[frameIdx + 1] * t);
+            }
+
+            const mi = mixStart + j;
+            const si = stemStart + j;
+            const x = mix.samples[mi] / INT16_MAX;
+            const v = vocal.samples[si] / INT16_MAX;
+            const a = accompaniment.samples[si] / INT16_MAX;
+            const v0 = v * gV;
+            const a0 = a * gA;
+            const residual = x - (v0 + a0);
+            const vPow = Math.pow(Math.abs(v0) + 1e-8, 1.20);
+            const aPow = Math.pow(Math.abs(a0) + 1e-8, 1.20);
+            let wV = vPow / (vPow + aPow + 1e-9);
+            wV = this.clampNumber((wV * 0.65) + (wVFrame * 0.35), 0.02, 0.98, 0.5);
+            let yV = (v0 * (0.60 + (0.40 * suppressVocal))) + (residual * wV);
+            let yA = x - yV;
+
+            if (lowCancel > 0.001) {
+                lowVState += lowAlpha * (yV - lowVState);
+                lowAState += lowAlpha * (yA - lowAState);
+                const corrSign = Math.sign(lowVState * lowAState);
+                if (corrSign > 0 && Math.abs(lowAState) > 0.003) {
+                    yV -= lowAState * lowCancel;
+                    yA = x - yV;
+                }
+            } else {
+                lowVState += lowAlpha * (yV - lowVState);
+                lowAState += lowAlpha * (yA - lowAState);
+            }
+
+            yV = Math.tanh(yV * 1.05) / Math.tanh(1.05);
+            yA = x - yV;
+            outVocal[si] = this.clampInt16(Math.round(yV * INT16_MAX));
+            outAcc[si] = this.clampInt16(Math.round(yA * INT16_MAX));
+
+            const reconAfter = x - (outVocal[si] / INT16_MAX + outAcc[si] / INT16_MAX);
+            reconErrAfterSqExact += reconAfter * reconAfter;
+            exactCount += 1;
+        }
+
+        this.writeMonoPcm16Wav(outputVocalPath, sr, outVocal);
+        if (outputAccompanimentPath) {
+            this.writeMonoPcm16Wav(outputAccompanimentPath, sr, outAcc);
+        }
+
+        return {
+            frameCount,
+            estimatedLagSamples: lagSamples,
+            estimatedLagMs: this.roundNumber((lagSamples / sr) * 1000, 2),
+            avgVocalGain: this.roundNumber(vocalGainSum / Math.max(1, frameCount), 4),
+            avgAccompanimentGain: this.roundNumber(accGainSum / Math.max(1, frameCount), 4),
+            avgVocalResidualWeight: this.roundNumber(vocalWeightSum / Math.max(1, frameCount), 4),
+            avgReconErrorBefore: this.roundNumber(Math.sqrt(reconErrBeforeSqSum / Math.max(1, frameCount)), 5),
+            avgReconErrorAfter: this.roundNumber(
+                exactCount > 0 ? Math.sqrt(reconErrAfterSqExact / exactCount) : Math.sqrt(reconErrAfterSqSumApprox / Math.max(1, frameCount)),
+                7,
+            ),
+            bgmOnlySuppressedFrames,
+            lowBleedGuardFrames,
+            outputDurationMs: Math.round((outVocal.length / sr) * 1000),
+        };
+    }
+
+    static refineWithOriginalMixtureSubbandMaskMonoPcm16Wav(
+        mixturePath: string,
+        vocalPath: string,
+        accompanimentPath: string,
+        outputVocalPath: string,
+        outputAccompanimentPath?: string,
+    ): SeparationSubbandReprojectionSummary {
+        const mix = this.parseMonoPcm16Wav(mixturePath);
+        const vocal = this.parseMonoPcm16Wav(vocalPath);
+        const accompaniment = this.parseMonoPcm16Wav(accompanimentPath);
+        if (mix.sampleRate !== vocal.sampleRate || mix.sampleRate !== accompaniment.sampleRate) {
+            throw new Error(`Sample rate mismatch for subband reprojection: mix=${mix.sampleRate}, vocal=${vocal.sampleRate}, accompaniment=${accompaniment.sampleRate}`);
+        }
+
+        const stemLength = Math.min(vocal.samples.length, accompaniment.samples.length);
+        if (stemLength < 2048 || mix.samples.length < 2048) {
+            fs.copyFileSync(vocalPath, outputVocalPath);
+            if (outputAccompanimentPath) fs.copyFileSync(accompanimentPath, outputAccompanimentPath);
+            return {
+                frameCount: 0,
+                estimatedLagSamples: 0,
+                estimatedLagMs: 0,
+                avgLowMask: 0.5,
+                avgMidMask: 0.5,
+                avgHighMask: 0.5,
+                bgmOnlySuppressedFrames: 0,
+                lowBleedGuardFrames: 0,
+                outputDurationMs: vocal.durationMs,
+            };
+        }
+
+        const sr = mix.sampleRate;
+        const maxLag = this.clampInt(Math.round(sr * 0.12), 256, 8192, 4096);
+        const lagSamples = this.estimateMixtureLagSamples(mix.samples, vocal.samples, accompaniment.samples, maxLag);
+        const mixStart = lagSamples < 0 ? -lagSamples : 0;
+        const stemStart = lagSamples > 0 ? lagSamples : 0;
+        const n = Math.min(
+            mix.samples.length - mixStart,
+            vocal.samples.length - stemStart,
+            accompaniment.samples.length - stemStart,
+        );
+        if (n < 2048) {
+            fs.copyFileSync(vocalPath, outputVocalPath);
+            if (outputAccompanimentPath) fs.copyFileSync(accompanimentPath, outputAccompanimentPath);
+            return {
+                frameCount: 0,
+                estimatedLagSamples: lagSamples,
+                estimatedLagMs: this.roundNumber((lagSamples / sr) * 1000, 2),
+                avgLowMask: 0.5,
+                avgMidMask: 0.5,
+                avgHighMask: 0.5,
+                bgmOnlySuppressedFrames: 0,
+                lowBleedGuardFrames: 0,
+                outputDurationMs: vocal.durationMs,
+            };
+        }
+
+        const frameLen = this.clampInt(Math.round(sr * 0.032), 1024, 4096, 2048);
+        const hop = this.clampInt(Math.round(sr * 0.012), 256, frameLen, 512);
+        const frameCount = Math.max(1, Math.floor((n - frameLen) / hop) + 1);
+        const centers = new Int32Array(frameCount);
+        const lowMasks = new Float32Array(frameCount);
+        const midMasks = new Float32Array(frameCount);
+        const highMasks = new Float32Array(frameCount);
+        const bgmSuppress = new Float32Array(frameCount);
+
+        const alphaLow = 1 - Math.exp((-2 * Math.PI * 180) / sr);
+        const alphaHighLp = 1 - Math.exp((-2 * Math.PI * 4200) / sr);
+        let lowMaskSum = 0;
+        let midMaskSum = 0;
+        let highMaskSum = 0;
+        let bgmOnlySuppressedFrames = 0;
+        let lowBleedGuardFrames = 0;
+
+        for (let fi = 0; fi < frameCount; fi += 1) {
+            const start = fi * hop;
+            const end = Math.min(n, start + frameLen);
+            const center = Math.min(n - 1, start + Math.floor((end - start) / 2));
+            centers[fi] = center;
+
+            let vSq = 0;
+            let aSq = 0;
+            let xSq = 0;
+            let va = 0;
+            let zcV = 0;
+            let prevV = vocal.samples[stemStart + start] / INT16_MAX;
+
+            let vLowState = 0;
+            let aLowState = 0;
+            let xLowState = 0;
+            let vHighLpState = 0;
+            let aHighLpState = 0;
+            let xHighLpState = 0;
+            let vLowSq = 0;
+            let aLowSq = 0;
+            let xLowSq = 0;
+            let vHighSq = 0;
+            let aHighSq = 0;
+            let xHighSq = 0;
+            let vLowA = 0;
+            let vHighA = 0;
+
+            for (let j = start; j < end; j += 1) {
+                const mi = mixStart + j;
+                const si = stemStart + j;
+                const x = mix.samples[mi] / INT16_MAX;
+                const v = vocal.samples[si] / INT16_MAX;
+                const a = accompaniment.samples[si] / INT16_MAX;
+                xSq += x * x;
+                vSq += v * v;
+                aSq += a * a;
+                va += v * a;
+
+                vLowState += alphaLow * (v - vLowState);
+                aLowState += alphaLow * (a - aLowState);
+                xLowState += alphaLow * (x - xLowState);
+                vHighLpState += alphaHighLp * (v - vHighLpState);
+                aHighLpState += alphaHighLp * (a - aHighLpState);
+                xHighLpState += alphaHighLp * (x - xHighLpState);
+                const vLow = vLowState;
+                const aLow = aLowState;
+                const xLow = xLowState;
+                const vHigh = v - vHighLpState;
+                const aHigh = a - aHighLpState;
+                const xHigh = x - xHighLpState;
+                vLowSq += vLow * vLow;
+                aLowSq += aLow * aLow;
+                xLowSq += xLow * xLow;
+                vHighSq += vHigh * vHigh;
+                aHighSq += aHigh * aHigh;
+                xHighSq += xHigh * xHigh;
+                vLowA += vLow * aLow;
+                vHighA += vHigh * aHigh;
+
+                if (j > start && ((v >= 0 && prevV < 0) || (v < 0 && prevV >= 0))) zcV += 1;
+                prevV = v;
+            }
+
+            const len = Math.max(1, end - start);
+            const vRms = Math.sqrt(vSq / len);
+            const aRms = Math.sqrt(aSq / len);
+            const xRms = Math.sqrt(xSq / len);
+            const vLowRms = Math.sqrt(vLowSq / len);
+            const aLowRms = Math.sqrt(aLowSq / len);
+            const xLowRms = Math.sqrt(xLowSq / len);
+            const vHighRms = Math.sqrt(vHighSq / len);
+            const aHighRms = Math.sqrt(aHighSq / len);
+            const xHighRms = Math.sqrt(xHighSq / len);
+            const vMidSq = Math.max(0, vSq - vLowSq - vHighSq);
+            const aMidSq = Math.max(0, aSq - aLowSq - aHighSq);
+            const xMidSq = Math.max(0, xSq - xLowSq - xHighSq);
+            const vMidRms = Math.sqrt(vMidSq / len);
+            const aMidRms = Math.sqrt(aMidSq / len);
+            const xMidRms = Math.sqrt(xMidSq / len);
+            const zcr = len > 1 ? zcV / (len - 1) : 0;
+            const dominance = vRms / (aRms + 1e-9);
+            const lowDominance = vLowRms / (aLowRms + 1e-9);
+            const corrVA = (vSq > 1e-12 && aSq > 1e-12) ? Math.abs(va) / Math.sqrt(vSq * aSq) : 0;
+            const corrLow = (vLowSq > 1e-12 && aLowSq > 1e-12) ? Math.abs(vLowA) / Math.sqrt(vLowSq * aLowSq) : 0;
+            const corrHigh = (vHighSq > 1e-12 && aHighSq > 1e-12) ? Math.abs(vHighA) / Math.sqrt(vHighSq * aHighSq) : 0;
+
+            const voiceLike = (vRms >= Math.max(0.0048, xRms * 0.10)) && zcr >= 0.005 && zcr <= 0.40;
+            const likelyBgmOnly = aRms > 0.0085 && (
+                (!voiceLike && dominance < 0.88)
+                || (lowDominance < 0.78 && corrLow > 0.18)
+                || (dominance < 0.68 && corrVA > 0.18)
+            );
+
+            const p = 1.28;
+            const vLowPow = Math.pow(vLowRms + 1e-8, p);
+            const aLowPow = Math.pow(aLowRms + 1e-8, p);
+            const vMidPow = Math.pow(vMidRms + 1e-8, p);
+            const aMidPow = Math.pow(aMidRms + 1e-8, p);
+            const vHighPow = Math.pow(vHighRms + 1e-8, p);
+            const aHighPow = Math.pow(aHighRms + 1e-8, p);
+
+            const lowBias = this.clampNumber(1.35 + Math.max(0, corrLow - 0.14) * 1.7 + Math.max(0, 0.95 - lowDominance) * 0.45, 1.05, 3.0, 1.35);
+            const midBias = this.clampNumber(1.05 + Math.max(0, corrVA - 0.12) * 0.60, 0.95, 1.9, 1.05);
+            const highBias = this.clampNumber(0.95 + Math.max(0, corrHigh - 0.12) * 0.45, 0.75, 1.7, 1.0);
+            let lowMask = vLowPow / (vLowPow + (aLowPow * lowBias) + 1e-9);
+            let midMask = vMidPow / (vMidPow + (aMidPow * midBias) + 1e-9);
+            let highMask = vHighPow / (vHighPow + (aHighPow * highBias) + 1e-9);
+
+            if (voiceLike) {
+                midMask = this.clampNumber(midMask + 0.05, 0.02, 0.98, midMask);
+                highMask = this.clampNumber(highMask + 0.04, 0.02, 0.98, highMask);
+            }
+
+            let suppress = 1;
+            if (likelyBgmOnly) {
+                const strength = this.clampNumber(
+                    (0.92 - dominance) * 1.15
+                    + Math.max(0, corrLow - 0.16) * 1.25
+                    + Math.max(0, 0.92 - lowDominance) * 0.55,
+                    0,
+                    1.3,
+                    0,
+                );
+                suppress = this.clampNumber(1 - (0.74 * strength), 0.12, 1, 1);
+                if (suppress < 0.98) bgmOnlySuppressedFrames += 1;
+            }
+
+            const lowBleedHeavy = aLowRms > 0.006
+                && xLowRms > 0.004
+                && lowDominance < 0.86
+                && corrLow > 0.20;
+            if (lowBleedHeavy) {
+                const lowPenalty = this.clampNumber(
+                    0.08 + Math.max(0, 0.86 - lowDominance) * 0.35 + Math.max(0, corrLow - 0.20) * 0.32,
+                    0.02,
+                    0.30,
+                    0.08,
+                );
+                lowMask = this.clampNumber(lowMask - lowPenalty, 0.02, 0.95, lowMask);
+                lowBleedGuardFrames += 1;
+            }
+
+            // If the mixture has very low vocal-like high band and strong accompaniment-like low band, be more conservative.
+            if (!voiceLike && xLowRms > xMidRms * 0.9 && xHighRms < xMidRms * 0.55) {
+                lowMask = this.clampNumber(lowMask * 0.82, 0.02, 0.95, lowMask);
+                midMask = this.clampNumber(midMask * 0.92, 0.02, 0.98, midMask);
+            }
+
+            lowMask = this.clampNumber(lowMask * (0.88 + (0.12 * suppress)), 0.01, 0.98, lowMask);
+            midMask = this.clampNumber(midMask * suppress, 0.01, 0.99, midMask);
+            highMask = this.clampNumber(highMask * (0.55 + (0.45 * suppress)), 0.01, 0.99, highMask);
+
+            lowMasks[fi] = lowMask;
+            midMasks[fi] = midMask;
+            highMasks[fi] = highMask;
+            bgmSuppress[fi] = suppress;
+            lowMaskSum += lowMask;
+            midMaskSum += midMask;
+            highMaskSum += highMask;
+        }
+
+        const lowMasksSmooth = new Float32Array(frameCount);
+        const midMasksSmooth = new Float32Array(frameCount);
+        const highMasksSmooth = new Float32Array(frameCount);
+        for (let i = 0; i < frameCount; i += 1) {
+            const i0 = Math.max(0, i - 1);
+            const i1 = i;
+            const i2 = Math.min(frameCount - 1, i + 1);
+            lowMasksSmooth[i] = (lowMasks[i0] * 0.18) + (lowMasks[i1] * 0.64) + (lowMasks[i2] * 0.18);
+            midMasksSmooth[i] = (midMasks[i0] * 0.18) + (midMasks[i1] * 0.64) + (midMasks[i2] * 0.18);
+            highMasksSmooth[i] = (highMasks[i0] * 0.18) + (highMasks[i1] * 0.64) + (highMasks[i2] * 0.18);
+        }
+
+        const outVocal = new Int16Array(vocal.samples.length);
+        const outAcc = new Int16Array(accompaniment.samples.length);
+        outVocal.set(vocal.samples);
+        outAcc.set(accompaniment.samples);
+
+        let frameIdx = 0;
+        let mixLowState = 0;
+        let mixHighLpState = 0;
+        for (let j = 0; j < n; j += 1) {
+            while (frameIdx + 1 < frameCount && j > centers[frameIdx + 1]) {
+                frameIdx += 1;
+            }
+
+            let lowMask = lowMasksSmooth[frameIdx];
+            let midMask = midMasksSmooth[frameIdx];
+            let highMask = highMasksSmooth[frameIdx];
+            if (frameIdx + 1 < frameCount) {
+                const c0 = centers[frameIdx];
+                const c1 = centers[frameIdx + 1];
+                const t = c1 > c0 ? (j - c0) / (c1 - c0) : 0;
+                lowMask = (lowMasksSmooth[frameIdx] * (1 - t)) + (lowMasksSmooth[frameIdx + 1] * t);
+                midMask = (midMasksSmooth[frameIdx] * (1 - t)) + (midMasksSmooth[frameIdx + 1] * t);
+                highMask = (highMasksSmooth[frameIdx] * (1 - t)) + (highMasksSmooth[frameIdx + 1] * t);
+            }
+
+            const mi = mixStart + j;
+            const si = stemStart + j;
+            const x = mix.samples[mi] / INT16_MAX;
+            mixLowState += alphaLow * (x - mixLowState);
+            mixHighLpState += alphaHighLp * (x - mixHighLpState);
+            const xLow = mixLowState;
+            const xHigh = x - mixHighLpState;
+            const xMid = x - xLow - xHigh;
+
+            let yV = (xLow * lowMask) + (xMid * midMask) + (xHigh * highMask);
+            // Blend a small amount of the original separated vocal to preserve fine articulation.
+            const vOrig = vocal.samples[si] / INT16_MAX;
+            yV = (yV * 0.88) + (vOrig * 0.12);
+            yV = Math.tanh(yV * 1.04) / Math.tanh(1.04);
+            const yA = x - yV;
+
+            outVocal[si] = this.clampInt16(Math.round(yV * INT16_MAX));
+            outAcc[si] = this.clampInt16(Math.round(yA * INT16_MAX));
+        }
+
+        this.writeMonoPcm16Wav(outputVocalPath, sr, outVocal);
+        if (outputAccompanimentPath) this.writeMonoPcm16Wav(outputAccompanimentPath, sr, outAcc);
+
+        return {
+            frameCount,
+            estimatedLagSamples: lagSamples,
+            estimatedLagMs: this.roundNumber((lagSamples / sr) * 1000, 2),
+            avgLowMask: this.roundNumber(lowMaskSum / Math.max(1, frameCount), 4),
+            avgMidMask: this.roundNumber(midMaskSum / Math.max(1, frameCount), 4),
+            avgHighMask: this.roundNumber(highMaskSum / Math.max(1, frameCount), 4),
+            bgmOnlySuppressedFrames,
+            lowBleedGuardFrames,
+            outputDurationMs: Math.round((outVocal.length / sr) * 1000),
+        };
+    }
+
     private static parseMonoPcm16Wav(filePath: string): ParsedMonoPcm16Wav {
         const source = fs.readFileSync(filePath);
         if (source.length < 44) {
@@ -1248,6 +2020,71 @@ export class SeparationQualityLibrary {
         if (value >= 12) return 0.999994;
         if (value <= -12) return 0.000006;
         return 1 / (1 + Math.exp(-value));
+    }
+
+    private static estimateMixtureLagSamples(
+        mixture: Int16Array,
+        vocal: Int16Array,
+        accompaniment: Int16Array,
+        maxLagSamples: number,
+    ): number {
+        const stemLen = Math.min(vocal.length, accompaniment.length);
+        const n = Math.min(mixture.length, stemLen);
+        if (n < 4096) {
+            return 0;
+        }
+        const scanLen = Math.min(n, 44100 * 18);
+        const startMix = Math.max(0, Math.floor((mixture.length - scanLen) / 2));
+        const startStem = Math.max(0, Math.floor((stemLen - scanLen) / 2));
+        const stride = Math.max(1, Math.floor(scanLen / 9000));
+        const scoreLag = (lag: number): number => {
+            let sumXY = 0;
+            let sumXX = 0;
+            let sumYY = 0;
+            let count = 0;
+            for (let j = 0; j < scanLen; j += stride) {
+                const mixIdx = startMix + j;
+                const stemIdx = startStem + j + lag;
+                if (mixIdx < 0 || mixIdx >= mixture.length || stemIdx < 0 || stemIdx >= stemLen) {
+                    continue;
+                }
+                const x = mixture[mixIdx] / INT16_MAX;
+                const y = (vocal[stemIdx] + accompaniment[stemIdx]) / INT16_MAX;
+                sumXY += x * y;
+                sumXX += x * x;
+                sumYY += y * y;
+                count += 1;
+            }
+            if (count < 128 || sumXX <= 1e-9 || sumYY <= 1e-9) {
+                return -Infinity;
+            }
+            const corr = sumXY / Math.sqrt(sumXX * sumYY);
+            const lagPenalty = Math.abs(lag) * 0.00002;
+            return corr - lagPenalty;
+        };
+
+        let bestLag = 0;
+        let bestScore = -Infinity;
+        const coarseStep = Math.max(4, Math.min(32, Math.round(maxLagSamples / 96)));
+        for (let lag = -maxLagSamples; lag <= maxLagSamples; lag += coarseStep) {
+            const score = scoreLag(lag);
+            if (score > bestScore) {
+                bestScore = score;
+                bestLag = lag;
+            }
+        }
+
+        const fineRadius = Math.max(coarseStep * 2, 12);
+        const fineStart = Math.max(-maxLagSamples, bestLag - fineRadius);
+        const fineEnd = Math.min(maxLagSamples, bestLag + fineRadius);
+        for (let lag = fineStart; lag <= fineEnd; lag += 1) {
+            const score = scoreLag(lag);
+            if (score > bestScore) {
+                bestScore = score;
+                bestLag = lag;
+            }
+        }
+        return bestLag;
     }
 
     private static clampNumber(value: number, min: number, max: number, fallback: number): number {

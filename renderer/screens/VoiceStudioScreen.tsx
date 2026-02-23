@@ -66,6 +66,16 @@ interface RvcPreset {
     resampleSr: number;
 }
 
+interface StoredRvcAdvancedUiSettings {
+    speakerId?: number;
+    transpose?: number;
+    indexRate?: number;
+    protect?: number;
+    filterRadius?: number;
+    rmsMixRate?: number;
+    resampleSr?: number;
+}
+
 interface MediaDeviceOption {
     deviceId: string;
     label: string;
@@ -408,6 +418,8 @@ const ACTING_PAUSE_MS_BY_PUNCT: Record<string, number> = {
     '\n': 280,
 };
 
+const RVC_ADVANCED_UI_SETTINGS_STORAGE_KEY = 'voice_studio_rvc_advanced_ui_v1';
+
 const ACTING_PAUSE_EMOTION_MULTIPLIER: Record<AutoEmotion, number> = {
     joy: 0.85,
     anger: 0.70,
@@ -738,6 +750,17 @@ const VoiceStudioScreen: React.FC = () => {
     const rvcTestMuteTargetNameRef = useRef<string | null>(null);
     const rvcTestMutedStatesRef = useRef<Map<number, boolean>>(new Map());
     const rvcTestMuteRefreshTimerRef = useRef<number | null>(null);
+
+    const clampInt = (value: number, min: number, max: number, fallback: number): number => {
+        if (!Number.isFinite(value)) return fallback;
+        const rounded = Math.round(value);
+        return Math.max(min, Math.min(max, rounded));
+    };
+
+    const clampFloat = (value: number, min: number, max: number, fallback: number): number => {
+        if (!Number.isFinite(value)) return fallback;
+        return Math.max(min, Math.min(max, value));
+    };
 
     const activeStatus = useMemo(() => {
         if (mode === 'rvc') return rvcStatus;
@@ -1364,7 +1387,10 @@ const VoiceStudioScreen: React.FC = () => {
                 const setRes = await window.electronAPI.rvcSetModel(models[0].id);
                 const spkCount = Number(setRes?.speaker_count || 1);
                 setRvcSpeakerCount(spkCount > 0 ? spkCount : 1);
-                setRvcSpeakerId(0);
+                setRvcSpeakerId((prev) => {
+                    const maxSpeakerId = Math.max(0, (spkCount > 0 ? spkCount : 1) - 1);
+                    return Math.max(0, Math.min(prev, maxSpeakerId));
+                });
                 addLog(`RVC model ${models[0].name}: speaker count = ${spkCount > 0 ? spkCount : 1}`);
                 const indexFiles = await window.electronAPI.rvcListModelIndexes(models[0].id);
                 setRvcIndexFiles(indexFiles || []);
@@ -2351,6 +2377,49 @@ const VoiceStudioScreen: React.FC = () => {
     };
 
     useEffect(() => {
+        try {
+            const raw = window.localStorage.getItem(RVC_ADVANCED_UI_SETTINGS_STORAGE_KEY);
+            if (!raw) return;
+            const parsed = JSON.parse(raw) as StoredRvcAdvancedUiSettings;
+
+            setRvcSpeakerId(clampInt(Number(parsed?.speakerId), 0, 127, 0));
+            setRvcTranspose(clampInt(Number(parsed?.transpose), -12, 12, 0));
+            setRvcIndexRate(clampFloat(Number(parsed?.indexRate), 0, 1, 0.75));
+            setRvcProtect(clampFloat(Number(parsed?.protect), 0, 0.5, 0.33));
+            setRvcFilterRadius(clampInt(Number(parsed?.filterRadius), 0, 7, 3));
+            setRvcRmsMixRate(clampFloat(Number(parsed?.rmsMixRate), 0, 1, 0.25));
+            setRvcResampleSr(clampInt(Number(parsed?.resampleSr), 0, 192000, 0));
+        } catch {
+            // Ignore corrupted persisted UI settings.
+        }
+    }, []);
+
+    useEffect(() => {
+        try {
+            const payload: StoredRvcAdvancedUiSettings = {
+                speakerId: clampInt(rvcSpeakerId, 0, 127, 0),
+                transpose: clampInt(rvcTranspose, -12, 12, 0),
+                indexRate: clampFloat(rvcIndexRate, 0, 1, 0.75),
+                protect: clampFloat(rvcProtect, 0, 0.5, 0.33),
+                filterRadius: clampInt(rvcFilterRadius, 0, 7, 3),
+                rmsMixRate: clampFloat(rvcRmsMixRate, 0, 1, 0.25),
+                resampleSr: clampInt(rvcResampleSr, 0, 192000, 0),
+            };
+            window.localStorage.setItem(RVC_ADVANCED_UI_SETTINGS_STORAGE_KEY, JSON.stringify(payload));
+        } catch {
+            // Ignore storage failures.
+        }
+    }, [
+        rvcSpeakerId,
+        rvcTranspose,
+        rvcIndexRate,
+        rvcProtect,
+        rvcFilterRadius,
+        rvcRmsMixRate,
+        rvcResampleSr,
+    ]);
+
+    useEffect(() => {
         refreshStatus();
         loadPresets();
         loadActingProfiles();
@@ -2846,6 +2915,7 @@ const VoiceStudioScreen: React.FC = () => {
                     rmsMixRate: rvcRmsMixRate,
     
                     resampleSr: rvcResampleSr,
+                    autoHighPitchQualityProtect: false,
                 });
 
                 if (!res.success) {
@@ -4028,6 +4098,7 @@ const VoiceStudioScreen: React.FC = () => {
                         rmsMixRate: rvcRmsMixRate,
 
                         resampleSr: rvcResampleSr,
+                        autoHighPitchQualityProtect: true,
                     });
 
                     if (!res.success) {
@@ -4042,6 +4113,9 @@ const VoiceStudioScreen: React.FC = () => {
                         lastAudioUrl = await readAudioAsDataUrl(res.wavPath);
                     }
                     addLog(`RVC conversion complete [${i + 1}/${total}]${res.wavPath ? ': ' + res.wavPath : ''}`);
+                    if (res.warning) {
+                        addLog(`RVC quality safeguard: ${res.warning}`);
+                    }
                 }
 
                 setRvcBatchProgress(null);
@@ -4820,7 +4894,10 @@ const VoiceStudioScreen: React.FC = () => {
                                     const setRes = await window.electronAPI.rvcSetModel(modelId);
                                     const spkCount = Number(setRes?.speaker_count || 1);
                                     setRvcSpeakerCount(spkCount > 0 ? spkCount : 1);
-                                    setRvcSpeakerId(0);
+                                    setRvcSpeakerId((prev) => {
+                                        const maxSpeakerId = Math.max(0, (spkCount > 0 ? spkCount : 1) - 1);
+                                        return Math.max(0, Math.min(prev, maxSpeakerId));
+                                    });
                                     addLog(`RVC model ${modelId}: speaker count = ${spkCount > 0 ? spkCount : 1}`);
                                     const indexFiles = await window.electronAPI.rvcListModelIndexes(modelId);
                                     setRvcIndexFiles(indexFiles || []);

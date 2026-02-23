@@ -52,6 +52,7 @@ export interface CharacterConversationSettings {
 export interface CharacterLearningRequest {
     singingTrainingMode?: boolean;
     separationPreference?: 'auto' | 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    ytDlpCookiesFile?: string;
 }
 
 export interface CharacterLearningResult {

@@ -17,6 +17,7 @@ export interface SingingLearningIngestParams {
     characterId: string;
     sourceUrl: string;
     separationPreference?: SeparationPreference;
+    ytDlpCookiesFile?: string;
 }
 
 export interface SingingLearningIngestResult {
@@ -121,6 +122,11 @@ export class SingingLearningService {
     private readonly separationProfiles = new Map<string, PersistentCharacterSeparationProfile>();
     private separationProfilesDirty = false;
     private separationProfilesLastPersistAt = 0;
+    private ytDlpRuntimeCache: {
+        args: string[];
+        diag: string;
+        ytDlpOverride?: { command: string; argsPrefix: string[] };
+    } | 'unchecked' = 'unchecked';
 
     private constructor(ttsResourcesPath: string) {
         const localAppData = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Local');
@@ -143,7 +149,8 @@ export class SingingLearningService {
     extractYouTubeUrl(text: string): string | null {
         const source = String(text || '').trim();
         if (!source) return null;
-        const regex = /(https?:\/\/(?:www\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)|youtu\.be\/)[^\s]+)/i;
+        // Supports www.youtube.com, music.youtube.com, and youtu.be
+        const regex = /(https?:\/\/(?:(?:www\.|music\.)?youtube\.com\/(?:watch\?(?:[^#\s]*&)?v=|shorts\/|live\/|embed\/)|youtu\.be\/)[^\s]+)/i;
         const match = source.match(regex);
         if (!match || !match[1]) return null;
         return match[1];
@@ -225,7 +232,7 @@ export class SingingLearningService {
         fs.mkdirSync(instDir, { recursive: true });
         fs.mkdirSync(trainDir, { recursive: true });
 
-        const downloaded = await this.downloadYouTubeAudio(sourceUrl, downloadDir);
+        const downloaded = await this.downloadYouTubeAudio(sourceUrl, downloadDir, params.ytDlpCookiesFile);
         if (!downloaded.success || !downloaded.audioPath) {
             return {
                 success: false,
@@ -898,9 +905,88 @@ export class SingingLearningService {
         return targetPath;
     }
 
+    private extractVideoId(url: string): string | null {
+        // Matches v= in query string or youtu.be/ID shortlink
+        const qMatch = url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+        if (qMatch) return qMatch[1];
+        const shortMatch = url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
+        return shortMatch ? shortMatch[1] : null;
+    }
+
+    private cleanYouTubeUrl(url: string): string {
+        // Strip playlist/radio params so yt-dlp only downloads the single video.
+        const id = this.extractVideoId(url);
+        if (id) return `https://www.youtube.com/watch?v=${id}`;
+        return url;
+    }
+
+    private buildMusicYouTubeUrl(url: string): string | null {
+        const id = this.extractVideoId(url);
+        if (!id) return null;
+        return `https://music.youtube.com/watch?v=${id}`;
+    }
+
+    /**
+     * Validates a Netscape cookies.txt file for YouTube Premium authentication.
+     * Returns a warning string if critical cookies are missing or invalid.
+     */
+    private validateYouTubeCookiesFile(filePath: string): string | null {
+        let content: string;
+        try {
+            content = fs.readFileSync(filePath, 'utf-8');
+        } catch {
+            return `Cannot read cookies file: ${filePath}`;
+        }
+
+        // Parse Netscape cookie lines: domain\tflag\tpath\tsecure\texpiry\tname\tvalue
+        const now = Math.floor(Date.now() / 1000);
+        const cookieMap: Map<string, { domain: string; expiry: number }> = new Map();
+        for (const line of content.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const parts = trimmed.split('\t');
+            if (parts.length < 7) continue;
+            const [domain, , , , expiryStr, name] = parts;
+            const expiry = parseInt(expiryStr, 10);
+            const existing = cookieMap.get(name);
+            // Prefer .youtube.com (shared) over subdomain-specific entries
+            if (!existing || domain.startsWith('.')) {
+                cookieMap.set(name, { domain, expiry });
+            }
+        }
+
+        const issues: string[] = [];
+
+        // Check critical YouTube Premium auth cookies
+        const required = ['SAPISID', 'SID', '__Secure-3PSID'];
+        const missing = required.filter((name) => !cookieMap.has(name));
+        if (missing.length > 0) {
+            issues.push(`Missing required cookies: ${missing.join(', ')}`);
+        }
+
+        // Check that SAPISID has .youtube.com domain (not just music.youtube.com)
+        const sapisid = cookieMap.get('SAPISID');
+        if (sapisid && !sapisid.domain.endsWith('.youtube.com') && sapisid.domain !== '.youtube.com') {
+            issues.push(`SAPISID domain is "${sapisid.domain}" — must be ".youtube.com" for auth to work across all YouTube URLs`);
+        }
+
+        // Check for expired cookies
+        const expired = required.filter((name) => {
+            const c = cookieMap.get(name);
+            return c && c.expiry > 0 && c.expiry < now;
+        });
+        if (expired.length > 0) {
+            issues.push(`Expired cookies: ${expired.join(', ')} — re-export fresh cookies from your browser`);
+        }
+
+        if (issues.length === 0) return null;
+        return `cookies.txt validation issues: ${issues.join('; ')}. Export from youtube.com (not music.youtube.com) to ensure .youtube.com shared cookies are included.`;
+    }
+
     private async downloadYouTubeAudio(
         sourceUrl: string,
         outputDir: string,
+        cookiesFile?: string,
     ): Promise<{ success: boolean; audioPath?: string; warning?: string; error?: string }> {
         const outputTemplate = path.join(outputDir, 'source.%(ext)s');
         const ytDlp = await this.resolveYtDlpCommand();
@@ -912,59 +998,157 @@ export class SingingLearningService {
         }
 
         const warnings: string[] = [];
-        const baseArgs = [
-            '--ignore-config',
-            '--no-playlist',
-            '--no-warnings',
-            '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-            '-o', outputTemplate,
-            sourceUrl,
-        ];
-        const runYtDlp = async (extraArgs?: string[]): Promise<CommandResult> => (
-            this.runCommand(
-                ytDlp.command,
-                ytDlp.argsPrefix.concat(extraArgs || [], baseArgs),
-                {
-                    cwd: outputDir,
-                    timeoutMs: 30 * 60 * 1000,
-                },
-            )
-        );
-
-        let result = await runYtDlp();
-        let cookieSourceUsed = '';
-        if (!result.success) {
-            const errorText = result.stderr || result.stdout || '';
-            if (this.isYtDlpPremiumRestrictedError(errorText)) {
-                const cookieSources = this.buildYtDlpCookieSources();
-                for (const source of cookieSources) {
-                    const retry = await runYtDlp(['--cookies-from-browser', source]);
-                    if (retry.success) {
-                        result = retry;
-                        cookieSourceUsed = source;
-                        break;
-                    }
-                }
-                if (!result.success) {
-                    return {
-                        success: false,
-                        error: [
-                            'yt-dlp failed: This video is restricted to YouTube Music Premium.',
-                            'Sign in with a Premium account in your browser and retry.',
-                            `detail: ${this.takeTail(result.stderr || result.stdout, 300)}`,
-                        ].join(' '),
-                    };
-                }
-            } else {
-                return {
-                    success: false,
-                    error: `yt-dlp failed: ${this.takeTail(errorText, 400)}`,
-                };
+        const validCookiesFile = cookiesFile && fs.existsSync(cookiesFile) ? cookiesFile : null;
+        if (cookiesFile && !validCookiesFile) {
+            warnings.push(`cookies.txt not found at: ${cookiesFile}`);
+        }
+        if (validCookiesFile) {
+            const cookieValidation = this.validateYouTubeCookiesFile(validCookiesFile);
+            if (cookieValidation) {
+                warnings.push(cookieValidation);
             }
         }
 
-        if (cookieSourceUsed) {
-            warnings.push(`yt-dlp retry succeeded using browser cookies (${cookieSourceUsed}).`);
+        const cookieArgs = validCookiesFile ? ['--cookies', validCookiesFile] : [];
+        // Strip playlist/radio query params so yt-dlp only downloads this single video.
+        const cleanUrl = this.cleanYouTubeUrl(sourceUrl);
+        const musicUrl = this.buildMusicYouTubeUrl(sourceUrl);
+
+        // Provide a JS runtime for yt-dlp EJS support (--js-runtimes or --remote-components).
+        // Required for YouTube Premium EJS-based authentication (see yt-dlp/wiki/EJS).
+        const { args: runtimeArgs, diag: runtimeDiag, ytDlpOverride } = await this.detectYtDlpRuntimeArgs(ytDlp);
+        // Use the upgraded/pip version if detectYtDlpRuntimeArgs switched to it.
+        const activeYtDlp = ytDlpOverride ?? ytDlp;
+        if (runtimeArgs.length > 0) {
+            warnings.push(`Using JS runtime for yt-dlp (${runtimeArgs.join(' ')})`);
+        }
+
+        const baseFixedArgs = ['--ignore-config', '--no-playlist', '-o', outputTemplate, ...runtimeArgs];
+
+        const runAttempt = async (extraArgs: string[], url: string): Promise<CommandResult> => (
+            this.runCommand(
+                activeYtDlp.command,
+                activeYtDlp.argsPrefix.concat(cookieArgs, extraArgs, baseFixedArgs, [url]),
+                { cwd: outputDir, timeoutMs: 30 * 60 * 1000 },
+            )
+        );
+
+        // Ordered attempts — YouTube Music-specific clients first.
+        // Cookie domain note: cookies from music.youtube.com may only match music.youtube.com
+        // requests, so music.youtube.com URL variants are tried alongside www.youtube.com.
+        // Each entry: [extraArgs, url, label]
+        type Attempt = [string[], string, string];
+        const mkClient = (client: string): string[] => ['--extractor-args', `youtube:player_client=${client}`];
+        const fmt = (f: string): string[] => ['-f', f];
+
+        const musicAttempts: Attempt[] = musicUrl ? [
+            [[...mkClient('ios_music'), ...fmt('bestaudio/best')], musicUrl, 'ios_music+music_url'],
+            [[...mkClient('android_music'), ...fmt('bestaudio/best')], musicUrl, 'android_music+music_url'],
+            [[...mkClient('web_music'), ...fmt('bestaudio/best')], musicUrl, 'web_music+music_url'],
+            [fmt('bestaudio/best'), musicUrl, 'bestaudio+music_url'],
+            [[], musicUrl, 'default+music_url'],
+            [fmt('worst'), musicUrl, 'worst+music_url'],
+        ] : [];
+
+        const attempts: Attempt[] = [
+            // YouTube Music-specific mobile clients on clean URL (no playlist params)
+            [[...mkClient('ios_music'), ...fmt('bestaudio/best')], cleanUrl, 'ios_music'],
+            [[...mkClient('android_music'), ...fmt('bestaudio/best')], cleanUrl, 'android_music'],
+            // music.youtube.com URL variants interleaved (cookie domain match)
+            ...musicAttempts,
+            // Standard selectors on clean URL
+            [fmt('bestaudio/best'), cleanUrl, 'bestaudio'],
+            [[], cleanUrl, 'default'],
+            [[...mkClient('ios'), ...fmt('bestaudio/best')], cleanUrl, 'ios'],
+            [fmt('worst'), cleanUrl, 'worst'],
+        ];
+
+        let lastError = '';
+        let successLabel = '';
+        let finalResult: CommandResult | null = null;
+
+        for (const [extraArgs, url, label] of attempts) {
+            const result = await runAttempt(extraArgs, url);
+            if (result.success) {
+                finalResult = result;
+                successLabel = label;
+                break;
+            }
+            const errorText = result.stderr || result.stdout || '';
+            if (this.isYtDlpPremiumRestrictedError(errorText)) {
+                // Authentication failure — try browser cookies combined with music URL.
+                const urlsToTry = [cleanUrl, ...(musicUrl ? [musicUrl] : [])];
+                const cookieSources = this.buildYtDlpCookieSources();
+                outer: for (const tryUrl of urlsToTry) {
+                    for (const source of cookieSources) {
+                        const browserRetry = await this.runCommand(
+                            activeYtDlp.command,
+                            activeYtDlp.argsPrefix.concat(
+                                cookieArgs,
+                                ['--cookies-from-browser', source],
+                                [...mkClient('ios_music'), ...fmt('bestaudio/best')],
+                                baseFixedArgs,
+                                [tryUrl],
+                            ),
+                            { cwd: outputDir, timeoutMs: 30 * 60 * 1000 },
+                        );
+                        if (browserRetry.success) {
+                            finalResult = browserRetry;
+                            successLabel = `browser:${source}`;
+                            break outer;
+                        }
+                    }
+                }
+                if (finalResult) break;
+                const cookiesHint = cookiesFile
+                    ? `cookies.txt specified (${cookiesFile}) but authentication failed. Re-export cookies from music.youtube.com while logged in to your Premium account.`
+                    : 'Specify a cookies.txt file exported from music.youtube.com while logged in to your Premium account.';
+                return {
+                    success: false,
+                    error: `yt-dlp failed: This video is restricted to YouTube Music Premium. ${cookiesHint} detail: ${this.takeTail(errorText, 300)}`,
+                };
+            }
+            lastError = this.takeTail(errorText, 300);
+        }
+
+        if (!finalResult) {
+            // Diagnostic: capture --list-formats for both URLs to diagnose cookie auth.
+            const diagUrls: Array<[string, string]> = [[cleanUrl, 'youtube.com']];
+            if (musicUrl) diagUrls.push([musicUrl, 'music.youtube.com']);
+            const diagParts: string[] = [];
+            let onlyStoryboards = true;
+            for (const [diagUrl, label] of diagUrls) {
+                const listFmtResult = await this.runCommand(
+                    activeYtDlp.command,
+                    activeYtDlp.argsPrefix.concat(cookieArgs, runtimeArgs, ['--list-formats', '--ignore-config', diagUrl]),
+                    { cwd: outputDir, timeoutMs: 60_000 },
+                );
+                const fmtOut = listFmtResult.stdout || listFmtResult.stderr || '(no output)';
+                diagParts.push(`[${label}]:\n${this.takeTail(fmtOut, 600)}`);
+                // If any non-storyboard format is visible, cookies may be partially working
+                if (/\b(m4a|webm|mp4|opus|aac|mp3|audio)\b/i.test(fmtOut)) {
+                    onlyStoryboards = false;
+                }
+            }
+            const ejsNote = this.isYtDlpEjsError(lastError) && runtimeArgs.length === 0
+                ? ` JavaScript runtime required: ${runtimeDiag || 'see https://github.com/yt-dlp/yt-dlp/wiki/EJS'}.`
+                : '';
+            const cookieMsg = onlyStoryboards && validCookiesFile
+                ? ` cookies.txt present but only storyboard formats visible.${ejsNote || ' Re-export fresh cookies from music.youtube.com while logged in to Premium.'}`
+                : ejsNote;
+            const warningPrefix = warnings.length > 0 ? `[warnings: ${warnings.join(' ')}] ` : '';
+            return {
+                success: false,
+                error: `${warningPrefix}yt-dlp failed: ${lastError}${cookieMsg}\n${diagParts.join('\n')}`,
+            };
+        }
+
+        if (successLabel.startsWith('browser:')) {
+            warnings.push(`yt-dlp succeeded using browser cookies (${successLabel.slice(8)}).`);
+        } else if (validCookiesFile) {
+            warnings.push(`yt-dlp succeeded using cookies.txt (attempt: ${successLabel}).`);
+        } else if (successLabel !== 'bestaudio') {
+            warnings.push(`yt-dlp required fallback attempt: ${successLabel}.`);
         }
 
         const files = fs.readdirSync(outputDir)
@@ -1702,6 +1886,13 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             };
         }
 
+        // Demucs pulls in dora_search which upgrades omegaconf to 2.3.0, breaking RVC model
+        // loading (get_ref_type was removed from omegaconf._utils in omegaconf>=2.2).
+        // Pin back to 2.1.1 using --no-deps to avoid touching antlr4/PyYAML.
+        await this.runCommand(pythonExe, ['-m', 'pip', 'install', '--no-deps', 'omegaconf==2.1.1'], {
+            timeoutMs: 60_000,
+        });
+
         const probeAfterInstall = await this.runCommand(pythonExe, ['-m', 'demucs.separate', '--help'], {
             timeoutMs: 20_000,
         });
@@ -2290,6 +2481,153 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             }
         }
         return null;
+    }
+
+    private isYtDlpEjsError(text: string): boolean {
+        return text.includes('yt-dlp/wiki/EJS') || /\bEJS\b/.test(text);
+    }
+
+    /**
+     * Detects EJS (External JS Scripts) support in yt-dlp and determines the correct
+     * runtime args. The EJS system uses --js-runtimes (not --runtime).
+     *
+     * Strategy:
+     *  1. Check current yt-dlp help for --js-runtimes / --remote-components
+     *  2. If missing: try pip install -U "yt-dlp[default]" (installs bundled Deno runtime)
+     *     - For system yt-dlp: also try yt-dlp -U and RVC/system Python pip fallbacks
+     *  3. If --js-runtimes available + node.js found → --js-runtimes node
+     *  4. If --remote-components available → --remote-components ejs:npm (auto-download)
+     *  5. On failure: surface actionable diag message
+     *
+     * Returns { args, diag, ytDlpOverride? }.
+     * ytDlpOverride replaces the yt-dlp command if we switched to a pip-managed version.
+     * Result is cached for the lifetime of the service instance.
+     */
+    private async detectYtDlpRuntimeArgs(ytDlp: { command: string; argsPrefix: string[] }): Promise<{
+        args: string[];
+        diag: string;
+        ytDlpOverride?: { command: string; argsPrefix: string[] };
+    }> {
+        if (this.ytDlpRuntimeCache !== 'unchecked') {
+            return this.ytDlpRuntimeCache;
+        }
+
+        const set = (
+            args: string[],
+            diag: string,
+            ytDlpOverride?: { command: string; argsPrefix: string[] },
+        ) => {
+            this.ytDlpRuntimeCache = { args, diag, ytDlpOverride };
+            return this.ytDlpRuntimeCache;
+        };
+
+        type EjsCapability = { jsRuntimes: boolean; remoteComponents: boolean };
+
+        const checkEjsCapability = async (cmd: string, prefix: string[]): Promise<EjsCapability> => {
+            const r = await this.runCommand(cmd, prefix.concat(['--help']), { timeoutMs: 15_000 });
+            const text = r.stdout + (r.stderr || '');
+            return {
+                jsRuntimes: text.includes('--js-runtimes'),
+                remoteComponents: text.includes('--remote-components'),
+            };
+        };
+
+        const pipInstallYtDlp = async (python: string): Promise<boolean> => {
+            // "yt-dlp[default]" includes the bundled Deno runtime for EJS support.
+            const r = await this.runCommand(
+                python, ['-m', 'pip', 'install', '-U', 'yt-dlp[default]'], { timeoutMs: 5 * 60 * 1000 },
+            );
+            console.log(`[SingingLearning] pip install yt-dlp[default] via ${python}: ${r.success ? 'ok' : r.stderr || r.stdout}`);
+            return r.success;
+        };
+
+        let cap = await checkEjsCapability(ytDlp.command, ytDlp.argsPrefix);
+        let activeYtDlp = ytDlp;
+
+        if (!cap.jsRuntimes && !cap.remoteComponents) {
+            console.log('[SingingLearning] yt-dlp lacks EJS support; attempting upgrade...');
+
+            // Helper: try installing via a given Python and check if the result gains EJS.
+            const tryPipFallback = async (python: string, label: string): Promise<boolean> => {
+                if (await pipInstallYtDlp(python)) {
+                    const pipCmd = { command: python, argsPrefix: ['-m', 'yt_dlp'] };
+                    const pipCap = await checkEjsCapability(pipCmd.command, pipCmd.argsPrefix);
+                    if (pipCap.jsRuntimes || pipCap.remoteComponents) {
+                        cap = pipCap;
+                        activeYtDlp = pipCmd;
+                        console.log(`[SingingLearning] Using ${label} yt-dlp with EJS support`);
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            if (ytDlp.argsPrefix.length > 0) {
+                // pip-managed: upgrade in place
+                if (await pipInstallYtDlp(ytDlp.command)) {
+                    cap = await checkEjsCapability(ytDlp.command, ytDlp.argsPrefix);
+                }
+            } else {
+                // Direct system executable: try self-update, then pip fallbacks
+                const selfUpd = await this.runCommand(ytDlp.command, ['-U'], { timeoutMs: 3 * 60 * 1000 });
+                console.log(`[SingingLearning] yt-dlp -U: ${selfUpd.success ? 'ok' : 'failed'}`);
+                if (selfUpd.success) {
+                    cap = await checkEjsCapability(ytDlp.command, ytDlp.argsPrefix);
+                }
+
+                if (!cap.jsRuntimes && !cap.remoteComponents) {
+                    // RVC Python fallback
+                    const manifest = this.loadRvcManifest();
+                    const rvcPython = manifest?.pythonPath
+                        ? this.resolvePythonExecutable(manifest.pythonPath)
+                        : null;
+                    if (rvcPython) {
+                        await tryPipFallback(rvcPython, 'RVC Python');
+                    }
+                }
+
+                if (!cap.jsRuntimes && !cap.remoteComponents) {
+                    // System Python fallback
+                    const sysPython = await this.resolveExecutable('python')
+                        ?? await this.resolveExecutable('python3')
+                        ?? await this.resolveExecutable('py');
+                    if (sysPython) {
+                        await tryPipFallback(sysPython, 'system Python');
+                    }
+                }
+            }
+        }
+
+        if (!cap.jsRuntimes && !cap.remoteComponents) {
+            return set(
+                [],
+                'yt-dlp EJS support missing. Run: pip install -U "yt-dlp[default]"  or  yt-dlp -U',
+            );
+        }
+
+        // Prefer --js-runtimes node (explicit, faster than auto-download).
+        if (cap.jsRuntimes) {
+            const nodePath = await this.resolveExecutable('node');
+            if (nodePath) {
+                const override = activeYtDlp !== ytDlp ? activeYtDlp : undefined;
+                console.log(`[SingingLearning] EJS via --js-runtimes node:${nodePath}${override ? ' (pip)' : ''}`);
+                return set(['--js-runtimes', `node:${nodePath}`], '', override);
+            }
+            // node not in PATH but --remote-components is available — fall through.
+        }
+
+        // Fallback: auto-download EJS runtime from npm on first use.
+        if (cap.remoteComponents) {
+            const override = activeYtDlp !== ytDlp ? activeYtDlp : undefined;
+            console.log(`[SingingLearning] EJS via --remote-components ejs:npm${override ? ' (pip)' : ''}`);
+            return set(['--remote-components', 'ejs:npm'], '', override);
+        }
+
+        // --js-runtimes supported but no node.js and no --remote-components
+        return set(
+            [],
+            'Node.js ≥20 not found in PATH — install from https://nodejs.org and restart',
+        );
     }
 
     private async resolveYtDlpCommand(): Promise<{ command: string; argsPrefix: string[] } | null> {

@@ -3151,21 +3151,7 @@ const detectSingingModeFromText = (text: string): boolean => {
 
     const lower = normalized.toLowerCase();
     const explicitMarkers = ['♪', '♫', '♬', 'サビ', 'aメロ', 'bメロ', 'chorus', 'verse', 'bridge', 'ラララ', 'ららら'];
-    if (explicitMarkers.some((marker) => lower.includes(marker.toLowerCase()))) {
-        return true;
-    }
-
-    const lines = normalized
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean);
-    if (lines.length >= 3) {
-        return true;
-    }
-
-    const phraseDelimiters = (normalized.match(/[、,]/g) || []).length;
-    const sentenceEndings = (normalized.match(/[。.!?！？]/g) || []).length;
-    return phraseDelimiters >= 3 && sentenceEndings <= 1;
+    return explicitMarkers.some((marker) => lower.includes(marker.toLowerCase()));
 };
 
 const detectSingingIntentFromUserText = (text: string): boolean => {
@@ -3469,6 +3455,7 @@ ipcMain.handle('character-chat-send', async (_event, request: CharacterChatReque
                     characterId: request.characterId || 'default',
                     sourceUrl: youtubeUrl,
                     separationPreference: request.learning?.separationPreference,
+                    ytDlpCookiesFile: request.learning?.ytDlpCookiesFile,
                 });
                 const sessionId = request.sessionId || `char_learning_${Date.now()}`;
                 const responseText = buildSingingLearningResultMessage(ingestResult);
@@ -3520,11 +3507,14 @@ ipcMain.handle('character-chat-send', async (_event, request: CharacterChatReque
         const requestedSingingSetting = request.voice?.expression?.singing;
         const detectedSingingFromResponse = detectSingingModeFromText(responseText);
         const detectedSingingFromUserText = detectSingingIntentFromUserText(request.text);
+        // Singing mode activates only when explicitly requested (forceSingingMode=true),
+        // OR when the user text contains a clear singing request AND the response also has musical markers.
+        // Never auto-activate from multi-line responses alone — normal conversation is multi-line.
         const effectiveSinging = requestedSingingSetting === true
             ? true
             : requestedSingingSetting === false
                 ? false
-                : (detectedSingingFromResponse || detectedSingingFromUserText);
+                : (detectedSingingFromResponse && detectedSingingFromUserText);
         const defaultExpression = buildCharacterVoiceExpressionDefaults(
             responseText,
             hintedEmotion,

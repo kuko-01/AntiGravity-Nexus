@@ -66,6 +66,7 @@ interface StoredVoiceEnhanceSettings {
     emotionLabelHint?: 'auto' | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited';
     useEmotionIntensityHint?: boolean;
     emotionIntensityHint?: number;
+    ytDlpCookiesFile?: string;
 }
 
 type SeparationMethodId = 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
@@ -147,6 +148,7 @@ const CharacterStudioScreen: React.FC = () => {
     const [singingSeparationPreference, setSingingSeparationPreference] = useState<'auto' | 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback'>(
         DEFAULT_VOICE_ENHANCE_SETTINGS.separationPreference || 'auto',
     );
+    const [ytDlpCookiesFile, setYtDlpCookiesFile] = useState<string>('');
     const [forceSingingMode, setForceSingingMode] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.forceSingingMode || false);
     const [autoEmotionRefine, setAutoEmotionRefine] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.autoEmotionRefine !== false);
     const [enhanceFinalAudio, setEnhanceFinalAudio] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.enhanceFinalAudio !== false);
@@ -271,6 +273,7 @@ const CharacterStudioScreen: React.FC = () => {
         return {
             singingTrainingMode: settings?.singingTrainingMode === true,
             separationPreference: nextSeparationPreference,
+            ytDlpCookiesFile: typeof settings?.ytDlpCookiesFile === 'string' ? settings.ytDlpCookiesFile : '',
             forceSingingMode: settings?.forceSingingMode === true,
             autoEmotionRefine: settings?.autoEmotionRefine !== false,
             enhanceFinalAudio: settings?.enhanceFinalAudio !== false,
@@ -285,6 +288,7 @@ const CharacterStudioScreen: React.FC = () => {
         const normalized = normalizeVoiceEnhanceSettings(settings);
         setSingingTrainingMode(normalized.singingTrainingMode === true);
         setSingingSeparationPreference(normalized.separationPreference || 'auto');
+        setYtDlpCookiesFile(normalized.ytDlpCookiesFile || '');
         setForceSingingMode(normalized.forceSingingMode || false);
         setAutoEmotionRefine(normalized.autoEmotionRefine !== false);
         setEnhanceFinalAudio(normalized.enhanceFinalAudio !== false);
@@ -298,6 +302,7 @@ const CharacterStudioScreen: React.FC = () => {
         normalizeVoiceEnhanceSettings({
             singingTrainingMode,
             separationPreference: singingSeparationPreference,
+            ytDlpCookiesFile,
             forceSingingMode,
             autoEmotionRefine,
             enhanceFinalAudio,
@@ -957,6 +962,7 @@ const CharacterStudioScreen: React.FC = () => {
                 learning: {
                     singingTrainingMode,
                     separationPreference: singingSeparationPreference,
+                    ytDlpCookiesFile: ytDlpCookiesFile || undefined,
                 },
                 withVoice: voiceEnabled,
                 voice: {
@@ -1363,6 +1369,36 @@ const CharacterStudioScreen: React.FC = () => {
                         <option value="uvr5">UVR5 (RVC)</option>
                         <option value="ffmpeg-fallback">FFmpeg fallback</option>
                     </select>
+
+                    <label
+                        style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}
+                        title="YouTube Music PremiumのCookiesファイル（cookies.txt）のパスを指定します。ブラウザ拡張機能でエクスポートしてください。"
+                    >
+                        YouTube cookies.txt (Premium)
+                    </label>
+                    <div style={{ display: 'flex', gap: '6px', marginBottom: '10px' }}>
+                        <input
+                            type="text"
+                            value={ytDlpCookiesFile}
+                            onChange={(e) => setYtDlpCookiesFile(e.target.value)}
+                            placeholder="cookies.txt (optional)"
+                            style={{ flex: 1, minWidth: 0 }}
+                            title="YouTube Music Premium動画のダウンロードに必要なcookies.txtのフルパス。'Get cookies.txt LOCALLY'等のブラウザ拡張でエクスポートできます。"
+                        />
+                        <button
+                            type="button"
+                            onClick={async () => {
+                                const result = await window.electronAPI.selectFile(['txt'], false);
+                                if (result?.success && result.path) {
+                                    setYtDlpCookiesFile(result.path);
+                                }
+                            }}
+                            style={{ whiteSpace: 'nowrap', flexShrink: 0 }}
+                            title="cookies.txtファイルを選択"
+                        >
+                            Browse
+                        </button>
+                    </div>
 
                     <label
                         style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}

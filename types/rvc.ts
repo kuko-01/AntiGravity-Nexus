@@ -151,6 +151,7 @@ export interface RvcConvertParams {
     filterRadius?: number;      // 0-7, median filter for f0, default: 3
     rmsMixRate?: number;        // 0.0-1.0, envelope mixing, default: 0.25
     resampleSr?: number;        // output sample rate (0 = no resample)
+    autoHighPitchQualityProtect?: boolean; // file WAV only: blend lower-transpose output on detected high-note regions
 }
 
 export interface RvcConvertResult {
@@ -159,6 +160,7 @@ export interface RvcConvertResult {
     audioBase64?: string;
     durationMs?: number;
     sampleRate?: number;
+    warning?: string;
     error?: RvcError;
 }
 

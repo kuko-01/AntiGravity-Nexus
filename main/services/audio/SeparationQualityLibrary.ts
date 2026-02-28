@@ -513,11 +513,26 @@ export class SeparationQualityLibrary {
             if (envFull < 0.012 && highRatio > 0.40) {
                 amount += 0.10;
             }
-            amount = this.clampNumber(amount, 0, 0.82, 0);
+            // ガビり検出: 高スルーレート×高域比×中エネルギーの組み合わせ → 強補正
+            const garbleGate = this.clampNumber(
+                (slewGate * 0.65) + Math.max(0, highRatio - 0.32) * 0.55
+                - (envFull > 0.28 ? 0.22 : 0),
+                0, 1, 0,
+            );
+            if (garbleGate > 0.22) {
+                amount = this.clampNumber(amount + (garbleGate * 0.22), 0, 0.88, amount);
+            }
+            amount = this.clampNumber(amount, 0, 0.88, 0);
 
             smoothedHigh += (highIn - smoothedHigh) * smoothAlpha;
             let y = x + ((smoothedHigh - highIn) * amount);
-            y = Math.tanh(y * 1.03) / Math.tanh(1.03);
+            // 音割れ検出: 振幅大きい場合はより強いソフトサチュレーション
+            const absY = Math.abs(y);
+            if (absY > 0.82) {
+                y = Math.tanh(y * 1.10) / Math.tanh(1.10);
+            } else {
+                y = Math.tanh(y * 1.03) / Math.tanh(1.03);
+            }
 
             const highOut = hpOut.process(y);
             highSqBefore += highIn * highIn;
@@ -741,14 +756,21 @@ export class SeparationQualityLibrary {
             ),
             3,
         );
+        // ブリード/反響が検出された場合は anlmdn を強化して残響尾を抑制
+        const reverbLeakagePressure = this.clampNumber(
+            Math.max(0, leakageCorrelation - 0.09) * 2.8
+            + Math.max(0, lowBandLeakageCorrelation - 0.11) * 1.4,
+            0, 1.2, 0,
+        );
         const anlmdnStrengthTuned = this.roundNumber(
             this.clampNumber(
                 anlmdnStrength
                 + (roughnessPressure * 1.3)
                 + (nearClipPressure * 0.6)
+                + (reverbLeakagePressure * 0.9)
                 - (metrics.speechActivityRatio > 0.72 ? 0.4 : 0),
                 speechSparse ? 3.0 : 3.5,
-                15,
+                16,
                 anlmdnStrength,
             ),
             3,
@@ -789,6 +811,11 @@ export class SeparationQualityLibrary {
             70,
         );
 
+        // 反響/ブリード圧力が強い場合は2段目の軽量 afftdn を追加 (反響対策)
+        const tailAfftdnNr = reverbLeakagePressure > 0.08
+            ? Math.round(4 + reverbLeakagePressure * 22)
+            : 0;
+
         return [
             ...(preGainLinear < 0.995 ? [`volume=${this.roundNumber(preGainLinear, 4)}`] : []),
             // Steep 2-pole (40 dB/decade) high-pass removes low-end rumble and bass bleed
@@ -805,6 +832,8 @@ export class SeparationQualityLibrary {
             `dynaudnorm=f=${dynaudnormFrame}:g=${dynamicGain}:p=${dynaudnormPeak}:m=${dynaudnormMax}`,
             // Transparent peak limiter
             'alimiter=limit=0.98',
+            // 反響/ブリード残響尾を除去する2段目デノイズ (leakageCorrelation が高い場合のみ)
+            ...(tailAfftdnNr > 0 ? [`afftdn=nr=${this.clampInt(tailAfftdnNr, 4, 20, 5)}:nf=-52:tn=1`] : []),
         ].join(',');
     }
 
@@ -1896,6 +1925,7 @@ export class SeparationQualityLibrary {
         const highMasks = new Float32Array(frameCount);
         const highSmoothBlendByFrame = new Float32Array(frameCount);
         const highProtectBoostByFrame = new Float32Array(frameCount);
+        const voiceLikeByFrame = new Float32Array(frameCount);
         const bgmSuppress = new Float32Array(frameCount);
 
         const alphaSubLow = 1 - Math.exp((-2 * Math.PI * 95) / sr);
@@ -2090,13 +2120,15 @@ export class SeparationQualityLibrary {
             let midMask = vMidPow / (vMidPow + (aMidPow * midBias) + 1e-9);
             let highMask = vHighPow / (vHighPow + (aHighPow * highBias) + 1e-9);
 
+            voiceLikeByFrame[fi] = voiceLike ? 1 : 0;
             if (voiceLike) {
                 subLowMask = this.clampNumber(subLowMask + 0.04, 0.02, 0.99, subLowMask);
-                midMask = this.clampNumber(midMask + 0.05, 0.02, 0.98, midMask);
-                highMask = this.clampNumber(highMask + 0.06, 0.10, 0.995, highMask);
+                midMask = this.clampNumber(midMask + 0.06, 0.02, 0.98, midMask);
+                // 高域ドロップアウト防止: voiceLike フレームの highMask 最小値を引き上げ (音抜け対策)
+                highMask = this.clampNumber(highMask + 0.09, 0.16, 0.995, highMask);
                 if (lowVoiceLikely) {
                     subLowMask = this.clampNumber(subLowMask + 0.03, 0.04, 0.995, subLowMask);
-                    lowMask = this.clampNumber(lowMask + 0.03, 0.02, 0.99, lowMask);
+                    lowMask = this.clampNumber(lowMask + 0.04, 0.02, 0.99, lowMask);
                 }
             }
 
@@ -2171,8 +2203,9 @@ export class SeparationQualityLibrary {
             subLowMask = this.clampNumber(subLowMask * subLowSuppressMixFinal, 0.02, 0.995, subLowMask);
             lowMask = this.clampNumber(lowMask * lowSuppressMixFinal, 0.01, 0.98, lowMask);
             midMask = this.clampNumber(midMask * (lowVoiceLikely ? (0.92 + (0.08 * suppress)) : (0.95 + (0.05 * suppress))), 0.01, 0.99, midMask);
-            const highSuppressMix = voiceLike ? (0.88 + (0.12 * suppress)) : (0.74 + (0.26 * suppress));
-            highMask = this.clampNumber(highMask * highSuppressMix, voiceLike ? 0.10 : 0.03, 0.995, highMask);
+            // voiceLike フレームではサプレッションを抑制して高域音抜けを防ぐ
+            const highSuppressMix = voiceLike ? (0.93 + (0.07 * suppress)) : (0.77 + (0.23 * suppress));
+            highMask = this.clampNumber(highMask * highSuppressMix, voiceLike ? 0.14 : 0.03, 0.995, highMask);
 
             const highMod = fi > 0 ? Math.abs(vHighRms - prevVHighRms) / Math.max(1e-6, prevVHighRms + vHighRms) : 0;
             const vibratoProxy = this.clampNumber(
@@ -2198,23 +2231,23 @@ export class SeparationQualityLibrary {
                 vibratoGuardFrames += 1;
             }
 
-            // Guard against frame-to-frame high-band mask jumps that can create buzzy/grainy artifacts.
+            // フレーム間の高域マスク変化を抑制 — ガビり・ブジー感の主因 (ガビる対策)
             let highMaskDeltaCap = this.clampNumber(
-                (voiceLike ? 0.12 : 0.09)
-                + (lowVoiceLikely ? 0.01 : 0)
-                + (vHighRms > (aHighRms * 1.10) ? 0.01 : 0)
-                - (likelyBgmOnly ? 0.015 : 0)
-                - (lowBandBgmPriorityMode ? 0.015 : 0)
-                - Math.max(0, corrHigh - 0.28) * 0.05,
-                voiceLike ? 0.06 : 0.045,
-                voiceLike ? 0.16 : 0.12,
-                voiceLike ? 0.12 : 0.09,
+                (voiceLike ? 0.065 : 0.045)
+                + (lowVoiceLikely ? 0.006 : 0)
+                + (vHighRms > (aHighRms * 1.10) ? 0.006 : 0)
+                - (likelyBgmOnly ? 0.012 : 0)
+                - (lowBandBgmPriorityMode ? 0.012 : 0)
+                - Math.max(0, corrHigh - 0.28) * 0.04,
+                voiceLike ? 0.030 : 0.020,
+                voiceLike ? 0.090 : 0.068,
+                voiceLike ? 0.065 : 0.045,
             );
             if (vibratoGuardStrength > 0) {
                 highMaskDeltaCap = this.clampNumber(
-                    highMaskDeltaCap * (1 - (0.26 * vibratoGuardStrength)),
-                    voiceLike ? 0.045 : 0.038,
-                    voiceLike ? 0.15 : 0.11,
+                    highMaskDeltaCap * (1 - (0.30 * vibratoGuardStrength)),
+                    voiceLike ? 0.022 : 0.016,
+                    voiceLike ? 0.082 : 0.060,
                     highMaskDeltaCap,
                 );
             }
@@ -2235,6 +2268,12 @@ export class SeparationQualityLibrary {
             prevHighMaskLimited = highMask;
             prevVHighRms = vHighRms;
 
+            // 反響検出: BGM高域がボーカル高域より大きい場合は反響(エコー)と判定 (反響対策)
+            const reverbPressure = this.clampNumber(
+                Math.max(0, (aHighRms / (vHighRms + 1e-9)) - 1.15) * 0.11
+                + Math.max(0, corrHigh - 0.18) * 0.13,
+                0, 0.30, 0,
+            );
             const highNoisePressure = this.clampNumber(
                 Math.max(0, corrHigh - 0.14) * 1.55
                 + Math.max(0, aHighRms - 0.0045) * 28
@@ -2242,6 +2281,7 @@ export class SeparationQualityLibrary {
                 + (likelyBgmOnly ? 0.16 : 0)
                 + (lowBandBgmPriorityMode ? 0.12 : 0)
                 + (highDeltaWasLimited ? 0.12 : 0)
+                + reverbPressure
                 - (voiceLike ? 0.05 : 0)
                 - (vHighRms > (aHighRms * 1.18) ? 0.07 : 0),
                 0,
@@ -2297,12 +2337,16 @@ export class SeparationQualityLibrary {
             const i2 = Math.min(frameCount - 1, i + 1);
             const iM2 = Math.max(0, i - 2);
             const iP2 = Math.min(frameCount - 1, i + 2);
+            const iM3 = Math.max(0, i - 3);
+            const iP3 = Math.min(frameCount - 1, i + 3);
             subLowMasksSmooth[i] = (subLowMasks[iM2] * 0.08) + (subLowMasks[i0] * 0.18) + (subLowMasks[i1] * 0.48) + (subLowMasks[i2] * 0.18) + (subLowMasks[iP2] * 0.08);
             lowMasksSmooth[i] = (lowMasks[iM2] * 0.08) + (lowMasks[i0] * 0.18) + (lowMasks[i1] * 0.48) + (lowMasks[i2] * 0.18) + (lowMasks[iP2] * 0.08);
             midMasksSmooth[i] = (midMasks[iM2] * 0.08) + (midMasks[i0] * 0.18) + (midMasks[i1] * 0.48) + (midMasks[i2] * 0.18) + (midMasks[iP2] * 0.08);
             const h3 = (highMasks[i0] * 0.18) + (highMasks[i1] * 0.64) + (highMasks[i2] * 0.18);
             const h5 = (highMasks[iM2] * 0.08) + (highMasks[i0] * 0.18) + (highMasks[i1] * 0.48) + (highMasks[i2] * 0.18) + (highMasks[iP2] * 0.08);
             const h5Strong = (highMasks[iM2] * 0.12) + (highMasks[i0] * 0.24) + (highMasks[i1] * 0.28) + (highMasks[i2] * 0.24) + (highMasks[iP2] * 0.12);
+            // 7タップ: 重度ガビり区間での強平滑化カーネル
+            const h7Strong = (highMasks[iM3] * 0.07) + (highMasks[iM2] * 0.13) + (highMasks[i0] * 0.20) + (highMasks[i1] * 0.20) + (highMasks[i2] * 0.20) + (highMasks[iP2] * 0.13) + (highMasks[iP3] * 0.07);
             const b0 = highSmoothBlendByFrame[i0];
             const b1 = highSmoothBlendByFrame[i1];
             const b2 = highSmoothBlendByFrame[i2];
@@ -2316,8 +2360,11 @@ export class SeparationQualityLibrary {
             );
             const toFive = this.clampNumber((smoothBlend - 0.12) / 0.46, 0, 1, 0);
             const toStrong = this.clampNumber((smoothBlend - 0.70) / 0.22, 0, 1, 0);
+            // 高smoothBlend時(≥0.83)は7タップに移行してガビりを抑制
+            const toSeven = this.clampNumber((smoothBlend - 0.83) / 0.10, 0, 1, 0);
             const hBase = (h3 * (1 - toFive)) + (h5 * toFive);
-            highMasksSmooth[i] = (hBase * (1 - toStrong)) + (h5Strong * toStrong);
+            const hMid = (hBase * (1 - toStrong)) + (h5Strong * toStrong);
+            highMasksSmooth[i] = (hMid * (1 - toSeven)) + (h7Strong * toSeven);
         }
 
         const outVocal = new Int16Array(vocal.samples.length);
@@ -2370,26 +2417,41 @@ export class SeparationQualityLibrary {
             const lowComponentAbs = Math.abs(xSubLow) + Math.abs(xLow);
             const lowProtectBlend = this.clampNumber(0.10 + (lowComponentAbs * 0.10), 0.10, 0.22, 0.12);
             const highProtectEnergyBoost = this.clampNumber(
-                Math.max(0, Math.abs(xHigh) - 0.022) * (0.035 + (highProtectBoost * 0.35)),
+                Math.max(0, Math.abs(xHigh) - 0.018) * (0.040 + (highProtectBoost * 0.40)),
                 0,
-                0.030,
+                0.038,
                 0,
             );
+            // 高域保護ブレンド強化 — 音抜け・音割れ・反響の自動補正に使用
             const highProtectBlend = this.clampNumber(
-                0.04 + (Math.abs(xHigh) * 0.10) + Math.max(0, 0.35 - highMask) * 0.10,
-                0.04,
-                0.14,
+                0.06 + (Math.abs(xHigh) * 0.12) + Math.max(0, 0.38 - highMask) * 0.12,
                 0.06,
-            ) + this.clampNumber(highProtectBoost + highProtectEnergyBoost, 0, 0.10, 0);
+                0.18,
+                0.08,
+            ) + this.clampNumber(highProtectBoost + highProtectEnergyBoost, 0, 0.12, 0);
             const highProtectBlendClamped = this.clampNumber(
                 highProtectBlend,
-                0.04,
-                0.20,
                 0.06,
+                0.26,
+                0.08,
             );
-            const protectBlend = this.clampNumber(Math.max(lowProtectBlend, highProtectBlendClamped), 0.08, 0.26, 0.12);
+            const protectBlend = this.clampNumber(Math.max(lowProtectBlend, highProtectBlendClamped), 0.10, 0.30, 0.14);
             yV = (yV * (1 - protectBlend)) + (vOrig * protectBlend);
             yV = Math.tanh(yV * 1.04) / Math.tanh(1.04);
+            // 音抜け自動補正: voiceLike区間で出力が原音の28%未満かつ混合音高域あり → 原音をブレンド
+            const isVoicedProxy = highMask >= 0.25;
+            if (isVoicedProxy) {
+                const yVAbs = Math.abs(yV);
+                const vOrigAbs = Math.abs(vOrig);
+                if (vOrigAbs > 0.018 && yVAbs < vOrigAbs * 0.28 && Math.abs(xHigh) > 0.010) {
+                    const dropoutSeverity = this.clampNumber(
+                        1 - (yVAbs / Math.max(vOrigAbs * 0.28, 1e-9)),
+                        0, 0.42, 0,
+                    );
+                    yV = (yV * (1 - dropoutSeverity)) + (vOrig * dropoutSeverity);
+                    yV = Math.tanh(yV * 1.02) / Math.tanh(1.02);
+                }
+            }
             const yA = x - yV;
 
             protectBlendSum += protectBlend;

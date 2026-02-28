@@ -132,7 +132,7 @@ class AudioPre:
                         ins_root,
                         head + "{}_{}.{}".format(name, self.data["agg"], format),
                     ),
-                    (np.array(wav_instrument) * 32768).astype("int16"),
+                    (np.clip(np.array(wav_instrument), -1.0, 1.0) * 32768).astype("int16"),
                     self.mp.param["sr"],
                 )  #
             else:
@@ -141,7 +141,7 @@ class AudioPre:
                 )
                 sf.write(
                     path,
-                    (np.array(wav_instrument) * 32768).astype("int16"),
+                    (np.clip(np.array(wav_instrument), -1.0, 1.0) * 32768).astype("int16"),
                     self.mp.param["sr"],
                 )
                 if os.path.exists(path):
@@ -173,7 +173,7 @@ class AudioPre:
                         vocal_root,
                         head + "{}_{}.{}".format(name, self.data["agg"], format),
                     ),
-                    (np.array(wav_vocals) * 32768).astype("int16"),
+                    (np.clip(np.array(wav_vocals), -1.0, 1.0) * 32768).astype("int16"),
                     self.mp.param["sr"],
                 )
             else:
@@ -182,7 +182,7 @@ class AudioPre:
                 )
                 sf.write(
                     path,
-                    (np.array(wav_vocals) * 32768).astype("int16"),
+                    (np.clip(np.array(wav_vocals), -1.0, 1.0) * 32768).astype("int16"),
                     self.mp.param["sr"],
                 )
                 if os.path.exists(path):
@@ -309,7 +309,7 @@ class AudioPreDeEcho:
                         ins_root,
                         "vocal_{}_{}.{}".format(name, self.data["agg"], format),
                     ),
-                    (np.array(wav_instrument) * 32768).astype("int16"),
+                    (np.clip(np.array(wav_instrument), -1.0, 1.0) * 32768).astype("int16"),
                     self.mp.param["sr"],
                 )  #
             else:
@@ -318,7 +318,7 @@ class AudioPreDeEcho:
                 )
                 sf.write(
                     path,
-                    (np.array(wav_instrument) * 32768).astype("int16"),
+                    (np.clip(np.array(wav_instrument), -1.0, 1.0) * 32768).astype("int16"),
                     self.mp.param["sr"],
                 )
                 if os.path.exists(path):
@@ -346,7 +346,7 @@ class AudioPreDeEcho:
                         vocal_root,
                         "instrument_{}_{}.{}".format(name, self.data["agg"], format),
                     ),
-                    (np.array(wav_vocals) * 32768).astype("int16"),
+                    (np.clip(np.array(wav_vocals), -1.0, 1.0) * 32768).astype("int16"),
                     self.mp.param["sr"],
                 )
             else:
@@ -355,7 +355,7 @@ class AudioPreDeEcho:
                 )
                 sf.write(
                     path,
-                    (np.array(wav_vocals) * 32768).astype("int16"),
+                    (np.clip(np.array(wav_vocals), -1.0, 1.0) * 32768).astype("int16"),
                     self.mp.param["sr"],
                 )
                 if os.path.exists(path):

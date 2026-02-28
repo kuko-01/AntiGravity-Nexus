@@ -35,6 +35,34 @@ export interface SingingLearningIngestResult {
     error?: string;
 }
 
+export interface DialogueExtractParams {
+    characterId: string;
+    sourceUrl: string;
+    startSec?: number;
+    durationSec: number;
+    separationPreference?: SeparationPreference;
+    ytDlpCookiesFile?: string;
+}
+
+export interface DialogueExtractResult {
+    success: boolean;
+    sourceUrl: string;
+    characterId: string;
+    runDir?: string;
+    startSec: number;
+    durationSec: number;
+    sourceAudioPath?: string;
+    vocalWavPath?: string;
+    method?: SeparationMethod;
+    warning?: string;
+    error?: string;
+}
+
+export interface DialogueExtractProgressEvent {
+    stage: string;
+    message: string;
+}
+
 export interface SingingLearningSeparationMethodView {
     method: SeparationMethod;
     scoreEma: number;
@@ -156,6 +184,254 @@ export class SingingLearningService {
         const match = source.match(regex);
         if (!match || !match[1]) return null;
         return match[1];
+    }
+
+    parseYouTubeTimestamp(url: string): number | null {
+        const match = url.match(/[?&]t=([^&\s#]+)/i);
+        if (!match) return null;
+        const raw = match[1];
+        if (/^\d+$/.test(raw)) return parseInt(raw, 10);
+        const hms = raw.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+        if (hms && (hms[1] || hms[2] || hms[3])) {
+            return (parseInt(hms[1] || '0', 10) * 3600)
+                + (parseInt(hms[2] || '0', 10) * 60)
+                + parseInt(hms[3] || '0', 10);
+        }
+        return null;
+    }
+
+    async extractDialogueClip(
+        params: DialogueExtractParams,
+        onProgress?: (event: DialogueExtractProgressEvent) => void,
+    ): Promise<DialogueExtractResult> {
+        const report = (stage: string, message: string): void => {
+            try {
+                onProgress?.({ stage, message });
+            } catch {
+                // Ignore progress callback failures
+            }
+        };
+        const characterId = this.normalizeId(params.characterId, 'character_default');
+        const sourceUrl = String(params.sourceUrl || '').trim();
+        if (!sourceUrl) {
+            return { success: false, sourceUrl, characterId, startSec: 0, durationSec: params.durationSec, error: 'YouTube URL is empty' };
+        }
+
+        const startSec = params.startSec ?? this.parseYouTubeTimestamp(sourceUrl) ?? 0;
+        const durationSec = Math.max(1, Math.floor(params.durationSec || 10));
+        const endSec = startSec + durationSec;
+        const sectionArg = `*${startSec}-${endSec}`;
+
+        const runId = this.createRunId();
+        const charDir = path.join(this.baseDir, characterId);
+        const runDir = path.join(charDir, 'dialogue_runs', runId);
+        const downloadDir = path.join(runDir, 'download');
+        const separateDir = path.join(runDir, 'separated');
+        const vocalDir = path.join(separateDir, 'vocals');
+        const instDir = path.join(separateDir, 'accompaniment');
+
+        fs.mkdirSync(downloadDir, { recursive: true });
+        fs.mkdirSync(vocalDir, { recursive: true });
+        fs.mkdirSync(instDir, { recursive: true });
+
+        const preWarnings: string[] = [];
+
+        report('download', 'YouTube音声を取得中...');
+        let downloaded = await this.downloadYouTubeAudio(
+            sourceUrl,
+            downloadDir,
+            params.ytDlpCookiesFile,
+            sectionArg,
+            (message) => report('download', message),
+        );
+        if ((!downloaded.success || !downloaded.audioPath) && this.isDialogueClipPartialDownloadTimeout(downloaded.error)) {
+            preWarnings.push('Dialogue clip partial download timed out; switched to full-audio download + local trim.');
+            report('download_retry', 'YouTube部分取得がタイムアウト。音声のみ取得に切り替えます...');
+            const fullDownloadDir = path.join(runDir, 'download_fallback_full');
+            fs.mkdirSync(fullDownloadDir, { recursive: true });
+            const fallbackDownloaded = await this.downloadYouTubeAudio(
+                sourceUrl,
+                fullDownloadDir,
+                params.ytDlpCookiesFile,
+                undefined,
+                (message) => report('download', `${message} [full-fallback]`),
+            );
+            if (!fallbackDownloaded.success || !fallbackDownloaded.audioPath) {
+                const partialErr = this.takeTail(downloaded.error || 'unknown partial download error', 320);
+                const fallbackErr = this.takeTail(fallbackDownloaded.error || 'unknown fallback download error', 320);
+                return {
+                    success: false, sourceUrl, characterId, runDir, startSec, durationSec,
+                    error: `Dialogue clip download failed (partial timeout + full fallback failed). partial=${partialErr} | fallback=${fallbackErr}`,
+                };
+            }
+            report('clip_trim', 'ローカルでクリップを切り出し中...');
+            const trimmed = await this.trimAudioClipWithFfmpeg(fallbackDownloaded.audioPath, runDir, startSec, durationSec);
+            if (!trimmed.success || !trimmed.audioPath) {
+                const trimErr = this.takeTail(trimmed.error || 'unknown trim error', 320);
+                return {
+                    success: false, sourceUrl, characterId, runDir, startSec, durationSec,
+                    error: `Dialogue clip download fallback succeeded but local trim failed: ${trimErr}`,
+                };
+            }
+            const mergedFallbackWarning = [fallbackDownloaded.warning, trimmed.warning].filter(Boolean).join(' ') || undefined;
+            downloaded = {
+                success: true,
+                audioPath: trimmed.audioPath,
+                warning: mergedFallbackWarning,
+            };
+        }
+        if (!downloaded.success || !downloaded.audioPath) {
+            return {
+                success: false, sourceUrl, characterId, runDir, startSec, durationSec,
+                error: downloaded.error || 'Failed to download audio clip from YouTube',
+            };
+        }
+        report('download_done', 'YouTube音声の取得完了。分離準備中...');
+
+        const separationPreference = this.normalizeSeparationPreference(params.separationPreference);
+        const separationPlan = this.buildSeparationPlan(separationPreference, characterId);
+        const dialogueFastAuto = separationPreference === 'auto';
+        if (downloaded.warning) preWarnings.push(downloaded.warning);
+        if (dialogueFastAuto) preWarnings.push('Dialogue extractor fast auto mode: using faster separator shortlist (ranking skipped).');
+
+        report('prepare', '分離用に音声を準備中...');
+        const prepared = await this.prepareSourceAudioForSeparation(downloaded.audioPath, runDir);
+        if (prepared.warning) preWarnings.push(prepared.warning);
+        const sourceAudioPath = prepared.audioPath;
+
+        const attemptErrors: string[] = [];
+        const failedMethods: SeparationMethod[] = [];
+        const methodsForInitialPass = separationPreference === 'auto'
+            ? this.buildDialogueFastAutoSeparationPlan(separationPlan)
+            : separationPlan;
+        const successfulCandidates: SeparationQualityCandidate[] = [];
+        let separation: SeparationAttempt = { success: false, error: 'No separator attempted.' };
+
+        for (const method of methodsForInitialPass) {
+            report('separate', `音声分離中... (${method})`);
+            const attempt = await this.runSeparationByMethod(method, sourceAudioPath, vocalDir, instDir);
+            if (attempt.success) {
+                if (attempt.vocalWavPath) {
+                    successfulCandidates.push({
+                        method: attempt.method || method,
+                        vocalWavPath: attempt.vocalWavPath,
+                        accompanimentWavPath: attempt.accompanimentWavPath,
+                        warning: attempt.warning,
+                    });
+                }
+                if (separationPreference !== 'auto') { separation = attempt; break; }
+                continue;
+            }
+            separation = attempt;
+            if (attempt.error) { attemptErrors.push(`${method}: ${attempt.error}`); failedMethods.push(method); }
+        }
+
+        if (dialogueFastAuto && successfulCandidates.length > 0) {
+            report('select', `分離候補を選択中... (高速モード: ${successfulCandidates[0].method})`);
+            const first = successfulCandidates[0];
+            separation = { success: true, method: first.method, vocalWavPath: first.vocalWavPath, warning: first.warning };
+            this.updateSeparationProfileForSuccess(characterId, first.method);
+        } else if (separationPreference === 'auto' && successfulCandidates.length > 0) {
+            report('select', '分離候補を品質評価中...');
+            try {
+                const selected = await this.selectBestSeparationCandidate(successfulCandidates, runDir, characterId, sourceAudioPath);
+                separation = { success: true, method: selected.candidate.method, vocalWavPath: selected.candidate.vocalWavPath, warning: selected.warning };
+                if (selected.scoredCandidates && selected.scoredCandidates.length > 0) {
+                    this.updateSeparationProfileFromScoredCandidates(characterId, selected.scoredCandidates);
+                } else {
+                    this.updateSeparationProfileForSuccess(characterId, selected.candidate.method);
+                }
+            } catch (_err) {
+                const first = successfulCandidates[0];
+                separation = { success: true, method: first.method, vocalWavPath: first.vocalWavPath, warning: first.warning };
+                this.updateSeparationProfileForSuccess(characterId, first.method);
+            }
+        } else if (separation.success && separation.method) {
+            this.updateSeparationProfileForSuccess(characterId, separation.method);
+        }
+
+        if ((!separation.success || !separation.vocalWavPath) && methodsForInitialPass.length < separationPlan.length) {
+            const fallbackMethod = separationPlan.find((method) => !methodsForInitialPass.includes(method));
+            if (fallbackMethod) {
+                report('separate_fallback', `音声分離中... (${fallbackMethod} fallback)`);
+                const fallback = await this.runSeparationByMethod(fallbackMethod, sourceAudioPath, vocalDir, instDir);
+                separation = fallback;
+                if (!fallback.success && fallback.error) { attemptErrors.push(`${fallbackMethod}: ${fallback.error}`); failedMethods.push(fallbackMethod); }
+                else if (fallback.success && fallback.method) { this.updateSeparationProfileForSuccess(characterId, fallback.method); }
+            }
+        }
+
+        if (failedMethods.length > 0) this.updateSeparationProfileForFailures(characterId, failedMethods);
+
+        if (!separation.success || !separation.vocalWavPath) {
+            const reasons = attemptErrors.length > 0 ? ` (${attemptErrors.join(' | ')})` : '';
+            return {
+                success: false, sourceUrl, characterId, runDir, startSec, durationSec, sourceAudioPath,
+                error: separation.error ? `${separation.error}${reasons}` : `Failed to separate vocal track${reasons}`,
+            };
+        }
+
+        report('done', `分離完了 (${separation.method || 'unknown'})`);
+        const allWarnings = [...preWarnings, separation.warning].filter(Boolean).join(' ') || undefined;
+        return {
+            success: true, sourceUrl, characterId, runDir, startSec, durationSec,
+            sourceAudioPath, vocalWavPath: separation.vocalWavPath,
+            method: separation.method, warning: allWarnings,
+        };
+    }
+
+    private isDialogueClipPartialDownloadTimeout(errorText?: string): boolean {
+        const text = String(errorText || '');
+        if (!text) return false;
+        return /Command timeout after \d+ms/i.test(text)
+            && /Dialogue clip partial download mode enabled/i.test(text);
+    }
+
+    private async trimAudioClipWithFfmpeg(
+        inputAudioPath: string,
+        runDir: string,
+        startSec: number,
+        durationSec: number,
+    ): Promise<{ success: boolean; audioPath?: string; warning?: string; error?: string }> {
+        const ffmpegTools = await this.ensureFfmpegTools();
+        if (!ffmpegTools.ffmpegPath) {
+            return {
+                success: false,
+                error: `ffmpeg is required for local dialogue clip trim (${ffmpegTools.error || 'ffmpeg not available'}).`,
+            };
+        }
+        const trimmedDir = path.join(runDir, 'trimmed');
+        fs.mkdirSync(trimmedDir, { recursive: true });
+        const trimmedWavPath = path.join(trimmedDir, `dialogue_clip_${Date.now()}.wav`);
+        const safeStart = Math.max(0, Number.isFinite(startSec) ? startSec : 0);
+        const safeDuration = Math.max(1, Math.floor(Number.isFinite(durationSec) ? durationSec : 10));
+        const trim = await this.runCommand(ffmpegTools.ffmpegPath, [
+            '-y',
+            '-ss', safeStart.toFixed(3),
+            '-t', safeDuration.toFixed(3),
+            '-i', inputAudioPath,
+            '-vn',
+            '-ac', '2',
+            '-ar', '44100',
+            '-c:a', 'pcm_s16le',
+            trimmedWavPath,
+        ], {
+            timeoutMs: Math.min(10 * 60 * 1000, Math.max(60_000, safeDuration * 8_000)),
+        });
+        if (!trim.success || !fs.existsSync(trimmedWavPath)) {
+            return {
+                success: false,
+                error: `ffmpeg dialogue clip trim failed (${this.takeTail(trim.stderr || trim.stdout, 360) || 'unknown error'}).`,
+            };
+        }
+        const warning = [ffmpegTools.warning, `Dialogue clip fallback used local ffmpeg trim (${safeStart.toFixed(1)}s + ${safeDuration}s).`]
+            .filter(Boolean)
+            .join(' ');
+        return {
+            success: true,
+            audioPath: trimmedWavPath,
+            warning: warning || undefined,
+        };
     }
 
     getSeparationProfile(characterIdRaw: string): SingingLearningSeparationProfileView {
@@ -745,6 +1021,18 @@ export class SingingLearningService {
         return [preference, ...defaultPlan.filter((method) => method !== preference)];
     }
 
+    private buildDialogueFastAutoSeparationPlan(autoPlan: SeparationMethod[]): SeparationMethod[] {
+        // Dialogue clip extraction favors responsiveness over exhaustive separator comparison.
+        // Skip UVR Ultimate in auto mode (heavy install/import path) and try at most two practical separators first.
+        const preferred = autoPlan.filter((method) => method !== 'uvr-ultimate' && method !== 'ffmpeg-fallback');
+        const shortlist = preferred.slice(0, 2);
+        if (shortlist.length > 0) {
+            return shortlist;
+        }
+        const fallbackOnly = autoPlan.find((method) => method === 'ffmpeg-fallback');
+        return fallbackOnly ? [fallbackOnly] : autoPlan.filter((method) => method !== 'uvr-ultimate');
+    }
+
     private async runSeparationByMethod(
         method: SeparationMethod,
         sourceAudioPath: string,
@@ -1102,7 +1390,16 @@ export class SingingLearningService {
         sourceUrl: string,
         outputDir: string,
         cookiesFile?: string,
+        sectionArg?: string,
+        onProgress?: (message: string) => void,
     ): Promise<{ success: boolean; audioPath?: string; warning?: string; error?: string }> {
+        const notify = (message: string): void => {
+            try {
+                onProgress?.(message);
+            } catch {
+                // Ignore progress callback errors
+            }
+        };
         const outputTemplate = path.join(outputDir, 'source.%(ext)s');
         const ytDlp = await this.resolveYtDlpCommand();
         if (!ytDlp) {
@@ -1125,6 +1422,24 @@ export class SingingLearningService {
         }
 
         const cookieArgs = validCookiesFile ? ['--cookies', validCookiesFile] : [];
+        let ytDlpFfmpegArgs: string[] = [];
+        let ytDlpEnv: NodeJS.ProcessEnv | undefined;
+        if (sectionArg) {
+            const ffmpegTools = await this.ensureFfmpegTools();
+            if (!ffmpegTools.ffmpegPath) {
+                const warningPrefix = warnings.length > 0 ? `[warnings: ${warnings.join(' ')}] ` : '';
+                return {
+                    success: false,
+                    error: `${warningPrefix}yt-dlp partial download requires ffmpeg, but ffmpeg could not be prepared (${ffmpegTools.error || 'unknown error'}).`,
+                };
+            }
+            const ffmpegDir = path.dirname(ffmpegTools.ffmpegPath);
+            ytDlpFfmpegArgs = ['--ffmpeg-location', ffmpegDir];
+            ytDlpEnv = this.buildEnvWithAdditionalPath(ffmpegDir);
+            if (ffmpegTools.warning) {
+                warnings.push(ffmpegTools.warning);
+            }
+        }
         // Strip playlist/radio query params so yt-dlp only downloads this single video.
         const cleanUrl = this.cleanYouTubeUrl(sourceUrl);
         const musicUrl = this.buildMusicYouTubeUrl(sourceUrl);
@@ -1138,13 +1453,22 @@ export class SingingLearningService {
             warnings.push(`Using JS runtime for yt-dlp (${runtimeArgs.join(' ')})`);
         }
 
-        const baseFixedArgs = ['--ignore-config', '--no-playlist', '-o', outputTemplate, ...runtimeArgs];
+        const sectionMode = !!sectionArg;
+        const sectionArgs = sectionArg ? ['--download-sections', sectionArg] : [];
+        const sectionNetworkArgs = sectionMode
+            ? ['--socket-timeout', '20', '--retries', '1', '--fragment-retries', '1']
+            : [];
+        const baseFixedArgs = ['--ignore-config', '--no-playlist', '-o', outputTemplate, ...ytDlpFfmpegArgs, ...runtimeArgs, ...sectionNetworkArgs, ...sectionArgs];
+        const downloadAttemptTimeoutMs = sectionMode ? 75 * 1000 : 30 * 60 * 1000;
+        if (sectionMode) {
+            warnings.push(`Dialogue clip partial download mode enabled (timeout=${Math.floor(downloadAttemptTimeoutMs / 1000)}s/attempt).`);
+        }
 
         const runAttempt = async (extraArgs: string[], url: string): Promise<CommandResult> => (
             this.runCommand(
                 activeYtDlp.command,
                 activeYtDlp.argsPrefix.concat(cookieArgs, extraArgs, baseFixedArgs, [url]),
-                { cwd: outputDir, timeoutMs: 30 * 60 * 1000 },
+                { cwd: outputDir, timeoutMs: downloadAttemptTimeoutMs, env: ytDlpEnv },
             )
         );
 
@@ -1155,61 +1479,76 @@ export class SingingLearningService {
         type Attempt = [string[], string, string];
         const mkClient = (client: string): string[] => ['--extractor-args', `youtube:player_client=${client}`];
         const fmt = (f: string): string[] => ['-f', f];
+        const fastAudioFmt = (sectionMode ? '140/251/250/249/bestaudio' : 'bestaudio/best');
 
         const musicAttempts: Attempt[] = musicUrl ? [
-            [[...mkClient('ios_music'), ...fmt('bestaudio/best')], musicUrl, 'ios_music+music_url'],
-            [[...mkClient('android_music'), ...fmt('bestaudio/best')], musicUrl, 'android_music+music_url'],
-            [[...mkClient('web_music'), ...fmt('bestaudio/best')], musicUrl, 'web_music+music_url'],
-            [fmt('bestaudio/best'), musicUrl, 'bestaudio+music_url'],
+            [[...mkClient('ios_music'), ...fmt(fastAudioFmt)], musicUrl, 'ios_music+music_url'],
+            [[...mkClient('android_music'), ...fmt(fastAudioFmt)], musicUrl, 'android_music+music_url'],
+            [[...mkClient('web_music'), ...fmt(fastAudioFmt)], musicUrl, 'web_music+music_url'],
+            [fmt(fastAudioFmt), musicUrl, 'bestaudio+music_url'],
             [[], musicUrl, 'default+music_url'],
             [fmt('worst'), musicUrl, 'worst+music_url'],
         ] : [];
 
-        const attempts: Attempt[] = [
+        const fullAttempts: Attempt[] = [
             // YouTube Music-specific mobile clients on clean URL (no playlist params)
-            [[...mkClient('ios_music'), ...fmt('bestaudio/best')], cleanUrl, 'ios_music'],
-            [[...mkClient('android_music'), ...fmt('bestaudio/best')], cleanUrl, 'android_music'],
+            [[...mkClient('ios_music'), ...fmt(fastAudioFmt)], cleanUrl, 'ios_music'],
+            [[...mkClient('android_music'), ...fmt(fastAudioFmt)], cleanUrl, 'android_music'],
             // music.youtube.com URL variants interleaved (cookie domain match)
             ...musicAttempts,
             // Standard selectors on clean URL
-            [fmt('bestaudio/best'), cleanUrl, 'bestaudio'],
+            [fmt(fastAudioFmt), cleanUrl, 'bestaudio'],
             [[], cleanUrl, 'default'],
-            [[...mkClient('ios'), ...fmt('bestaudio/best')], cleanUrl, 'ios'],
+            [[...mkClient('ios'), ...fmt(fastAudioFmt)], cleanUrl, 'ios'],
             [fmt('worst'), cleanUrl, 'worst'],
         ];
+        const fastSectionAttempts: Attempt[] = [
+            [[...mkClient('ios_music'), ...fmt(fastAudioFmt)], cleanUrl, 'ios_music'],
+            ...(musicUrl ? [[[...mkClient('ios_music'), ...fmt(fastAudioFmt)], musicUrl, 'ios_music+music_url'] as Attempt] : []),
+            [fmt(fastAudioFmt), cleanUrl, 'bestaudio'],
+        ];
+        const attempts: Attempt[] = sectionArg ? fastSectionAttempts : fullAttempts;
 
         let lastError = '';
         let successLabel = '';
         let finalResult: CommandResult | null = null;
 
-        for (const [extraArgs, url, label] of attempts) {
+        for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
+            const [extraArgs, url, label] = attempts[attemptIndex];
+            notify(`YouTube音声を取得中... (${attemptIndex + 1}/${attempts.length}: ${label})`);
             const result = await runAttempt(extraArgs, url);
             if (result.success) {
                 finalResult = result;
                 successLabel = label;
+                notify(`YouTube音声を取得完了 (${label})`);
                 break;
             }
             const errorText = result.stderr || result.stdout || '';
+            if (result.code === -1 && /Command timeout/i.test(errorText)) {
+                notify(`YouTube音声取得タイムアウト。次の方式で再試行します... (${label})`);
+            }
             if (this.isYtDlpPremiumRestrictedError(errorText)) {
                 // Authentication failure — try browser cookies combined with music URL.
                 const urlsToTry = [cleanUrl, ...(musicUrl ? [musicUrl] : [])];
                 const cookieSources = this.buildYtDlpCookieSources();
                 outer: for (const tryUrl of urlsToTry) {
                     for (const source of cookieSources) {
+                        notify(`YouTube認証付き再試行中... (browser cookies: ${source})`);
                         const browserRetry = await this.runCommand(
                             activeYtDlp.command,
                             activeYtDlp.argsPrefix.concat(
                                 cookieArgs,
                                 ['--cookies-from-browser', source],
-                                [...mkClient('ios_music'), ...fmt('bestaudio/best')],
+                                [...mkClient('ios_music'), ...fmt(fastAudioFmt)],
                                 baseFixedArgs,
                                 [tryUrl],
                             ),
-                            { cwd: outputDir, timeoutMs: 30 * 60 * 1000 },
+                            { cwd: outputDir, timeoutMs: downloadAttemptTimeoutMs, env: ytDlpEnv },
                         );
                         if (browserRetry.success) {
                             finalResult = browserRetry;
                             successLabel = `browser:${source}`;
+                            notify(`YouTube音声を取得完了 (browser cookies: ${source})`);
                             break outer;
                         }
                     }
@@ -1270,6 +1609,13 @@ export class SingingLearningService {
             .map((name) => path.join(outputDir, name))
             .filter((fullPath) => fs.statSync(fullPath).isFile());
         const sortedByRecent = files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+        const stableOutputFiles = sortedByRecent.filter((filePath) => {
+            const lower = filePath.toLowerCase();
+            const base = path.basename(lower);
+            if (base.endsWith('.part') || base.endsWith('.ytdl') || base.endsWith('.tmp')) return false;
+            if (base.includes('.part-frag')) return false;
+            return true;
+        });
         const wavCandidate = sortedByRecent.find((filePath) => filePath.toLowerCase().endsWith('.wav'));
         if (wavCandidate) {
             return {
@@ -1278,7 +1624,7 @@ export class SingingLearningService {
                 warning: warnings.length > 0 ? warnings.join(' ') : undefined,
             };
         }
-        const audioCandidate = sortedByRecent.find((filePath) => /\.(m4a|mp3|webm|ogg|flac|aac)$/i.test(filePath));
+        const audioCandidate = stableOutputFiles.find((filePath) => /\.(m4a|mp3|webm|ogg|flac|aac|opus|mp4|m4v|mkv|mov)$/i.test(filePath));
         if (audioCandidate) {
             return {
                 success: true,
@@ -1287,9 +1633,32 @@ export class SingingLearningService {
             };
         }
 
+        const fallbackMediaCandidate = stableOutputFiles.find((filePath) => {
+            const lower = filePath.toLowerCase();
+            if (/\.(json|txt|jpg|jpeg|png|webp|vtt|srt|ass|lrc|nfo)$/i.test(lower)) return false;
+            try {
+                return fs.statSync(filePath).size > 64 * 1024;
+            } catch {
+                return false;
+            }
+        });
+        if (fallbackMediaCandidate) {
+            warnings.push(`yt-dlp produced unexpected media container: ${path.basename(fallbackMediaCandidate)}`);
+            return {
+                success: true,
+                audioPath: fallbackMediaCandidate,
+                warning: warnings.length > 0 ? warnings.join(' ') : undefined,
+            };
+        }
+
+        const producedNames = sortedByRecent
+            .slice(0, 10)
+            .map((filePath) => path.basename(filePath))
+            .join(', ');
+
         return {
             success: false,
-            error: 'No audio file was produced by yt-dlp.',
+            error: `No audio file was produced by yt-dlp.${producedNames ? ` Files found: ${producedNames}` : ''}`,
         };
     }
 
@@ -1577,6 +1946,13 @@ raise SystemExit(0)
         if (!manifest) {
             return { success: false, error: 'RVC install manifest not found' };
         }
+        const ffmpegTools = await this.ensureFfmpegTools();
+        if (!ffmpegTools.ffmpegPath) {
+            return {
+                success: false,
+                error: ffmpegTools.error || 'ffmpeg not found. UVR5 requires ffmpeg/ffprobe.',
+            };
+        }
 
         const pythonExe = this.resolvePythonExecutable(manifest.pythonPath);
         if (!pythonExe) {
@@ -1645,13 +2021,16 @@ for row in uvr(
 print(json.dumps({'ok': True, 'logs': infos[-3:]}))
 `.trim();
 
+        const uvrEnv = this.buildEnvWithAdditionalPath(path.dirname(ffmpegTools.ffmpegPath), {
+            ...process.env,
+            weight_uvr5_root: weightRoot,
+            PYTHONUTF8: '1',
+            PYTHONIOENCODING: 'utf-8',
+        });
         const result = await this.runCommand(pythonExe, ['-c', script], {
             cwd: rvcOfficialRoot,
             timeoutMs: 45 * 60 * 1000,
-            env: {
-                ...process.env,
-                weight_uvr5_root: weightRoot,
-            },
+            env: uvrEnv,
         });
         if (!result.success) {
             return {
@@ -1659,10 +2038,37 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                 error: `UVR separation failed: ${this.takeTail(result.stderr || result.stdout, 600)}`,
             };
         }
+        try {
+            const logPath = path.join(path.dirname(sourceAudioPath), `uvr5_${Date.now()}.log`);
+            const payload = [
+                `code=${result.code}`,
+                '',
+                '[stderr]',
+                result.stderr || '',
+                '',
+                '[stdout]',
+                result.stdout || '',
+            ].join('\n');
+            fs.writeFileSync(logPath, payload, 'utf-8');
+        } catch {
+            // Ignore UVR debug log write failures.
+        }
+        const uvrReport = this.tryParseLastJsonLine<{ ok?: boolean; logs?: unknown }>(result.stdout || '');
+        const uvrLogs = Array.isArray(uvrReport?.logs)
+            ? uvrReport.logs.map((value) => String(value)).filter(Boolean)
+            : [];
+        const uvrLogTail = uvrLogs.length > 0 ? this.takeTail(uvrLogs.join(' | '), 360) : undefined;
 
         const vocalWav = this.findStemFile(uvrVocalOutDir, ['vocals', 'vocal', 'main_vocal']);
         if (!vocalWav) {
-            return { success: false, error: 'UVR separation completed but vocal WAV not found' };
+            const debugWavs = this.collectFilesRecursive(path.dirname(sourceAudioPath))
+                .filter((fullPath) => fullPath.toLowerCase().endsWith('.wav') && fullPath.includes(`uvr5_run_${uvrStamp}`))
+                .slice(0, 10)
+                .map((fullPath) => path.basename(fullPath));
+            return {
+                success: false,
+                error: `UVR separation completed but vocal WAV not found${uvrLogTail ? ` (uvr: ${uvrLogTail})` : ''}${debugWavs.length > 0 ? ` [debug files: ${debugWavs.join(', ')}]` : ''}`,
+            };
         }
         const accompanimentWav = this.findStemFile(
             uvrAccOutDir,
@@ -1683,7 +2089,7 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             method: 'uvr5',
             vocalWavPath: vocalCopyPath,
             accompanimentWavPath: accompanimentCopyPath,
-            warning: ensureWeights.warning,
+            warning: [ensureWeights.warning, ffmpegTools.warning].filter(Boolean).join(' ') || undefined,
         };
     }
 
@@ -2485,7 +2891,21 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                     const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
                     const lowImproved = beforeLow - afterMetrics.lowBandRatio;
                     const leakImproved = beforeLeak - afterLeak;
-                    const improved = (
+                    const scoreDrop = beforeScore.score - afterScore.score;
+                    const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+                    const silenceRise = afterMetrics.silenceRatio - beforeMetrics.silenceRatio;
+                    const lowWorsened = afterMetrics.lowBandRatio - beforeLow;
+                    const bgmSuppressRatio = reprojSummary.frameCount > 0
+                        ? (reprojSummary.bgmOnlySuppressedFrames / reprojSummary.frameCount)
+                        : 0;
+                    const regressionSafe = (
+                        scoreDrop <= 2.5
+                        && speechDrop <= 0.035
+                        && silenceRise <= 0.07
+                        && lowWorsened <= 0.06
+                        && bgmSuppressRatio <= (beforeMetrics.speechActivityRatio < 0.50 ? 0.18 : 0.30)
+                    );
+                    const improved = regressionSafe && (
                         afterScore.score >= beforeScore.score + 0.8
                         || leakImproved >= 0.015
                         || lowImproved >= 0.020
@@ -2509,7 +2929,7 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                         try { if (fs.existsSync(reprojVocalPath)) fs.unlinkSync(reprojVocalPath); } catch {}
                         try { if (fs.existsSync(reprojAccPath)) fs.unlinkSync(reprojAccPath); } catch {}
                         enhancementNotes.push(
-                            `Mixture reprojection not adopted (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, low ${beforeLow.toFixed(2)}->${afterMetrics.lowBandRatio.toFixed(2)}).`,
+                            `Mixture reprojection not adopted (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, low ${beforeLow.toFixed(2)}->${afterMetrics.lowBandRatio.toFixed(2)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}, bgmRatio=${bgmSuppressRatio.toFixed(2)}).`,
                         );
                     }
                 } catch (error) {
@@ -2533,6 +2953,11 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                     const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
                     const beforeLow = beforeMetrics.lowBandRatio;
                     const beforeHigh = beforeMetrics.highBandRatio;
+                    const beforeHighRough = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(subbandInputPath);
+                    const beforeLowBandLeak = SeparationQualityLibrary.estimateLowBandLeakageCorrelation(
+                        subbandInputPath,
+                        preparedAccMonoPath,
+                    );
 
                     const subbandSummary = SeparationQualityLibrary.refineWithOriginalMixtureSubbandMaskMonoPcm16Wav(
                         preparedMixMonoPath,
@@ -2545,14 +2970,42 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                     const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(subbandVocalPath);
                     const afterLeak = SeparationQualityLibrary.estimateLeakageCorrelation(subbandVocalPath, subbandAccPath);
                     const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
+                    const afterHighRough = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(subbandVocalPath);
+                    const afterLowBandLeak = SeparationQualityLibrary.estimateLowBandLeakageCorrelation(
+                        subbandVocalPath,
+                        subbandAccPath,
+                    );
                     const lowImproved = beforeLow - afterMetrics.lowBandRatio;
                     const highImproved = beforeHigh - afterMetrics.highBandRatio;
+                    const highRoughDelta = afterHighRough - beforeHighRough;
                     const leakImproved = beforeLeak - afterLeak;
-                    const improved = (
+                    const lowBandLeakImproved = beforeLowBandLeak - afterLowBandLeak;
+                    const scoreDrop = beforeScore.score - afterScore.score;
+                    const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+                    const silenceRise = afterMetrics.silenceRatio - beforeMetrics.silenceRatio;
+                    const lowWorsened = afterMetrics.lowBandRatio - beforeLow;
+                    const leakWorsened = afterLeak - beforeLeak;
+                    const lowBandLeakWorsened = afterLowBandLeak - beforeLowBandLeak;
+                    const bgmSuppressRatio = subbandSummary.frameCount > 0
+                        ? (subbandSummary.bgmOnlySuppressedFrames / subbandSummary.frameCount)
+                        : 0;
+                    const regressionSafe = (
+                        scoreDrop <= 2.0
+                        && speechDrop <= 0.030
+                        && silenceRise <= 0.06
+                        && lowWorsened <= 0.05
+                        && leakWorsened <= 0.025
+                        && lowBandLeakWorsened <= 0.012
+                        && highRoughDelta <= Math.max(0.00045, beforeHighRough * 0.18)
+                        && bgmSuppressRatio <= (beforeMetrics.speechActivityRatio < 0.50 ? 0.20 : 0.32)
+                    );
+                    const improved = regressionSafe && (
                         afterScore.score >= beforeScore.score + 0.8
                         || leakImproved >= 0.012
+                        || lowBandLeakImproved >= 0.010
                         || lowImproved >= 0.018
                         || (afterScore.score >= beforeScore.score - 0.4 && lowImproved >= 0.010 && highImproved >= 0.010)
+                        || (lowImproved >= 0.012 && highRoughDelta <= 0.00020 && leakWorsened <= 0.010 && lowBandLeakWorsened <= 0.006)
                     );
 
                     if (improved) {
@@ -2566,13 +3019,13 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                         }
                         leakageForCleanupTuning = afterLeak;
                         enhancementNotes.push(
-                            `Subband reprojection applied (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, low ${beforeLow.toFixed(2)}->${afterMetrics.lowBandRatio.toFixed(2)}, high ${beforeHigh.toFixed(2)}->${afterMetrics.highBandRatio.toFixed(2)}, lag=${subbandSummary.estimatedLagMs.toFixed(1)}ms, m=${subbandSummary.avgLowMask.toFixed(2)}/${subbandSummary.avgMidMask.toFixed(2)}/${subbandSummary.avgHighMask.toFixed(2)}, bgmFrames=${subbandSummary.bgmOnlySuppressedFrames}).`,
+                            `Subband reprojection applied (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, low ${beforeLow.toFixed(2)}->${afterMetrics.lowBandRatio.toFixed(2)}, high ${beforeHigh.toFixed(2)}->${afterMetrics.highBandRatio.toFixed(2)}, rough ${beforeHighRough.toFixed(4)}->${afterHighRough.toFixed(4)}, lag=${subbandSummary.estimatedLagMs.toFixed(1)}ms, m4=${subbandSummary.avgSubLowMask.toFixed(2)}/${subbandSummary.avgLowMask.toFixed(2)}/${subbandSummary.avgMidMask.toFixed(2)}/${subbandSummary.avgHighMask.toFixed(2)}, hDelta=${subbandSummary.avgHighMaskDelta.toFixed(3)}/${subbandSummary.maxHighMaskDelta.toFixed(3)}(#${subbandSummary.highMaskDeltaLimitedFrames}), hSm=${subbandSummary.avgHighSmoothBlend.toFixed(2)}(#${subbandSummary.highStrongSmoothFrames}), vib=${subbandSummary.avgVibratoProxy.toFixed(2)}(#${subbandSummary.vibratoGuardFrames}), pBl=${subbandSummary.avgProtectBlend.toFixed(2)}(+${subbandSummary.avgHighProtectBoost.toFixed(2)},r=${subbandSummary.highProtectBoostRatio.toFixed(2)}), bgmFrames=${subbandSummary.bgmOnlySuppressedFrames}, lowBgmFrames=${subbandSummary.lowBgmPriorityFrames}).`,
                         );
                     } else {
                         try { if (fs.existsSync(subbandVocalPath)) fs.unlinkSync(subbandVocalPath); } catch {}
                         try { if (fs.existsSync(subbandAccPath)) fs.unlinkSync(subbandAccPath); } catch {}
                         enhancementNotes.push(
-                            `Subband reprojection not adopted (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, low ${beforeLow.toFixed(2)}->${afterMetrics.lowBandRatio.toFixed(2)}, high ${beforeHigh.toFixed(2)}->${afterMetrics.highBandRatio.toFixed(2)}).`,
+                            `Subband reprojection not adopted (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, low ${beforeLow.toFixed(2)}->${afterMetrics.lowBandRatio.toFixed(2)}, high ${beforeHigh.toFixed(2)}->${afterMetrics.highBandRatio.toFixed(2)}, rough ${beforeHighRough.toFixed(4)}->${afterHighRough.toFixed(4)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}, hDelta=${subbandSummary.avgHighMaskDelta.toFixed(3)}/${subbandSummary.maxHighMaskDelta.toFixed(3)}(#${subbandSummary.highMaskDeltaLimitedFrames}), hSm=${subbandSummary.avgHighSmoothBlend.toFixed(2)}(#${subbandSummary.highStrongSmoothFrames}), vib=${subbandSummary.avgVibratoProxy.toFixed(2)}(#${subbandSummary.vibratoGuardFrames}), pBl=${subbandSummary.avgProtectBlend.toFixed(2)}(+${subbandSummary.avgHighProtectBoost.toFixed(2)},r=${subbandSummary.highProtectBoostRatio.toFixed(2)}), bgmRatio=${bgmSuppressRatio.toFixed(2)}, lowBgmFrames=${subbandSummary.lowBgmPriorityFrames}).`,
                         );
                     }
                 } catch (error) {
@@ -2651,17 +3104,76 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
 
                 const beforeMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(musicRemovalInputPath);
                 const beforeLeak = SeparationQualityLibrary.estimateLeakageCorrelation(musicRemovalInputPath, preparedAccMonoPath);
+                const beforeLowBandLeak = SeparationQualityLibrary.estimateLowBandLeakageCorrelation(
+                    musicRemovalInputPath,
+                    preparedAccMonoPath,
+                );
                 const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
+                const bassVocalProtectBias = this.clampNumber(
+                    (beforeMetrics.speechActivityRatio < 0.55 ? 0.03 : 0)
+                    + Math.max(0, beforeMetrics.lowBandRatio - 0.10) * 0.35
+                    - Math.max(0, beforeLeak - 0.14) * 0.08,
+                    0,
+                    0.10,
+                    0.03,
+                );
+                const timelineSuppressionGain = this.clampNumber(
+                    beforeMetrics.speechActivityRatio >= 0.62
+                        ? (beforeLeak >= 0.12 ? 0.22 : 0.28)
+                        : beforeMetrics.speechActivityRatio >= 0.50
+                            ? (beforeLeak >= 0.12 ? 0.26 : 0.32)
+                            : (beforeLeak >= 0.12 ? 0.48 : 0.58),
+                    0.24,
+                    0.70,
+                    0.34,
+                ) + bassVocalProtectBias;
+                const timelineSuppressionGainClamped = this.clampNumber(timelineSuppressionGain, 0.24, 0.78, 0.36);
                 const trimSummary = SeparationQualityLibrary.removeMusicOnlySectionsWithReferenceMonoPcm16Wav(
                     musicRemovalInputPath,
                     preparedAccMonoPath,
                     musicOnlyTrimPath,
+                    { preserveTimeline: true, preserveTimelineAttenuation: timelineSuppressionGainClamped },
                 );
                 const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(musicOnlyTrimPath);
                 const afterLeak = SeparationQualityLibrary.estimateLeakageCorrelation(musicOnlyTrimPath, preparedAccMonoPath);
+                const afterLowBandLeak = SeparationQualityLibrary.estimateLowBandLeakageCorrelation(
+                    musicOnlyTrimPath,
+                    preparedAccMonoPath,
+                );
                 const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
                 const leakImprovementAbs = beforeLeak - afterLeak;
                 const leakImprovementRatio = beforeLeak > 1e-6 ? (leakImprovementAbs / beforeLeak) : 0;
+                const lowBandLeakImprovementAbs = beforeLowBandLeak - afterLowBandLeak;
+                const lowBandLeakWorsened = afterLowBandLeak - beforeLowBandLeak;
+                const totalBeforeMs = Math.max(1, beforeMetrics.durationMs || (trimSummary.outputDurationMs + trimSummary.removedDurationMs));
+                const removedRatio = trimSummary.removedDurationMs / totalBeforeMs;
+                const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+                const silenceRise = afterMetrics.silenceRatio - beforeMetrics.silenceRatio;
+                const midBandDrop = beforeMetrics.midBandRatio - afterMetrics.midBandRatio;
+                const likelyContinuousVocal = beforeMetrics.speechActivityRatio >= 0.52;
+                const continuitySafe = (
+                    speechDrop <= 0.05
+                    && silenceRise <= 0.10
+                    && midBandDrop <= 0.06
+                    && lowBandLeakWorsened <= 0.010
+                );
+                const aggressiveTrimOnContinuousVocal = likelyContinuousVocal && (
+                    removedRatio >= 0.05
+                    || trimSummary.removedSegments >= 8
+                ) && (
+                    speechDrop > 0.015
+                    || silenceRise > 0.04
+                    || midBandDrop > 0.025
+                );
+                const overSuppressionOnSparseVocal = (
+                    beforeMetrics.speechActivityRatio < 0.48
+                    && removedRatio >= 0.18
+                    && (
+                        leakImprovementAbs < 0.010
+                        || speechDrop > 0.01
+                        || midBandDrop > 0.02
+                    )
+                );
 
                 const removedEnough = trimSummary.removedDurationMs >= 500;
                 const removedSome = trimSummary.removedDurationMs >= 180;
@@ -2669,10 +3181,12 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                     && trimSummary.outputDurationMs >= Math.round(trimSummary.outputDurationMs + trimSummary.removedDurationMs > 0
                         ? (trimSummary.outputDurationMs + trimSummary.removedDurationMs) * 0.18
                         : 15_000);
-                const improved = outputStillUsable && (
+                const improved = outputStillUsable && continuitySafe && !aggressiveTrimOnContinuousVocal && !overSuppressionOnSparseVocal && (
                     afterScore.score >= beforeScore.score + 1.0
                     || afterLeak <= beforeLeak - 0.025
+                    || afterLowBandLeak <= beforeLowBandLeak - 0.010
                     || (removedSome && leakImprovementRatio >= 0.15)
+                    || (removedSome && lowBandLeakImprovementAbs >= 0.008)
                     || leakImprovementAbs >= 0.010
                     || (afterScore.score >= beforeScore.score && afterLeak < beforeLeak && trimSummary.zeroedShortGapDurationMs >= 120)
                     || (removedEnough && afterScore.score >= beforeScore.score - 1.0)
@@ -2685,17 +3199,71 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                     cleanupInputPath = musicOnlyTrimPath;
                     leakageForCleanupTuning = afterLeak;
                     enhancementNotes.push(
-                        `Music-only section removal applied (removed ${trimSummary.removedDurationMs}ms in ${trimSummary.removedSegments} segments, output ${trimSummary.outputDurationMs}ms, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}).`,
+                        `Music-only section removal applied (timeline-preserved, suppressed ${trimSummary.removedDurationMs}ms in ${trimSummary.removedSegments} segments, gain=${timelineSuppressionGainClamped.toFixed(2)}, output ${trimSummary.outputDurationMs}ms, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}).`,
                     );
                 } else {
                     try { if (fs.existsSync(musicOnlyTrimPath)) fs.unlinkSync(musicOnlyTrimPath); } catch {}
                     enhancementNotes.push(
-                        `Music-only section removal not adopted (removed ${trimSummary.removedDurationMs}ms, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}).`,
+                        `Music-only section removal not adopted (timeline-preserved, suppressed ${trimSummary.removedDurationMs}ms @gain=${timelineSuppressionGainClamped.toFixed(2)}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}).`,
                     );
                 }
             } catch (error) {
                 enhancementNotes.push(`Music-only section removal skipped (${error instanceof Error ? error.message : String(error)}).`);
                 try { if (fs.existsSync(musicOnlyTrimPath)) fs.unlinkSync(musicOnlyTrimPath); } catch {}
+            }
+        }
+
+        if (fs.existsSync(cleanupInputPath)) {
+            const highSmoothInputPath = cleanupInputPath === sourcePath
+                ? (analysisPrepared ? preparedVocalMonoPath : cleanupInputPath)
+                : cleanupInputPath;
+            if (fs.existsSync(highSmoothInputPath)) {
+                const highSmoothPath = path.join(enhancedDir, `vocal_high_smooth_${stamp}.wav`);
+                try {
+                    const beforeMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(highSmoothInputPath);
+                    const beforeLeak = (preparedAccMonoPath && fs.existsSync(preparedAccMonoPath))
+                        ? SeparationQualityLibrary.estimateLeakageCorrelation(highSmoothInputPath, preparedAccMonoPath)
+                        : 0;
+                    const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
+                    const smoothingSummary = SeparationQualityLibrary.smoothHarshHighBandMonoPcm16Wav(
+                        highSmoothInputPath,
+                        highSmoothPath,
+                    );
+                    const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(highSmoothPath);
+                    const afterLeak = (preparedAccMonoPath && fs.existsSync(preparedAccMonoPath))
+                        ? SeparationQualityLibrary.estimateLeakageCorrelation(highSmoothPath, preparedAccMonoPath)
+                        : beforeLeak;
+                    const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
+
+                    const highImproved = beforeMetrics.highBandRatio - afterMetrics.highBandRatio;
+                    const roughImproved = smoothingSummary.roughnessBefore - smoothingSummary.roughnessAfter;
+                    const scoreDrop = beforeScore.score - afterScore.score;
+                    const leakWorsened = afterLeak - beforeLeak;
+                    const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+                    const improved = (
+                        highImproved >= 0.012
+                        || (highImproved >= 0.006 && roughImproved >= 0.00035)
+                        || (smoothingSummary.roughnessAfter <= smoothingSummary.roughnessBefore * 0.90 && highImproved >= 0.004)
+                    ) && scoreDrop <= 1.2 && leakWorsened <= 0.018 && speechDrop <= 0.04;
+
+                    if (improved) {
+                        if (cleanupInputPath !== sourcePath && cleanupInputPath !== highSmoothInputPath) {
+                            try { if (fs.existsSync(cleanupInputPath)) fs.unlinkSync(cleanupInputPath); } catch {}
+                        }
+                        cleanupInputPath = highSmoothPath;
+                        enhancementNotes.push(
+                            `High-band smoothing applied (high ${beforeMetrics.highBandRatio.toFixed(2)}->${afterMetrics.highBandRatio.toFixed(2)}, rough ${smoothingSummary.roughnessBefore.toFixed(4)}->${smoothingSummary.roughnessAfter.toFixed(4)}, amt=${smoothingSummary.avgAmount.toFixed(2)}, leak ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}).`,
+                        );
+                    } else {
+                        try { if (fs.existsSync(highSmoothPath)) fs.unlinkSync(highSmoothPath); } catch {}
+                        enhancementNotes.push(
+                            `High-band smoothing not adopted (high ${beforeMetrics.highBandRatio.toFixed(2)}->${afterMetrics.highBandRatio.toFixed(2)}, rough ${smoothingSummary.roughnessBefore.toFixed(4)}->${smoothingSummary.roughnessAfter.toFixed(4)}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}).`,
+                        );
+                    }
+                } catch (error) {
+                    try { if (fs.existsSync(highSmoothPath)) fs.unlinkSync(highSmoothPath); } catch {}
+                    enhancementNotes.push(`High-band smoothing skipped (${error instanceof Error ? error.message : String(error)}).`);
+                }
             }
         }
 
@@ -2714,33 +3282,61 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         if (analysisReady) {
             try {
                 const metrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(analysisMonoPath);
-                filters = SeparationQualityLibrary.buildAdaptiveFilterChain(metrics);
+                const highBandRoughness = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(analysisMonoPath);
+                const lowBandLeakForCleanup = (preparedAccMonoPath && fs.existsSync(preparedAccMonoPath))
+                    ? SeparationQualityLibrary.estimateLowBandLeakageCorrelation(analysisMonoPath, preparedAccMonoPath)
+                    : undefined;
+                filters = SeparationQualityLibrary.buildAdaptiveFilterChain(metrics, {
+                    highBandRoughness,
+                    leakageCorrelation: leakageForCleanupTuning,
+                    lowBandLeakageCorrelation: lowBandLeakForCleanup,
+                });
                 const lowBleedRisk = (
-                    metrics.lowBandRatio > 0.33
-                    || (typeof leakageForCleanupTuning === 'number' && leakageForCleanupTuning > 0.16)
+                    metrics.lowBandRatio > 0.38
+                    || (typeof leakageForCleanupTuning === 'number' && leakageForCleanupTuning > 0.20)
+                    || (typeof lowBandLeakForCleanup === 'number' && lowBandLeakForCleanup > 0.16)
                 );
                 if (lowBleedRisk) {
                     const extraHighpassHz = Math.max(
-                        100,
+                        85,
                         Math.min(
-                            220,
+                            180,
                             Math.round(
-                                105
-                                + Math.max(0, metrics.lowBandRatio - 0.28) * 320
-                                + Math.max(0, (leakageForCleanupTuning ?? 0) - 0.12) * 220,
+                                92
+                                + Math.max(0, metrics.lowBandRatio - 0.30) * 220
+                                + Math.max(0, (leakageForCleanupTuning ?? 0) - 0.14) * 150,
                             ),
                         ),
                     );
+                    const continuousSinging = metrics.speechActivityRatio >= 0.42;
+                    const lowBleedSevere = (
+                        metrics.lowBandRatio > 0.52
+                        || (typeof leakageForCleanupTuning === 'number' && leakageForCleanupTuning > 0.28)
+                    );
+                    const gateSafe = (
+                        lowBleedSevere
+                        && metrics.speechActivityRatio < 0.18
+                        && metrics.silenceRatio > 0.55
+                        && metrics.midBandRatio < 0.22
+                    );
+                    const lowBleedGuardFilters = gateSafe
+                        ? [
+                            `highpass=f=${extraHighpassHz}:poles=2`,
+                            // Very soft gate; only enabled on low speech-activity tracks with severe low bleed.
+                            'agate=threshold=0.0055:ratio=1.35:attack=16:release=260:range=0.86:makeup=1',
+                        ]
+                        : [
+                            `highpass=f=${Math.max(75, extraHighpassHz - (continuousSinging ? 26 : 10) - (metrics.lowBandRatio > 0.18 ? 8 : 0))}:poles=2`,
+                        ];
                     filters = [
-                        `highpass=f=${extraHighpassHz}:poles=2`,
-                        'agate=threshold=0.010:ratio=2.5:attack=8:release=120:makeup=1',
+                        ...lowBleedGuardFilters,
                         filters,
                     ].join(',');
                     enhancementNotes.push(
-                        `Low-end bleed guard enabled (extra highpass=${extraHighpassHz}Hz${typeof leakageForCleanupTuning === 'number' ? `, leakage=${leakageForCleanupTuning.toFixed(3)}` : ''}).`,
+                        `Low-end bleed guard enabled (${gateSafe ? 'mode=hp+soft-gate' : 'mode=soft-hp'}, extra highpass=${extraHighpassHz}Hz${typeof leakageForCleanupTuning === 'number' ? `, leakage=${leakageForCleanupTuning.toFixed(3)}` : ''}).`,
                     );
                 }
-                metricsSummary = `Adaptive cleanup tuned from analysis (rms=${metrics.rmsDb.toFixed(2)}dB, low=${metrics.lowBandRatio.toFixed(2)}, high=${metrics.highBandRatio.toFixed(2)}, speech=${metrics.speechActivityRatio.toFixed(2)}).`;
+                metricsSummary = `Adaptive cleanup tuned from analysis (rms=${metrics.rmsDb.toFixed(2)}dB, low=${metrics.lowBandRatio.toFixed(2)}, high=${metrics.highBandRatio.toFixed(2)}, rough=${highBandRoughness.toFixed(4)}, nearClip=${metrics.nearClipRatio.toFixed(4)}, speech=${metrics.speechActivityRatio.toFixed(2)}${typeof lowBandLeakForCleanup === 'number' ? `, lowLeak=${lowBandLeakForCleanup.toFixed(3)}` : ''}).`;
             } catch {
                 // Keep default filters when analysis fails.
             }
@@ -2774,8 +3370,45 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             };
         }
 
+        let finalEnhancedPath = enhancedPath;
+        try {
+            const postSmoothPath = path.join(enhancedDir, `vocal_enhanced_post_high_smooth_${stamp}.wav`);
+            const beforeMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(enhancedPath);
+            // Final cleanup can reintroduce slight harshness via normalization/limiting.
+            // Run a second, conservative high-band smoothing pass and adopt only on clear improvement.
+            const smoothingSummary = SeparationQualityLibrary.smoothHarshHighBandMonoPcm16Wav(
+                enhancedPath,
+                postSmoothPath,
+            );
+            const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(postSmoothPath);
+            const highImproved = beforeMetrics.highBandRatio - afterMetrics.highBandRatio;
+            const roughImproved = smoothingSummary.roughnessBefore - smoothingSummary.roughnessAfter;
+            const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+            const rmsDiff = Math.abs(afterMetrics.rmsDb - beforeMetrics.rmsDb);
+            const crestDiff = Math.abs(afterMetrics.crestFactorDb - beforeMetrics.crestFactorDb);
+            const improved = (
+                highImproved >= 0.010
+                || (highImproved >= 0.005 && roughImproved >= 0.00030)
+                || (smoothingSummary.roughnessAfter <= smoothingSummary.roughnessBefore * 0.92 && highImproved >= 0.0035)
+            ) && speechDrop <= 0.03 && rmsDiff <= 1.0 && crestDiff <= 2.4;
+
+            if (improved) {
+                finalEnhancedPath = postSmoothPath;
+                enhancementNotes.push(
+                    `Post-cleanup high-band smoothing applied (high ${beforeMetrics.highBandRatio.toFixed(2)}->${afterMetrics.highBandRatio.toFixed(2)}, rough ${smoothingSummary.roughnessBefore.toFixed(4)}->${smoothingSummary.roughnessAfter.toFixed(4)}, amt=${smoothingSummary.avgAmount.toFixed(2)}).`,
+                );
+            } else {
+                try { if (fs.existsSync(postSmoothPath)) fs.unlinkSync(postSmoothPath); } catch {}
+                enhancementNotes.push(
+                    `Post-cleanup high-band smoothing not adopted (high ${beforeMetrics.highBandRatio.toFixed(2)}->${afterMetrics.highBandRatio.toFixed(2)}, rough ${smoothingSummary.roughnessBefore.toFixed(4)}->${smoothingSummary.roughnessAfter.toFixed(4)}).`,
+                );
+            }
+        } catch (error) {
+            enhancementNotes.push(`Post-cleanup high-band smoothing skipped (${error instanceof Error ? error.message : String(error)}).`);
+        }
+
         return {
-            vocalWavPath: enhancedPath,
+            vocalWavPath: finalEnhancedPath,
             warning: [
                 ffmpegTools.warning,
                 ...enhancementNotes,

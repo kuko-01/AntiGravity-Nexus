@@ -5,7 +5,9 @@ import {
     VoiceSynthesizeResult,
 } from './rvc';
 
-export type CharacterEmotionLabel = 'neutral' | 'joy' | 'sad' | 'angry' | 'excited';
+export type CharacterEmotionLabel =
+    | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited'
+    | 'fear' | 'surprise' | 'love' | 'embarrassed' | 'curious';
 
 export interface CharacterEmotionResult {
     label: CharacterEmotionLabel;
@@ -28,6 +30,16 @@ export interface CharacterChatTurn {
     emotion?: CharacterEmotionResult;
 }
 
+/** Per-character emotion personality profile. Controls emotion intensity and baseline. */
+export interface CharacterEmotionPersonality {
+    /** Overall intensity multiplier: 0.5 = subdued, 1.0 = standard, 1.5 = expressive */
+    intensityScale?: number;
+    /** How quickly emotions shift between turns: 0.1 = very stable, 0.5 = volatile */
+    volatility?: number;
+    /** Per-label baseline offset applied before lexicon matching (-0.2 to +0.2) */
+    baselineBias?: Partial<Record<CharacterEmotionLabel, number>>;
+}
+
 export interface CharacterPersonaSettings {
     nameKanji?: string;
     nameKana?: string;
@@ -36,6 +48,7 @@ export interface CharacterPersonaSettings {
     firstPerson?: string;
     personaNote?: string;
     speakingStyleNote?: string;
+    emotionPersonality?: CharacterEmotionPersonality;
 }
 
 export interface UserPersonaSettings {

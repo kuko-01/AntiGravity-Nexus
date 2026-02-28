@@ -114,10 +114,22 @@ export interface SeparationSubbandReprojectionSummary {
     frameCount: number;
     estimatedLagSamples: number;
     estimatedLagMs: number;
+    avgSubLowMask: number;
     avgLowMask: number;
     avgMidMask: number;
     avgHighMask: number;
+    avgHighMaskDelta: number;
+    maxHighMaskDelta: number;
+    highMaskDeltaLimitedFrames: number;
+    avgHighSmoothBlend: number;
+    highStrongSmoothFrames: number;
+    avgProtectBlend: number;
+    avgHighProtectBoost: number;
+    highProtectBoostRatio: number;
+    avgVibratoProxy: number;
+    vibratoGuardFrames: number;
     bgmOnlySuppressedFrames: number;
+    lowBgmPriorityFrames: number;
     lowBleedGuardFrames: number;
     outputDurationMs: number;
 }
@@ -128,6 +140,23 @@ export interface SeparationMixtureConsistencyEstimate {
     normalizedError: number;
     lowBandResidualRatio: number;
     sumCorrelation: number;
+}
+
+export interface SeparationHighBandSmoothingSummary {
+    sampleRate: number;
+    durationMs: number;
+    avgAmount: number;
+    maxAmount: number;
+    highRmsBefore: number;
+    highRmsAfter: number;
+    roughnessBefore: number;
+    roughnessAfter: number;
+}
+
+export interface SeparationAdaptiveFilterTuningHints {
+    highBandRoughness?: number;
+    leakageCorrelation?: number;
+    lowBandLeakageCorrelation?: number;
 }
 
 export class SeparationQualityLibrary {
@@ -278,6 +307,61 @@ export class SeparationQualityLibrary {
         return this.roundNumber(Math.abs(correlation), 6);
     }
 
+    static estimateLowBandLeakageCorrelation(
+        vocalPath: string,
+        accompanimentPath: string,
+        cutoffHz: number = 180,
+    ): number {
+        const vocal = this.parseMonoPcm16Wav(vocalPath);
+        const accompaniment = this.parseMonoPcm16Wav(accompanimentPath);
+        const n = Math.min(vocal.samples.length, accompaniment.samples.length);
+        if (n < 1024) {
+            return 0;
+        }
+
+        const vocalLp = new BiquadFilter(this.createLowPass(vocal.sampleRate, cutoffHz));
+        const accLp = new BiquadFilter(this.createLowPass(accompaniment.sampleRate, cutoffHz));
+        const stride = Math.max(1, Math.floor(n / 220000));
+        const xs: number[] = [];
+        const ys: number[] = [];
+        for (let i = 0; i < n; i += 1) {
+            const x = vocalLp.process(vocal.samples[i] / INT16_MAX);
+            const y = accLp.process(accompaniment.samples[i] / INT16_MAX);
+            if (i % stride === 0) {
+                xs.push(x);
+                ys.push(y);
+            }
+        }
+        if (xs.length <= 1) {
+            return 0;
+        }
+
+        let sumX = 0;
+        let sumY = 0;
+        for (let i = 0; i < xs.length; i += 1) {
+            sumX += xs[i];
+            sumY += ys[i];
+        }
+        const meanX = sumX / xs.length;
+        const meanY = sumY / ys.length;
+        let cov = 0;
+        let varX = 0;
+        let varY = 0;
+        for (let i = 0; i < xs.length; i += 1) {
+            const x = xs[i] - meanX;
+            const y = ys[i] - meanY;
+            cov += x * y;
+            varX += x * x;
+            varY += y * y;
+        }
+        if (varX <= 1e-12 || varY <= 1e-12) {
+            return 0;
+        }
+
+        const correlation = cov / Math.sqrt(varX * varY);
+        return this.roundNumber(Math.abs(correlation), 6);
+    }
+
     static estimateMixtureConsistencyMonoPcm16Wav(
         mixturePath: string,
         vocalPath: string,
@@ -363,6 +447,122 @@ export class SeparationQualityLibrary {
             lowBandResidualRatio: this.roundNumber(lowRmsE / Math.max(1e-8, lowRmsX), 5),
             sumCorrelation: this.roundNumber(Math.abs(corr), 5),
         };
+    }
+
+    static smoothHarshHighBandMonoPcm16Wav(
+        inputPath: string,
+        outputPath: string,
+    ): SeparationHighBandSmoothingSummary {
+        const parsed = this.parseMonoPcm16Wav(inputPath);
+        const n = parsed.samples.length;
+        if (n < 2048) {
+            fs.copyFileSync(inputPath, outputPath);
+            return {
+                sampleRate: parsed.sampleRate,
+                durationMs: parsed.durationMs,
+                avgAmount: 0,
+                maxAmount: 0,
+                highRmsBefore: 0,
+                highRmsAfter: 0,
+                roughnessBefore: 0,
+                roughnessAfter: 0,
+            };
+        }
+
+        const sr = parsed.sampleRate;
+        const hpIn = new BiquadFilter(this.createHighPass(sr, 5200));
+        const hpOut = new BiquadFilter(this.createHighPass(sr, 5200));
+        const smoothCutoffHz = this.clampNumber(sr * 0.13, 4200, 9000, 6500);
+        const smoothAlpha = 1 - Math.exp((-2 * Math.PI * smoothCutoffHz) / sr);
+        const envAttack = 1 - Math.exp((-2 * Math.PI * 220) / sr);
+        const envRelease = 1 - Math.exp((-2 * Math.PI * 18) / sr);
+        const slewAttack = 1 - Math.exp((-2 * Math.PI * 420) / sr);
+        const slewRelease = 1 - Math.exp((-2 * Math.PI * 30) / sr);
+
+        let smoothedHigh = 0;
+        let envHigh = 0;
+        let envFull = 0;
+        let envSlew = 0;
+        let prevHighIn = 0;
+        let prevHighOut = 0;
+        let amountSum = 0;
+        let amountMax = 0;
+        let highSqBefore = 0;
+        let highSqAfter = 0;
+        let roughBeforeSum = 0;
+        let roughAfterSum = 0;
+        const out = new Int16Array(n);
+
+        for (let i = 0; i < n; i += 1) {
+            const x = parsed.samples[i] / INT16_MAX;
+            const highIn = hpIn.process(x);
+            const absHigh = Math.abs(highIn);
+            const absFull = Math.abs(x);
+            envHigh += (absHigh - envHigh) * (absHigh > envHigh ? envAttack : envRelease);
+            envFull += (absFull - envFull) * (absFull > envFull ? envAttack : envRelease);
+            const slew = Math.abs(highIn - prevHighIn);
+            envSlew += (slew - envSlew) * (slew > envSlew ? slewAttack : slewRelease);
+
+            const highRatio = envHigh / (envFull + 1e-7);
+            const ratioGate = this.smoothstep(highRatio, 0.24, 0.78);
+            const slewGate = this.smoothstep(envSlew, 0.0025, 0.055);
+            const noiseLikeGate = 1 - this.smoothstep(envFull, 0.04, 0.18);
+            const peakGuard = 1 - (this.smoothstep(absFull, 0.88, 0.99) * 0.55);
+            const baseAmount = (ratioGate * 0.58) + (slewGate * 0.42);
+            let amount = baseAmount * (0.68 + (0.32 * noiseLikeGate)) * peakGuard;
+            if (envFull < 0.012 && highRatio > 0.40) {
+                amount += 0.10;
+            }
+            amount = this.clampNumber(amount, 0, 0.82, 0);
+
+            smoothedHigh += (highIn - smoothedHigh) * smoothAlpha;
+            let y = x + ((smoothedHigh - highIn) * amount);
+            y = Math.tanh(y * 1.03) / Math.tanh(1.03);
+
+            const highOut = hpOut.process(y);
+            highSqBefore += highIn * highIn;
+            highSqAfter += highOut * highOut;
+            if (i > 0) {
+                roughBeforeSum += Math.abs(highIn - prevHighIn);
+                roughAfterSum += Math.abs(highOut - prevHighOut);
+            }
+            prevHighIn = highIn;
+            prevHighOut = highOut;
+            amountSum += amount;
+            if (amount > amountMax) amountMax = amount;
+            out[i] = this.clampInt16(Math.round(y * INT16_MAX));
+        }
+
+        this.writeMonoPcm16Wav(outputPath, sr, out);
+        const denom = Math.max(1, n);
+        return {
+            sampleRate: sr,
+            durationMs: parsed.durationMs,
+            avgAmount: this.roundNumber(amountSum / denom, 4),
+            maxAmount: this.roundNumber(amountMax, 4),
+            highRmsBefore: this.roundNumber(Math.sqrt(highSqBefore / denom), 5),
+            highRmsAfter: this.roundNumber(Math.sqrt(highSqAfter / denom), 5),
+            roughnessBefore: this.roundNumber(roughBeforeSum / Math.max(1, n - 1), 6),
+            roughnessAfter: this.roundNumber(roughAfterSum / Math.max(1, n - 1), 6),
+        };
+    }
+
+    static estimateHighBandRoughnessMonoPcm16Wav(
+        inputPath: string,
+    ): number {
+        const parsed = this.parseMonoPcm16Wav(inputPath);
+        const n = parsed.samples.length;
+        if (n < 8) return 0;
+        const hp = new BiquadFilter(this.createHighPass(parsed.sampleRate, 5200));
+        let prev = 0;
+        let rough = 0;
+        for (let i = 0; i < n; i += 1) {
+            const x = parsed.samples[i] / INT16_MAX;
+            const h = hp.process(x);
+            if (i > 0) rough += Math.abs(h - prev);
+            prev = h;
+        }
+        return this.roundNumber(rough / Math.max(1, n - 1), 6);
     }
 
     static scoreFromMetrics(
@@ -451,27 +651,75 @@ export class SeparationQualityLibrary {
         };
     }
 
-    static buildAdaptiveFilterChain(metrics: SeparationStemQualityMetrics): string {
-        // High-pass cut: raised when low-band energy (rumble/bass bleed) is high
+    static buildAdaptiveFilterChain(
+        metrics: SeparationStemQualityMetrics,
+        hints?: SeparationAdaptiveFilterTuningHints,
+    ): string {
+        const highBandRoughness = Math.max(0, hints?.highBandRoughness ?? 0);
+        const leakageCorrelation = Math.max(0, hints?.leakageCorrelation ?? 0);
+        const lowBandLeakageCorrelation = Math.max(0, hints?.lowBandLeakageCorrelation ?? 0);
+        const roughnessPressure = this.clampNumber(
+            Math.max(0, highBandRoughness - 0.0048) / 0.0048,
+            0,
+            2.2,
+            0,
+        );
+        const nearClipPressure = this.clampNumber(
+            Math.max(0, metrics.nearClipRatio - 0.012) * 40,
+            0,
+            2.0,
+            0,
+        );
+        const lowBleedPressure = this.clampNumber(
+            Math.max(0, metrics.lowBandRatio - 0.30) * 3.0
+            + Math.max(0, lowBandLeakageCorrelation - 0.12) * 4.0
+            + Math.max(0, leakageCorrelation - 0.16) * 1.4,
+            0,
+            3.0,
+            0,
+        );
+        // High-pass cut: keep conservative for singing so low notes are not over-thinned.
+        const speechSparse = metrics.speechActivityRatio < 0.50;
+        const preGainLinear = this.clampNumber(
+            1 - (Math.max(0, metrics.nearClipRatio - 0.008) * 3.6) - (nearClipPressure * 0.03),
+            0.78,
+            1.0,
+            1.0,
+        );
         const highpassHz = this.clampNumber(
-            Math.round(80 + Math.max(0, metrics.lowBandRatio - 0.25) * 220),
-            70,
-            180,
-            90,
+            Math.round(
+                (speechSparse ? 58 : 68)
+                + Math.max(0, metrics.lowBandRatio - 0.28) * 180
+                + lowBleedPressure * (speechSparse ? 20 : 12)
+                - Math.max(0, metrics.speechActivityRatio - 0.55) * 18,
+            ),
+            48,
+            170,
+            speechSparse ? 58 : 68,
         );
         // Low-pass cut: lowered when high-band energy (hiss/artifact) is high
         const lowpassHz = this.clampNumber(
-            Math.round(15000 - Math.max(0, metrics.highBandRatio - 0.45) * 9000),
-            8500,
+            Math.round(
+                15000
+                - Math.max(0, metrics.highBandRatio - 0.45) * 9000
+                - roughnessPressure * 1700
+                - nearClipPressure * 700,
+            ),
+            8200,
             16000,
             14000,
         );
         // FFT spectral denoising strength: stronger when high-band hiss is prominent
         const afftdnNr = this.clampNumber(
-            Math.round(6 + Math.max(0, metrics.highBandRatio - 0.42) * 22),
-            6,
-            16,
-            8,
+            Math.round(
+                (speechSparse ? 5 : 6)
+                + Math.max(0, metrics.highBandRatio - 0.44) * 20
+                + (roughnessPressure * 1.8)
+                + (nearClipPressure * 0.8),
+            ),
+            speechSparse ? 4 : 5,
+            15,
+            speechSparse ? 6 : 7,
         );
         // Non-Local Means denoiser (anlmdn) tuning:
         // p = patch duration, r = research duration (must be >= p in practice)
@@ -485,28 +733,76 @@ export class SeparationQualityLibrary {
             4,
         );
         const anlmdnStrength = this.roundNumber(
-            this.clampNumber(4.5 + Math.max(0, metrics.highBandRatio - 0.40) * 22, 3.5, 16, 6),
+            this.clampNumber(
+                (speechSparse ? 3.8 : 4.5) + Math.max(0, metrics.highBandRatio - 0.42) * 18,
+                speechSparse ? 3.0 : 3.5,
+                14,
+                speechSparse ? 4.5 : 6,
+            ),
+            3,
+        );
+        const anlmdnStrengthTuned = this.roundNumber(
+            this.clampNumber(
+                anlmdnStrength
+                + (roughnessPressure * 1.3)
+                + (nearClipPressure * 0.6)
+                - (metrics.speechActivityRatio > 0.72 ? 0.4 : 0),
+                speechSparse ? 3.0 : 3.5,
+                15,
+                anlmdnStrength,
+            ),
             3,
         );
         // Dynamic loudness normalization gain
         const dynamicGain = this.clampNumber(
-            Math.round(8 + Math.max(0, -18 - metrics.rmsDb) * 0.65),
-            6,
-            16,
-            9,
+            Math.round((speechSparse ? 6 : 7) + Math.max(0, -18 - metrics.rmsDb) * 0.50),
+            4,
+            13,
+            speechSparse ? 7 : 8,
+        );
+        const dynaudnormFrame = this.clampNumber(
+            Math.round((speechSparse ? 440 : 340) + (roughnessPressure * 80) + (nearClipPressure * 40)),
+            speechSparse ? 380 : 300,
+            speechSparse ? 700 : 560,
+            speechSparse ? 480 : 360,
+        );
+        const dynaudnormPeak = this.roundNumber(
+            this.clampNumber(0.94 - (nearClipPressure * 0.03), 0.86, 0.96, 0.94),
+            3,
+        );
+        const dynaudnormMax = this.clampNumber(
+            Math.round((speechSparse ? 12 : 8) + (roughnessPressure * 2)),
+            speechSparse ? 10 : 7,
+            speechSparse ? 16 : 12,
+            speechSparse ? 12 : 8,
+        );
+        const adeclickWindow = this.clampInt(
+            Math.round(35 + (roughnessPressure * 8) + (nearClipPressure * 10)),
+            35,
+            64,
+            35,
+        );
+        const adeclickOverlap = this.clampInt(
+            Math.round(70 + (roughnessPressure * 10) + (nearClipPressure * 10)),
+            65,
+            88,
+            70,
         );
 
         return [
+            ...(preGainLinear < 0.995 ? [`volume=${this.roundNumber(preGainLinear, 4)}`] : []),
             // Steep 2-pole (40 dB/decade) high-pass removes low-end rumble and bass bleed
             `highpass=f=${highpassHz}:poles=2`,
             // FFT-based spectral denoiser — targets stationary hiss and tonal leakage
             `afftdn=nr=${afftdnNr}:nf=-45:tn=1`,
             // Non-local means denoiser — suppresses musical noise (separation artifacts)
-            `anlmdn=s=${anlmdnStrength}:p=${anlmdnPatch}:r=${anlmdnResearch}:m=15`,
+            `anlmdn=s=${anlmdnStrengthTuned}:p=${anlmdnPatch}:r=${anlmdnResearch}:m=15`,
+            // Light de-click after denoise to catch short "pops" introduced by aggressive separation/noise suppression
+            `adeclick=t=2:w=${adeclickWindow}:o=${adeclickOverlap}:a=2:m=a`,
             // 2-pole low-pass removes harsh high-frequency separation artifacts
             `lowpass=f=${lowpassHz}:poles=2`,
             // Dynamic loudness normalization for consistent RMS
-            `dynaudnorm=f=250:g=${dynamicGain}:p=0.95:m=6`,
+            `dynaudnorm=f=${dynaudnormFrame}:g=${dynamicGain}:p=${dynaudnormPeak}:m=${dynaudnormMax}`,
             // Transparent peak limiter
             'alimiter=limit=0.98',
         ].join(',');
@@ -660,6 +956,7 @@ export class SeparationQualityLibrary {
         vocalPath: string,
         accompanimentPath: string,
         outputPath: string,
+        options?: { preserveTimeline?: boolean; preserveTimelineAttenuation?: number },
     ): SeparationMusicOnlyRemovalSummary {
         const vocal = this.parseMonoPcm16Wav(vocalPath);
         const accompaniment = this.parseMonoPcm16Wav(accompanimentPath);
@@ -667,6 +964,10 @@ export class SeparationQualityLibrary {
             throw new Error(`Sample rate mismatch for music-only removal: vocal=${vocal.sampleRate}, accompaniment=${accompaniment.sampleRate}`);
         }
 
+        const preserveTimeline = options?.preserveTimeline === true;
+        const preserveTimelineAttenuation = preserveTimeline
+            ? this.clampNumber(Number(options?.preserveTimelineAttenuation), 0, 1, 0)
+            : 0;
         const n = Math.min(vocal.samples.length, accompaniment.samples.length);
         if (n < 2048) {
             fs.copyFileSync(vocalPath, outputPath);
@@ -828,8 +1129,9 @@ export class SeparationQualityLibrary {
         }
 
         const minRemoveSamples = Math.max(1, Math.round(sr * 0.24));
-        const fadeSamples = Math.max(1, Math.round(sr * 0.008));
-        const includedSegments: Array<{ start: number; end: number; zero: boolean }> = [];
+        // Longer fades reduce short "pops" when toggling suppression on/off across segment boundaries.
+        const fadeSamples = Math.max(1, Math.round(sr * 0.018));
+        const includedSegments: Array<{ start: number; end: number; zero: boolean; gain: number }> = [];
         let removedSegments = 0;
         let removedSamples = 0;
         let zeroedShortGapSamples = 0;
@@ -841,13 +1143,25 @@ export class SeparationQualityLibrary {
             if (s < n && curState === segState) continue;
             const len = s - segStart;
             if (segState) {
-                includedSegments.push({ start: segStart, end: s, zero: false });
+                includedSegments.push({ start: segStart, end: s, zero: false, gain: 1 });
             } else if (len < minRemoveSamples) {
-                includedSegments.push({ start: segStart, end: s, zero: true });
+                if (preserveTimeline && preserveTimelineAttenuation > 1e-6) {
+                    includedSegments.push({ start: segStart, end: s, zero: false, gain: preserveTimelineAttenuation });
+                } else {
+                    includedSegments.push({ start: segStart, end: s, zero: true, gain: 0 });
+                }
                 zeroedShortGapSamples += len;
             } else {
                 removedSegments += 1;
                 removedSamples += len;
+                if (preserveTimeline) {
+                    includedSegments.push({
+                        start: segStart,
+                        end: s,
+                        zero: preserveTimelineAttenuation <= 1e-6,
+                        gain: preserveTimelineAttenuation <= 1e-6 ? 0 : preserveTimelineAttenuation,
+                    });
+                }
             }
             segStart = s;
             segState = curState;
@@ -878,7 +1192,13 @@ export class SeparationQualityLibrary {
             const len = Math.max(0, seg.end - seg.start);
             if (len <= 0) continue;
             for (let i2 = 0; i2 < len; i2 += 1) {
-                out[outPos + i2] = seg.zero ? 0 : vocal.samples[seg.start + i2];
+                if (seg.zero) {
+                    out[outPos + i2] = 0;
+                } else if (seg.gain >= 0.999) {
+                    out[outPos + i2] = vocal.samples[seg.start + i2];
+                } else {
+                    out[outPos + i2] = this.clampInt16(Math.round(vocal.samples[seg.start + i2] * seg.gain));
+                }
             }
             if (!seg.zero) {
                 const fade = Math.min(fadeSamples, len);
@@ -887,11 +1207,19 @@ export class SeparationQualityLibrary {
                     const fadeOut = (fade - 1 - f) / Math.max(1, fade - 1);
                     if (si > 0) {
                         const idx = outPos + f;
-                        out[idx] = this.clampInt16(Math.round(out[idx] * fadeIn));
+                        const prevSeg = includedSegments[si - 1];
+                        const gainDelta = Math.abs((prevSeg?.gain ?? 0) - seg.gain);
+                        if ((prevSeg?.zero ?? true) || gainDelta > 0.10) {
+                            out[idx] = this.clampInt16(Math.round(out[idx] * fadeIn));
+                        }
                     }
                     if (si < includedSegments.length - 1) {
                         const idx = outPos + len - 1 - f;
-                        out[idx] = this.clampInt16(Math.round(out[idx] * fadeOut));
+                        const nextSeg = includedSegments[si + 1];
+                        const gainDelta = Math.abs((nextSeg?.gain ?? 0) - seg.gain);
+                        if ((nextSeg?.zero ?? true) || gainDelta > 0.10) {
+                            out[idx] = this.clampInt16(Math.round(out[idx] * fadeOut));
+                        }
                     }
                 }
             }
@@ -1499,10 +1827,22 @@ export class SeparationQualityLibrary {
                 frameCount: 0,
                 estimatedLagSamples: 0,
                 estimatedLagMs: 0,
+                avgSubLowMask: 0.5,
                 avgLowMask: 0.5,
                 avgMidMask: 0.5,
                 avgHighMask: 0.5,
+                avgHighMaskDelta: 0,
+                maxHighMaskDelta: 0,
+                highMaskDeltaLimitedFrames: 0,
+                avgHighSmoothBlend: 0.5,
+                highStrongSmoothFrames: 0,
+                avgProtectBlend: 0,
+                avgHighProtectBoost: 0,
+                highProtectBoostRatio: 0,
+                avgVibratoProxy: 0,
+                vibratoGuardFrames: 0,
                 bgmOnlySuppressedFrames: 0,
+                lowBgmPriorityFrames: 0,
                 lowBleedGuardFrames: 0,
                 outputDurationMs: vocal.durationMs,
             };
@@ -1525,10 +1865,22 @@ export class SeparationQualityLibrary {
                 frameCount: 0,
                 estimatedLagSamples: lagSamples,
                 estimatedLagMs: this.roundNumber((lagSamples / sr) * 1000, 2),
+                avgSubLowMask: 0.5,
                 avgLowMask: 0.5,
                 avgMidMask: 0.5,
                 avgHighMask: 0.5,
+                avgHighMaskDelta: 0,
+                maxHighMaskDelta: 0,
+                highMaskDeltaLimitedFrames: 0,
+                avgHighSmoothBlend: 0.5,
+                highStrongSmoothFrames: 0,
+                avgProtectBlend: 0,
+                avgHighProtectBoost: 0,
+                highProtectBoostRatio: 0,
+                avgVibratoProxy: 0,
+                vibratoGuardFrames: 0,
                 bgmOnlySuppressedFrames: 0,
+                lowBgmPriorityFrames: 0,
                 lowBleedGuardFrames: 0,
                 outputDurationMs: vocal.durationMs,
             };
@@ -1538,17 +1890,32 @@ export class SeparationQualityLibrary {
         const hop = this.clampInt(Math.round(sr * 0.012), 256, frameLen, 512);
         const frameCount = Math.max(1, Math.floor((n - frameLen) / hop) + 1);
         const centers = new Int32Array(frameCount);
+        const subLowMasks = new Float32Array(frameCount);
         const lowMasks = new Float32Array(frameCount);
         const midMasks = new Float32Array(frameCount);
         const highMasks = new Float32Array(frameCount);
+        const highSmoothBlendByFrame = new Float32Array(frameCount);
+        const highProtectBoostByFrame = new Float32Array(frameCount);
         const bgmSuppress = new Float32Array(frameCount);
 
-        const alphaLow = 1 - Math.exp((-2 * Math.PI * 180) / sr);
+        const alphaSubLow = 1 - Math.exp((-2 * Math.PI * 95) / sr);
+        const alphaLow = 1 - Math.exp((-2 * Math.PI * 260) / sr);
         const alphaHighLp = 1 - Math.exp((-2 * Math.PI * 4200) / sr);
+        let subLowMaskSum = 0;
         let lowMaskSum = 0;
         let midMaskSum = 0;
         let highMaskSum = 0;
+        let highMaskDeltaSum = 0;
+        let highMaskDeltaMax = 0;
+        let highMaskDeltaLimitedFrames = 0;
+        let highSmoothBlendSum = 0;
+        let highStrongSmoothFrames = 0;
+        let vibratoProxySum = 0;
+        let vibratoGuardFrames = 0;
+        let prevHighMaskLimited = 0.5;
+        let prevVHighRms = 0;
         let bgmOnlySuppressedFrames = 0;
+        let lowBgmPriorityFrames = 0;
         let lowBleedGuardFrames = 0;
 
         for (let fi = 0; fi < frameCount; fi += 1) {
@@ -1564,18 +1931,25 @@ export class SeparationQualityLibrary {
             let zcV = 0;
             let prevV = vocal.samples[stemStart + start] / INT16_MAX;
 
+            let vSubLowState = 0;
+            let aSubLowState = 0;
+            let xSubLowState = 0;
             let vLowState = 0;
             let aLowState = 0;
             let xLowState = 0;
             let vHighLpState = 0;
             let aHighLpState = 0;
             let xHighLpState = 0;
+            let vSubLowSq = 0;
+            let aSubLowSq = 0;
+            let xSubLowSq = 0;
             let vLowSq = 0;
             let aLowSq = 0;
             let xLowSq = 0;
             let vHighSq = 0;
             let aHighSq = 0;
             let xHighSq = 0;
+            let vSubLowA = 0;
             let vLowA = 0;
             let vHighA = 0;
 
@@ -1590,24 +1964,34 @@ export class SeparationQualityLibrary {
                 aSq += a * a;
                 va += v * a;
 
+                vSubLowState += alphaSubLow * (v - vSubLowState);
+                aSubLowState += alphaSubLow * (a - aSubLowState);
+                xSubLowState += alphaSubLow * (x - xSubLowState);
                 vLowState += alphaLow * (v - vLowState);
                 aLowState += alphaLow * (a - aLowState);
                 xLowState += alphaLow * (x - xLowState);
                 vHighLpState += alphaHighLp * (v - vHighLpState);
                 aHighLpState += alphaHighLp * (a - aHighLpState);
                 xHighLpState += alphaHighLp * (x - xHighLpState);
-                const vLow = vLowState;
-                const aLow = aLowState;
-                const xLow = xLowState;
+                const vSubLow = vSubLowState;
+                const aSubLow = aSubLowState;
+                const xSubLow = xSubLowState;
+                const vLow = vLowState - vSubLowState;
+                const aLow = aLowState - aSubLowState;
+                const xLow = xLowState - xSubLowState;
                 const vHigh = v - vHighLpState;
                 const aHigh = a - aHighLpState;
                 const xHigh = x - xHighLpState;
+                vSubLowSq += vSubLow * vSubLow;
+                aSubLowSq += aSubLow * aSubLow;
+                xSubLowSq += xSubLow * xSubLow;
                 vLowSq += vLow * vLow;
                 aLowSq += aLow * aLow;
                 xLowSq += xLow * xLow;
                 vHighSq += vHigh * vHigh;
                 aHighSq += aHigh * aHigh;
                 xHighSq += xHigh * xHigh;
+                vSubLowA += vSubLow * aSubLow;
                 vLowA += vLow * aLow;
                 vHighA += vHigh * aHigh;
 
@@ -1619,33 +2003,61 @@ export class SeparationQualityLibrary {
             const vRms = Math.sqrt(vSq / len);
             const aRms = Math.sqrt(aSq / len);
             const xRms = Math.sqrt(xSq / len);
+            const vSubLowRms = Math.sqrt(vSubLowSq / len);
+            const aSubLowRms = Math.sqrt(aSubLowSq / len);
+            const xSubLowRms = Math.sqrt(xSubLowSq / len);
             const vLowRms = Math.sqrt(vLowSq / len);
             const aLowRms = Math.sqrt(aLowSq / len);
             const xLowRms = Math.sqrt(xLowSq / len);
             const vHighRms = Math.sqrt(vHighSq / len);
             const aHighRms = Math.sqrt(aHighSq / len);
             const xHighRms = Math.sqrt(xHighSq / len);
-            const vMidSq = Math.max(0, vSq - vLowSq - vHighSq);
-            const aMidSq = Math.max(0, aSq - aLowSq - aHighSq);
-            const xMidSq = Math.max(0, xSq - xLowSq - xHighSq);
+            const vMidSq = Math.max(0, vSq - vSubLowSq - vLowSq - vHighSq);
+            const aMidSq = Math.max(0, aSq - aSubLowSq - aLowSq - aHighSq);
+            const xMidSq = Math.max(0, xSq - xSubLowSq - xLowSq - xHighSq);
             const vMidRms = Math.sqrt(vMidSq / len);
             const aMidRms = Math.sqrt(aMidSq / len);
             const xMidRms = Math.sqrt(xMidSq / len);
             const zcr = len > 1 ? zcV / (len - 1) : 0;
             const dominance = vRms / (aRms + 1e-9);
+            const subLowDominance = vSubLowRms / (aSubLowRms + 1e-9);
             const lowDominance = vLowRms / (aLowRms + 1e-9);
             const corrVA = (vSq > 1e-12 && aSq > 1e-12) ? Math.abs(va) / Math.sqrt(vSq * aSq) : 0;
+            const corrSubLow = (vSubLowSq > 1e-12 && aSubLowSq > 1e-12) ? Math.abs(vSubLowA) / Math.sqrt(vSubLowSq * aSubLowSq) : 0;
             const corrLow = (vLowSq > 1e-12 && aLowSq > 1e-12) ? Math.abs(vLowA) / Math.sqrt(vLowSq * aLowSq) : 0;
             const corrHigh = (vHighSq > 1e-12 && aHighSq > 1e-12) ? Math.abs(vHighA) / Math.sqrt(vHighSq * aHighSq) : 0;
 
             const voiceLike = (vRms >= Math.max(0.0048, xRms * 0.10)) && zcr >= 0.005 && zcr <= 0.40;
+            const lowVoiceLikely = voiceLike && (
+                vSubLowRms >= Math.max(0.0038, xSubLowRms * 0.10)
+                || subLowDominance >= 0.72
+                || (vLowRms >= Math.max(0.0045, xLowRms * 0.12) && lowDominance >= 0.70)
+            );
+            const lowBandLeakPressure = this.clampNumber(
+                Math.max(0, corrSubLow - 0.18) * 2.3
+                + Math.max(0, corrLow - 0.20) * 1.9
+                + Math.max(0, 0.88 - subLowDominance) * 0.90
+                + Math.max(0, 0.90 - lowDominance) * 0.70
+                + Math.max(0, aSubLowRms - 0.0055) * 28
+                + Math.max(0, aLowRms - 0.0060) * 20,
+                0,
+                1.8,
+                0,
+            );
+            const lowBandBgmPriorityMode = !lowVoiceLikely
+                && aRms > 0.0065
+                && (xSubLowRms + xLowRms) > (xMidRms * 0.60)
+                && lowBandLeakPressure >= 0.22;
             const likelyBgmOnly = aRms > 0.0085 && (
                 (!voiceLike && dominance < 0.88)
-                || (lowDominance < 0.78 && corrLow > 0.18)
+                || (!lowVoiceLikely && lowDominance < 0.78 && corrLow > 0.18)
+                || (!lowVoiceLikely && subLowDominance < 0.74 && corrSubLow > 0.18)
                 || (dominance < 0.68 && corrVA > 0.18)
             );
 
             const p = 1.28;
+            const vSubLowPow = Math.pow(vSubLowRms + 1e-8, p);
+            const aSubLowPow = Math.pow(aSubLowRms + 1e-8, p);
             const vLowPow = Math.pow(vLowRms + 1e-8, p);
             const aLowPow = Math.pow(aLowRms + 1e-8, p);
             const vMidPow = Math.pow(vMidRms + 1e-8, p);
@@ -1653,16 +2065,39 @@ export class SeparationQualityLibrary {
             const vHighPow = Math.pow(vHighRms + 1e-8, p);
             const aHighPow = Math.pow(aHighRms + 1e-8, p);
 
-            const lowBias = this.clampNumber(1.35 + Math.max(0, corrLow - 0.14) * 1.7 + Math.max(0, 0.95 - lowDominance) * 0.45, 1.05, 3.0, 1.35);
+            const subLowBias = this.clampNumber(
+                1.18
+                + Math.max(0, corrSubLow - 0.13) * 1.10
+                + Math.max(0, 0.90 - subLowDominance) * 0.25
+                + (lowBandBgmPriorityMode ? this.clampNumber(lowBandLeakPressure * 0.22, 0.04, 0.28, 0.10) : 0),
+                0.95,
+                2.6,
+                1.15,
+            );
+            const lowBias = this.clampNumber(
+                1.35
+                + Math.max(0, corrLow - 0.14) * 1.7
+                + Math.max(0, 0.95 - lowDominance) * 0.45
+                + (lowBandBgmPriorityMode ? this.clampNumber(lowBandLeakPressure * 0.42, 0.08, 0.55, 0.16) : 0),
+                1.05,
+                3.8,
+                1.35,
+            );
             const midBias = this.clampNumber(1.05 + Math.max(0, corrVA - 0.12) * 0.60, 0.95, 1.9, 1.05);
-            const highBias = this.clampNumber(0.95 + Math.max(0, corrHigh - 0.12) * 0.45, 0.75, 1.7, 1.0);
+            const highBias = this.clampNumber(0.92 + Math.max(0, corrHigh - 0.12) * 0.28, 0.82, 1.35, 0.95);
+            let subLowMask = vSubLowPow / (vSubLowPow + (aSubLowPow * subLowBias) + 1e-9);
             let lowMask = vLowPow / (vLowPow + (aLowPow * lowBias) + 1e-9);
             let midMask = vMidPow / (vMidPow + (aMidPow * midBias) + 1e-9);
             let highMask = vHighPow / (vHighPow + (aHighPow * highBias) + 1e-9);
 
             if (voiceLike) {
+                subLowMask = this.clampNumber(subLowMask + 0.04, 0.02, 0.99, subLowMask);
                 midMask = this.clampNumber(midMask + 0.05, 0.02, 0.98, midMask);
-                highMask = this.clampNumber(highMask + 0.04, 0.02, 0.98, highMask);
+                highMask = this.clampNumber(highMask + 0.06, 0.10, 0.995, highMask);
+                if (lowVoiceLikely) {
+                    subLowMask = this.clampNumber(subLowMask + 0.03, 0.04, 0.995, subLowMask);
+                    lowMask = this.clampNumber(lowMask + 0.03, 0.02, 0.99, lowMask);
+                }
             }
 
             let suppress = 1;
@@ -1670,49 +2105,189 @@ export class SeparationQualityLibrary {
                 const strength = this.clampNumber(
                     (0.92 - dominance) * 1.15
                     + Math.max(0, corrLow - 0.16) * 1.25
+                    + Math.max(0, corrSubLow - 0.16) * 0.80
                     + Math.max(0, 0.92 - lowDominance) * 0.55,
                     0,
                     1.3,
                     0,
                 );
-                suppress = this.clampNumber(1 - (0.74 * strength), 0.12, 1, 1);
+                const bgmPriorityBoost = lowBandBgmPriorityMode ? this.clampNumber(lowBandLeakPressure * 0.22, 0.04, 0.28, 0.08) : 0;
+                // Keep low bass layers more conservative to avoid hollowing low-pitched vocals.
+                const suppressFloor = lowVoiceLikely ? 0.42 : 0.18;
+                suppress = this.clampNumber(1 - (0.68 * (strength + bgmPriorityBoost)), suppressFloor, 1, 1);
                 if (suppress < 0.98) bgmOnlySuppressedFrames += 1;
             }
+            if (lowBandBgmPriorityMode) {
+                lowBgmPriorityFrames += 1;
+            }
 
-            const lowBleedHeavy = aLowRms > 0.006
-                && xLowRms > 0.004
-                && lowDominance < 0.86
-                && corrLow > 0.20;
+            const lowBleedHeavy = lowBandBgmPriorityMode || (
+                (aLowRms > 0.006 || aSubLowRms > 0.006)
+                && (xLowRms > 0.004 || xSubLowRms > 0.004)
+                && (lowDominance < 0.86 || subLowDominance < 0.84)
+                && (corrLow > 0.20 || corrSubLow > 0.20)
+            );
             if (lowBleedHeavy) {
-                const lowPenalty = this.clampNumber(
-                    0.08 + Math.max(0, 0.86 - lowDominance) * 0.35 + Math.max(0, corrLow - 0.20) * 0.32,
-                    0.02,
-                    0.30,
-                    0.08,
-                );
-                lowMask = this.clampNumber(lowMask - lowPenalty, 0.02, 0.95, lowMask);
+                const lowPenaltyBase = this.clampNumber(
+                    0.06
+                    + Math.max(0, 0.86 - lowDominance) * 0.28
+                    + Math.max(0, corrLow - 0.20) * 0.24
+                    + Math.max(0, corrSubLow - 0.20) * 0.18,
+                    0.01,
+                    0.24,
+                    0.06,
+                ) + (lowBandBgmPriorityMode ? this.clampNumber(lowBandLeakPressure * 0.08, 0.02, 0.10, 0.03) : 0);
+                const lowPenaltyScale = lowVoiceLikely ? 0.45 : 1.0;
+                const lowPenalty = lowPenaltyBase * lowPenaltyScale;
+                const subPenalty = lowPenalty * (lowVoiceLikely ? 0.25 : 0.55);
+                subLowMask = this.clampNumber(subLowMask - subPenalty, lowVoiceLikely ? 0.10 : 0.03, 0.97, subLowMask);
+                lowMask = this.clampNumber(lowMask - lowPenalty, lowVoiceLikely ? 0.07 : 0.02, 0.95, lowMask);
                 lowBleedGuardFrames += 1;
             }
 
             // If the mixture has very low vocal-like high band and strong accompaniment-like low band, be more conservative.
             if (!voiceLike && xLowRms > xMidRms * 0.9 && xHighRms < xMidRms * 0.55) {
-                lowMask = this.clampNumber(lowMask * 0.82, 0.02, 0.95, lowMask);
+                subLowMask = this.clampNumber(subLowMask * 0.90, 0.03, 0.97, subLowMask);
+                lowMask = this.clampNumber(lowMask * 0.86, 0.02, 0.95, lowMask);
                 midMask = this.clampNumber(midMask * 0.92, 0.02, 0.98, midMask);
             }
+            if (lowBandBgmPriorityMode) {
+                subLowMask = this.clampNumber(subLowMask * (lowVoiceLikely ? 0.96 : 0.84), lowVoiceLikely ? 0.08 : 0.03, lowVoiceLikely ? 0.94 : 0.84, subLowMask);
+                lowMask = this.clampNumber(lowMask * (lowVoiceLikely ? 0.92 : 0.76), lowVoiceLikely ? 0.06 : 0.02, lowVoiceLikely ? 0.90 : 0.78, lowMask);
+                if (!voiceLike) {
+                    midMask = this.clampNumber(midMask * 0.90, 0.01, 0.94, midMask);
+                }
+            }
 
-            lowMask = this.clampNumber(lowMask * (0.88 + (0.12 * suppress)), 0.01, 0.98, lowMask);
-            midMask = this.clampNumber(midMask * suppress, 0.01, 0.99, midMask);
-            highMask = this.clampNumber(highMask * (0.55 + (0.45 * suppress)), 0.01, 0.99, highMask);
+            // Apply weaker suppression to low layers so low-pitched vocals do not become hollow.
+            const subLowSuppressMix = lowVoiceLikely ? (0.94 + (0.06 * suppress)) : (0.90 + (0.10 * suppress));
+            const lowSuppressMix = lowVoiceLikely ? (0.90 + (0.10 * suppress)) : (0.84 + (0.16 * suppress));
+            const subLowSuppressMixFinal = lowBandBgmPriorityMode
+                ? Math.min(subLowSuppressMix, (lowVoiceLikely ? (0.92 + (0.08 * suppress)) : (0.80 + (0.20 * suppress))))
+                : subLowSuppressMix;
+            const lowSuppressMixFinal = lowBandBgmPriorityMode
+                ? Math.min(lowSuppressMix, (lowVoiceLikely ? (0.88 + (0.12 * suppress)) : (0.72 + (0.28 * suppress))))
+                : lowSuppressMix;
+            subLowMask = this.clampNumber(subLowMask * subLowSuppressMixFinal, 0.02, 0.995, subLowMask);
+            lowMask = this.clampNumber(lowMask * lowSuppressMixFinal, 0.01, 0.98, lowMask);
+            midMask = this.clampNumber(midMask * (lowVoiceLikely ? (0.92 + (0.08 * suppress)) : (0.95 + (0.05 * suppress))), 0.01, 0.99, midMask);
+            const highSuppressMix = voiceLike ? (0.88 + (0.12 * suppress)) : (0.74 + (0.26 * suppress));
+            highMask = this.clampNumber(highMask * highSuppressMix, voiceLike ? 0.10 : 0.03, 0.995, highMask);
 
+            const highMod = fi > 0 ? Math.abs(vHighRms - prevVHighRms) / Math.max(1e-6, prevVHighRms + vHighRms) : 0;
+            const vibratoProxy = this.clampNumber(
+                (voiceLike ? 0.18 : 0)
+                + (lowVoiceLikely ? 0.07 : 0)
+                + Math.max(0, highMod - 0.05) * 3.0
+                + Math.max(0, (vHighRms / (vMidRms + 1e-9)) - 0.30) * 0.70
+                - (likelyBgmOnly ? 0.18 : 0)
+                - (lowBandBgmPriorityMode ? 0.12 : 0)
+                - Math.max(0, corrHigh - 0.42) * 0.35,
+                0,
+                1.4,
+                0.18,
+            );
+            const vibratoGuardStrength = this.clampNumber(
+                (vibratoProxy - 0.52) / 0.65,
+                0,
+                1,
+                0,
+            );
+            vibratoProxySum += vibratoProxy;
+            if (vibratoGuardStrength > 0.05) {
+                vibratoGuardFrames += 1;
+            }
+
+            // Guard against frame-to-frame high-band mask jumps that can create buzzy/grainy artifacts.
+            let highMaskDeltaCap = this.clampNumber(
+                (voiceLike ? 0.12 : 0.09)
+                + (lowVoiceLikely ? 0.01 : 0)
+                + (vHighRms > (aHighRms * 1.10) ? 0.01 : 0)
+                - (likelyBgmOnly ? 0.015 : 0)
+                - (lowBandBgmPriorityMode ? 0.015 : 0)
+                - Math.max(0, corrHigh - 0.28) * 0.05,
+                voiceLike ? 0.06 : 0.045,
+                voiceLike ? 0.16 : 0.12,
+                voiceLike ? 0.12 : 0.09,
+            );
+            if (vibratoGuardStrength > 0) {
+                highMaskDeltaCap = this.clampNumber(
+                    highMaskDeltaCap * (1 - (0.26 * vibratoGuardStrength)),
+                    voiceLike ? 0.045 : 0.038,
+                    voiceLike ? 0.15 : 0.11,
+                    highMaskDeltaCap,
+                );
+            }
+            let highDeltaWasLimited = false;
+            if (fi > 0) {
+                const rawDelta = highMask - prevHighMaskLimited;
+                if (Math.abs(rawDelta) > highMaskDeltaCap) {
+                    highMask = prevHighMaskLimited + (Math.sign(rawDelta) * highMaskDeltaCap);
+                    highMaskDeltaLimitedFrames += 1;
+                    highDeltaWasLimited = true;
+                }
+            }
+            const highMaskDelta = fi > 0 ? Math.abs(highMask - prevHighMaskLimited) : 0;
+            highMaskDeltaSum += highMaskDelta;
+            if (highMaskDelta > highMaskDeltaMax) {
+                highMaskDeltaMax = highMaskDelta;
+            }
+            prevHighMaskLimited = highMask;
+            prevVHighRms = vHighRms;
+
+            const highNoisePressure = this.clampNumber(
+                Math.max(0, corrHigh - 0.14) * 1.55
+                + Math.max(0, aHighRms - 0.0045) * 28
+                + Math.max(0, (xHighRms / (xMidRms + 1e-9)) - 0.75) * 0.55
+                + (likelyBgmOnly ? 0.16 : 0)
+                + (lowBandBgmPriorityMode ? 0.12 : 0)
+                + (highDeltaWasLimited ? 0.12 : 0)
+                - (voiceLike ? 0.05 : 0)
+                - (vHighRms > (aHighRms * 1.18) ? 0.07 : 0),
+                0,
+                1,
+                0.18,
+            );
+            const highSmoothBlend = this.clampNumber(
+                0.12 + (highNoisePressure * 0.78),
+                0.08,
+                0.95,
+                0.28,
+            );
+            highSmoothBlendByFrame[fi] = highSmoothBlend;
+            highSmoothBlendSum += highSmoothBlend;
+            if (highSmoothBlend >= 0.70) {
+                highStrongSmoothFrames += 1;
+            }
+            let highProtectBoost = this.clampNumber(
+                Math.max(0, highSmoothBlend - 0.28) * 0.10
+                + Math.max(0, 0.55 - highMask) * 0.03
+                + (highDeltaWasLimited ? 0.012 : 0)
+                + (vibratoGuardStrength * 0.020)
+                + (voiceLike ? 0.006 : 0)
+                - (likelyBgmOnly ? 0.010 : 0)
+                - (lowBandBgmPriorityMode ? 0.008 : 0),
+                0,
+                0.08,
+                0.01,
+            );
+            if (!voiceLike && likelyBgmOnly && highMask < 0.20) {
+                highProtectBoost = Math.min(highProtectBoost, 0.02);
+            }
+            highProtectBoostByFrame[fi] = highProtectBoost;
+
+            subLowMasks[fi] = subLowMask;
             lowMasks[fi] = lowMask;
             midMasks[fi] = midMask;
             highMasks[fi] = highMask;
             bgmSuppress[fi] = suppress;
+            subLowMaskSum += subLowMask;
             lowMaskSum += lowMask;
             midMaskSum += midMask;
             highMaskSum += highMask;
         }
 
+        const subLowMasksSmooth = new Float32Array(frameCount);
         const lowMasksSmooth = new Float32Array(frameCount);
         const midMasksSmooth = new Float32Array(frameCount);
         const highMasksSmooth = new Float32Array(frameCount);
@@ -1720,9 +2295,29 @@ export class SeparationQualityLibrary {
             const i0 = Math.max(0, i - 1);
             const i1 = i;
             const i2 = Math.min(frameCount - 1, i + 1);
-            lowMasksSmooth[i] = (lowMasks[i0] * 0.18) + (lowMasks[i1] * 0.64) + (lowMasks[i2] * 0.18);
-            midMasksSmooth[i] = (midMasks[i0] * 0.18) + (midMasks[i1] * 0.64) + (midMasks[i2] * 0.18);
-            highMasksSmooth[i] = (highMasks[i0] * 0.18) + (highMasks[i1] * 0.64) + (highMasks[i2] * 0.18);
+            const iM2 = Math.max(0, i - 2);
+            const iP2 = Math.min(frameCount - 1, i + 2);
+            subLowMasksSmooth[i] = (subLowMasks[iM2] * 0.08) + (subLowMasks[i0] * 0.18) + (subLowMasks[i1] * 0.48) + (subLowMasks[i2] * 0.18) + (subLowMasks[iP2] * 0.08);
+            lowMasksSmooth[i] = (lowMasks[iM2] * 0.08) + (lowMasks[i0] * 0.18) + (lowMasks[i1] * 0.48) + (lowMasks[i2] * 0.18) + (lowMasks[iP2] * 0.08);
+            midMasksSmooth[i] = (midMasks[iM2] * 0.08) + (midMasks[i0] * 0.18) + (midMasks[i1] * 0.48) + (midMasks[i2] * 0.18) + (midMasks[iP2] * 0.08);
+            const h3 = (highMasks[i0] * 0.18) + (highMasks[i1] * 0.64) + (highMasks[i2] * 0.18);
+            const h5 = (highMasks[iM2] * 0.08) + (highMasks[i0] * 0.18) + (highMasks[i1] * 0.48) + (highMasks[i2] * 0.18) + (highMasks[iP2] * 0.08);
+            const h5Strong = (highMasks[iM2] * 0.12) + (highMasks[i0] * 0.24) + (highMasks[i1] * 0.28) + (highMasks[i2] * 0.24) + (highMasks[iP2] * 0.12);
+            const b0 = highSmoothBlendByFrame[i0];
+            const b1 = highSmoothBlendByFrame[i1];
+            const b2 = highSmoothBlendByFrame[i2];
+            const bM2 = highSmoothBlendByFrame[iM2];
+            const bP2 = highSmoothBlendByFrame[iP2];
+            const smoothBlend = this.clampNumber(
+                (bM2 * 0.08) + (b0 * 0.18) + (b1 * 0.48) + (b2 * 0.18) + (bP2 * 0.08),
+                0.08,
+                0.95,
+                b1 || 0.28,
+            );
+            const toFive = this.clampNumber((smoothBlend - 0.12) / 0.46, 0, 1, 0);
+            const toStrong = this.clampNumber((smoothBlend - 0.70) / 0.22, 0, 1, 0);
+            const hBase = (h3 * (1 - toFive)) + (h5 * toFive);
+            highMasksSmooth[i] = (hBase * (1 - toStrong)) + (h5Strong * toStrong);
         }
 
         const outVocal = new Int16Array(vocal.samples.length);
@@ -1731,40 +2326,78 @@ export class SeparationQualityLibrary {
         outAcc.set(accompaniment.samples);
 
         let frameIdx = 0;
+        let mixSubLowState = 0;
         let mixLowState = 0;
         let mixHighLpState = 0;
+        let protectBlendSum = 0;
+        let highProtectBoostAppliedSum = 0;
+        let highProtectBoostAppliedCount = 0;
         for (let j = 0; j < n; j += 1) {
             while (frameIdx + 1 < frameCount && j > centers[frameIdx + 1]) {
                 frameIdx += 1;
             }
 
+            let subLowMask = subLowMasksSmooth[frameIdx];
             let lowMask = lowMasksSmooth[frameIdx];
             let midMask = midMasksSmooth[frameIdx];
             let highMask = highMasksSmooth[frameIdx];
+            let highProtectBoost = highProtectBoostByFrame[frameIdx];
             if (frameIdx + 1 < frameCount) {
                 const c0 = centers[frameIdx];
                 const c1 = centers[frameIdx + 1];
                 const t = c1 > c0 ? (j - c0) / (c1 - c0) : 0;
+                subLowMask = (subLowMasksSmooth[frameIdx] * (1 - t)) + (subLowMasksSmooth[frameIdx + 1] * t);
                 lowMask = (lowMasksSmooth[frameIdx] * (1 - t)) + (lowMasksSmooth[frameIdx + 1] * t);
                 midMask = (midMasksSmooth[frameIdx] * (1 - t)) + (midMasksSmooth[frameIdx + 1] * t);
                 highMask = (highMasksSmooth[frameIdx] * (1 - t)) + (highMasksSmooth[frameIdx + 1] * t);
+                highProtectBoost = (highProtectBoostByFrame[frameIdx] * (1 - t)) + (highProtectBoostByFrame[frameIdx + 1] * t);
             }
 
             const mi = mixStart + j;
             const si = stemStart + j;
             const x = mix.samples[mi] / INT16_MAX;
+            mixSubLowState += alphaSubLow * (x - mixSubLowState);
             mixLowState += alphaLow * (x - mixLowState);
             mixHighLpState += alphaHighLp * (x - mixHighLpState);
-            const xLow = mixLowState;
+            const xSubLow = mixSubLowState;
+            const xLow = mixLowState - mixSubLowState;
             const xHigh = x - mixHighLpState;
-            const xMid = x - xLow - xHigh;
+            const xMid = x - xSubLow - xLow - xHigh;
 
-            let yV = (xLow * lowMask) + (xMid * midMask) + (xHigh * highMask);
+            let yV = (xSubLow * subLowMask) + (xLow * lowMask) + (xMid * midMask) + (xHigh * highMask);
             // Blend a small amount of the original separated vocal to preserve fine articulation.
             const vOrig = vocal.samples[si] / INT16_MAX;
-            yV = (yV * 0.88) + (vOrig * 0.12);
+            const lowComponentAbs = Math.abs(xSubLow) + Math.abs(xLow);
+            const lowProtectBlend = this.clampNumber(0.10 + (lowComponentAbs * 0.10), 0.10, 0.22, 0.12);
+            const highProtectEnergyBoost = this.clampNumber(
+                Math.max(0, Math.abs(xHigh) - 0.022) * (0.035 + (highProtectBoost * 0.35)),
+                0,
+                0.030,
+                0,
+            );
+            const highProtectBlend = this.clampNumber(
+                0.04 + (Math.abs(xHigh) * 0.10) + Math.max(0, 0.35 - highMask) * 0.10,
+                0.04,
+                0.14,
+                0.06,
+            ) + this.clampNumber(highProtectBoost + highProtectEnergyBoost, 0, 0.10, 0);
+            const highProtectBlendClamped = this.clampNumber(
+                highProtectBlend,
+                0.04,
+                0.20,
+                0.06,
+            );
+            const protectBlend = this.clampNumber(Math.max(lowProtectBlend, highProtectBlendClamped), 0.08, 0.26, 0.12);
+            yV = (yV * (1 - protectBlend)) + (vOrig * protectBlend);
             yV = Math.tanh(yV * 1.04) / Math.tanh(1.04);
             const yA = x - yV;
+
+            protectBlendSum += protectBlend;
+            const highProtectBoostApplied = this.clampNumber(highProtectBoost + highProtectEnergyBoost, 0, 0.12, 0);
+            highProtectBoostAppliedSum += highProtectBoostApplied;
+            if (highProtectBoostApplied >= 0.012) {
+                highProtectBoostAppliedCount += 1;
+            }
 
             outVocal[si] = this.clampInt16(Math.round(yV * INT16_MAX));
             outAcc[si] = this.clampInt16(Math.round(yA * INT16_MAX));
@@ -1777,10 +2410,22 @@ export class SeparationQualityLibrary {
             frameCount,
             estimatedLagSamples: lagSamples,
             estimatedLagMs: this.roundNumber((lagSamples / sr) * 1000, 2),
+            avgSubLowMask: this.roundNumber(subLowMaskSum / Math.max(1, frameCount), 4),
             avgLowMask: this.roundNumber(lowMaskSum / Math.max(1, frameCount), 4),
             avgMidMask: this.roundNumber(midMaskSum / Math.max(1, frameCount), 4),
             avgHighMask: this.roundNumber(highMaskSum / Math.max(1, frameCount), 4),
+            avgHighMaskDelta: this.roundNumber(highMaskDeltaSum / Math.max(1, frameCount - 1), 4),
+            maxHighMaskDelta: this.roundNumber(highMaskDeltaMax, 4),
+            highMaskDeltaLimitedFrames,
+            avgHighSmoothBlend: this.roundNumber(highSmoothBlendSum / Math.max(1, frameCount), 4),
+            highStrongSmoothFrames,
+            avgProtectBlend: this.roundNumber(protectBlendSum / Math.max(1, n), 4),
+            avgHighProtectBoost: this.roundNumber(highProtectBoostAppliedSum / Math.max(1, n), 4),
+            highProtectBoostRatio: this.roundNumber(highProtectBoostAppliedCount / Math.max(1, n), 4),
+            avgVibratoProxy: this.roundNumber(vibratoProxySum / Math.max(1, frameCount), 4),
+            vibratoGuardFrames,
             bgmOnlySuppressedFrames,
+            lowBgmPriorityFrames,
             lowBleedGuardFrames,
             outputDurationMs: Math.round((outVocal.length / sr) * 1000),
         };

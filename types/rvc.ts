@@ -152,6 +152,7 @@ export interface RvcConvertParams {
     rmsMixRate?: number;        // 0.0-1.0, envelope mixing, default: 0.25
     resampleSr?: number;        // output sample rate (0 = no resample)
     autoHighPitchQualityProtect?: boolean; // file WAV only: blend lower-transpose output on detected high-note regions
+    latencyPriority?: boolean;  // prefer low latency (chat/interactive use) over heavy quality safeguards/archive
 }
 
 export interface RvcConvertResult {
@@ -200,7 +201,9 @@ export interface RvcStartOptions {
 
 export type VoicePipelineMode = 'sbv2' | 'rvc' | 'sbv2+rvc';
 
-export type VoiceEmotionLabelHint = 'neutral' | 'joy' | 'sad' | 'angry' | 'excited';
+export type VoiceEmotionLabelHint =
+    | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited'
+    | 'fear' | 'surprise' | 'love' | 'embarrassed' | 'curious';
 
 export interface VoiceSbv2WaveEditSettings {
     vibratoDepth?: number;

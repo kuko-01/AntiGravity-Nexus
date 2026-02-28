@@ -7,6 +7,7 @@ import {
     CharacterChatTurn,
     CharacterConversationSettings,
     CharacterEmotionLabel,
+    CharacterEmotionPersonality,
     CharacterEmotionResult,
     CharacterProfile,
 } from '../../types/character';
@@ -52,6 +53,48 @@ const EMOTION_LEXICON: Array<{ token: string; label: CharacterEmotionLabel; weig
     { token: 'やばい', label: 'excited', weight: 0.2 },
     { token: '楽しみ', label: 'excited', weight: 0.24 },
     { token: '感動', label: 'excited', weight: 0.18 },
+    // fear / 恐怖・不安
+    { token: '怖い', label: 'fear', weight: 0.34 },
+    { token: 'こわい', label: 'fear', weight: 0.34 },
+    { token: '恐ろしい', label: 'fear', weight: 0.34 },
+    { token: '不安', label: 'fear', weight: 0.30 },
+    { token: '心配', label: 'fear', weight: 0.28 },
+    { token: 'ドキドキ', label: 'fear', weight: 0.22 },
+    { token: 'ビクビク', label: 'fear', weight: 0.22 },
+    { token: '震える', label: 'fear', weight: 0.20 },
+    { token: 'ビビ', label: 'fear', weight: 0.20 },
+    // surprise / 驚き
+    { token: 'びっくり', label: 'surprise', weight: 0.34 },
+    { token: '驚', label: 'surprise', weight: 0.32 },
+    { token: '信じられない', label: 'surprise', weight: 0.28 },
+    { token: 'まじで', label: 'surprise', weight: 0.22 },
+    { token: 'えっ', label: 'surprise', weight: 0.20 },
+    { token: 'うわ', label: 'surprise', weight: 0.18 },
+    { token: '突然', label: 'surprise', weight: 0.14 },
+    // love / 愛情・優しさ
+    { token: '大好き', label: 'love', weight: 0.36 },
+    { token: '好き', label: 'love', weight: 0.34 },
+    { token: '愛', label: 'love', weight: 0.32 },
+    { token: 'かわいい', label: 'love', weight: 0.28 },
+    { token: '大切', label: 'love', weight: 0.26 },
+    { token: '温かい', label: 'love', weight: 0.22 },
+    { token: '癒し', label: 'love', weight: 0.20 },
+    // embarrassed / 恥ずかしさ
+    { token: '恥ずかしい', label: 'embarrassed', weight: 0.36 },
+    { token: '照れ', label: 'embarrassed', weight: 0.32 },
+    { token: 'きゃ', label: 'embarrassed', weight: 0.24 },
+    { token: 'むずがゆ', label: 'embarrassed', weight: 0.28 },
+    { token: '赤くなる', label: 'embarrassed', weight: 0.26 },
+    { token: 'てれ', label: 'embarrassed', weight: 0.28 },
+    // curious / 好奇心
+    { token: '気になる', label: 'curious', weight: 0.30 },
+    { token: '不思議', label: 'curious', weight: 0.28 },
+    { token: '知りたい', label: 'curious', weight: 0.28 },
+    { token: '面白い', label: 'curious', weight: 0.26 },
+    { token: 'なんで', label: 'curious', weight: 0.18 },
+    { token: 'どんな', label: 'curious', weight: 0.16 },
+    { token: 'なぜ', label: 'curious', weight: 0.18 },
+    { token: '興味', label: 'curious', weight: 0.24 },
 ];
 
 const EMOTION_INTENSIFIERS = ['とても', 'かなり', 'すごく', 'めっちゃ', '超', '本当に', 'ほんとうに', 'very', 'really'];
@@ -65,12 +108,17 @@ const NEGATIVE_NEGATION_PATTERNS = [
 ];
 const POSITIVE_EMOJI_PATTERN = /[😄😀😁😊🥳✨🎉💖💕❤️😍]/gu;
 const NEGATIVE_EMOJI_PATTERN = /[😢😭😞😔😡😠💢😣]/gu;
+const FEAR_EMOJI_PATTERN = /[😱🫣😰😨😧]/gu;
+const SURPRISE_EMOJI_PATTERN = /[😲😮🤯😦]/gu;
+const LOVE_EMOJI_PATTERN = /[😍💕❤️🥰💗]/gu;
+const EMBARRASSED_EMOJI_PATTERN = /[😳🫠🙈]/gu;
+const CURIOUS_EMOJI_PATTERN = /[🤔💭🧐🤨]/gu;
 const EXCLAMATION_PATTERN = /[!！]/gu;
 const QUESTION_PATTERN = /[?？]/gu;
 const ELLIPSIS_PATTERN = /[.…]{2,}|。{2,}/gu;
 const REPEATED_PUNCT_PATTERN = /([!！?？])\1+/gu;
 const EMPHASIS_PATTERN = /[A-Z]{4,}|[ぁ-んァ-ン一-龥]{1,}[ー～]{2,}/gu;
-const EMOTION_TAG_PATTERN = /<emotion\s+label=["'](neutral|joy|sad|angry|excited)["']\s+intensity=["']([0-9]*\.?[0-9]+)["']\s*\/>/i;
+const EMOTION_TAG_PATTERN = /<emotion\s+label=["'](neutral|joy|sad|angry|excited|fear|surprise|love|embarrassed|curious)["']\s+intensity=["']([0-9]*\.?[0-9]+)["']\s*\/>/i;
 
 const DEFAULT_PROFILE: CharacterProfile = {
     id: DEFAULT_CHARACTER_ID,
@@ -99,6 +147,7 @@ interface ResolvedConversationSettings {
     userCallName: string;
     userProfileNote: string;
     addressedUser: string;
+    emotionPersonality?: CharacterEmotionPersonality;
 }
 
 interface PersistentCharacterMemoryEntry {
@@ -172,10 +221,10 @@ export class CharacterChatService {
         const generatedResponse = await this.generateResponse(profile, turns, memoryEntry.turns, userText, settings);
         const parsedResponse = this.extractEmotionTag(generatedResponse);
         const responseText = parsedResponse.text.trim() || this.buildFallbackResponse(userText, settings);
-        const rawEmotion = this.estimateEmotion(responseText, userText, parsedResponse.hint);
+        const rawEmotion = this.estimateEmotion(responseText, userText, parsedResponse.hint, settings.emotionPersonality);
         const autoEmotionRefine = request.voice?.expression?.autoEmotionRefine !== false;
         const emotion = autoEmotionRefine
-            ? this.refineEmotionWithHistory(rawEmotion, turns, memoryEntry.turns)
+            ? this.refineEmotionWithHistory(rawEmotion, turns, memoryEntry.turns, settings.emotionPersonality)
             : {
                 label: rawEmotion.label,
                 intensity: this.clamp01(rawEmotion.intensity),
@@ -372,6 +421,7 @@ export class CharacterChatService {
             userCallName,
             userProfileNote: this.cleanSettingText(userSettings?.profileNote, 260),
             addressedUser,
+            emotionPersonality: characterSettings?.emotionPersonality,
         };
     }
 
@@ -515,7 +565,8 @@ export class CharacterChatService {
             singingIntent ? 'ユーザーは歌唱応答を希望しています。歌詞として2〜6行、1行あたり短めに改行して返してください。' : '',
             singingIntent ? '歌唱時は箇条書きや解説文を避け、歌詞本体だけを自然な日本語で出力してください。' : '',
             lengthPreference === 'detailed' ? '十分な具体性を持たせ、薄い一般論だけで終えないでください。' : '',
-            '返信本文の最後に機械可読タグを1行だけ追加してください: <emotion label="neutral|joy|sad|angry|excited" intensity="0.00-1.00" />',
+            '返信本文の最後に機械可読タグを1行だけ追加してください: <emotion label="neutral|joy|sad|angry|excited|fear|surprise|love|embarrassed|curious" intensity="0.00-1.00" />',
+            '感情はテキスト本文にも自然に反映してください（言葉の選び方・語尾・間投詞など）。',
             'タグは最後の行に1回だけ。本文中にタグやJSON形式の説明を含めないでください。',
             lengthInstruction,
         ].filter(Boolean).join('\n');
@@ -585,14 +636,12 @@ export class CharacterChatService {
     }
 
     private parseEmotionHint(labelRaw: unknown, intensityRaw: unknown): CharacterEmotionResult | undefined {
-        const label = (
-            labelRaw === 'neutral'
-            || labelRaw === 'joy'
-            || labelRaw === 'sad'
-            || labelRaw === 'angry'
-            || labelRaw === 'excited'
-        )
-            ? labelRaw
+        const VALID_LABELS: CharacterEmotionLabel[] = [
+            'neutral', 'joy', 'sad', 'angry', 'excited',
+            'fear', 'surprise', 'love', 'embarrassed', 'curious',
+        ];
+        const label = VALID_LABELS.includes(labelRaw as CharacterEmotionLabel)
+            ? (labelRaw as CharacterEmotionLabel)
             : undefined;
         if (!label) {
             return undefined;
@@ -671,14 +720,19 @@ export class CharacterChatService {
         return matches ? matches.length : 0;
     }
 
-    private inferEmotion(text: string): EmotionInference {
+    private inferEmotion(text: string, personality?: CharacterEmotionPersonality): EmotionInference {
         const normalized = String(text || '').trim().toLowerCase();
         const scores: Record<CharacterEmotionLabel, number> = {
-            neutral: 0.42,
-            joy: 0.06,
-            sad: 0.06,
-            angry: 0.06,
-            excited: 0.06,
+            neutral: 0.38,
+            joy: 0.05,
+            sad: 0.05,
+            angry: 0.05,
+            excited: 0.05,
+            fear: 0.04,
+            surprise: 0.04,
+            love: 0.05,
+            embarrassed: 0.03,
+            curious: 0.04,
         };
         if (!normalized) {
             return {
@@ -703,6 +757,11 @@ export class CharacterChatService {
         const emphasisCount = this.countPattern(normalized, EMPHASIS_PATTERN);
         const positiveEmojiCount = this.countPattern(normalized, POSITIVE_EMOJI_PATTERN);
         const negativeEmojiCount = this.countPattern(normalized, NEGATIVE_EMOJI_PATTERN);
+        const fearEmojiCount = this.countPattern(normalized, FEAR_EMOJI_PATTERN);
+        const surpriseEmojiCount = this.countPattern(normalized, SURPRISE_EMOJI_PATTERN);
+        const loveEmojiCount = this.countPattern(normalized, LOVE_EMOJI_PATTERN);
+        const embarrassedEmojiCount = this.countPattern(normalized, EMBARRASSED_EMOJI_PATTERN);
+        const curiousEmojiCount = this.countPattern(normalized, CURIOUS_EMOJI_PATTERN);
         const positiveNegationHits = POSITIVE_NEGATION_PATTERNS.reduce(
             (acc, pattern) => acc + this.countPattern(normalized, pattern),
             0,
@@ -727,6 +786,11 @@ export class CharacterChatService {
         scores.excited += Math.min(0.35, positiveEmojiCount * 0.08);
         scores.sad += Math.min(0.4, negativeEmojiCount * 0.12);
         scores.angry += Math.min(0.45, negativeEmojiCount * 0.13);
+        scores.fear += Math.min(0.5, fearEmojiCount * 0.15);
+        scores.surprise += Math.min(0.5, surpriseEmojiCount * 0.15);
+        scores.love += Math.min(0.4, loveEmojiCount * 0.12);
+        scores.embarrassed += Math.min(0.4, embarrassedEmojiCount * 0.12);
+        scores.curious += Math.min(0.35, curiousEmojiCount * 0.10);
 
         if (positiveNegationHits > 0) {
             scores.joy *= 0.72;
@@ -745,7 +809,21 @@ export class CharacterChatService {
         scores.sad *= emphasisMultiplier;
         scores.angry *= emphasisMultiplier;
         scores.excited *= emphasisMultiplier;
+        scores.fear *= emphasisMultiplier;
+        scores.surprise *= emphasisMultiplier;
+        scores.love *= emphasisMultiplier;
+        scores.embarrassed *= emphasisMultiplier;
+        scores.curious *= emphasisMultiplier;
         scores.neutral *= 2 - Math.min(1.2, emphasisMultiplier);
+
+        if (personality?.baselineBias) {
+            for (const [emotionLabel, bias] of Object.entries(personality.baselineBias)) {
+                const lbl = emotionLabel as CharacterEmotionLabel;
+                if (lbl in scores && typeof bias === 'number') {
+                    scores[lbl] = Math.max(0, scores[lbl] + bias);
+                }
+            }
+        }
 
         const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
         const top = sorted[0];
@@ -762,9 +840,11 @@ export class CharacterChatService {
             + Math.max(0, emphasisMultiplier - 1) * 0.5,
         );
 
-        const intensity = label === 'neutral'
+        const rawIntensity = label === 'neutral'
             ? this.clamp01(0.14 + arousal * 0.2 + (1 - confidence) * 0.2 + Math.min(0.18, topScore * 0.07))
             : this.clamp01(0.24 + confidence * 0.38 + arousal * 0.28 + Math.min(0.3, topScore * 0.14));
+        const intensityScale = personality?.intensityScale ?? 1.0;
+        const intensity = this.clamp01(rawIntensity * intensityScale);
 
         return {
             label,
@@ -847,6 +927,7 @@ export class CharacterChatService {
         rawEmotion: CharacterEmotionResult,
         sessionTurns: CharacterChatTurn[],
         memoryTurns: CharacterChatTurn[],
+        personality?: CharacterEmotionPersonality,
     ): CharacterEmotionResult {
         const recent = this.gatherRecentAssistantEmotions(sessionTurns, memoryTurns);
         if (recent.length === 0) {
@@ -863,7 +944,8 @@ export class CharacterChatService {
         const reference = sameLabel.length > 0 ? sameLabelAvg : globalAvg;
         const blendRatio = sameLabel.length > 0 ? 0.45 : 0.28;
         const blended = this.clamp01(rawEmotion.intensity * (1 - blendRatio) + reference * blendRatio);
-        const deltaLimited = this.limitDelta(blended, this.clamp01(last.intensity), EMOTION_DELTA_LIMIT);
+        const deltaLimit = personality?.volatility ?? EMOTION_DELTA_LIMIT;
+        const deltaLimited = this.limitDelta(blended, this.clamp01(last.intensity), deltaLimit);
 
         return {
             label: rawEmotion.label,
@@ -875,8 +957,9 @@ export class CharacterChatService {
         assistantText: string,
         userText?: string,
         hint?: CharacterEmotionResult,
+        personality?: CharacterEmotionPersonality,
     ): CharacterEmotionResult {
-        const assistantEmotion = this.inferEmotion(assistantText);
+        const assistantEmotion = this.inferEmotion(assistantText, personality);
         const userEmotion = this.inferEmotion(userText || '');
         return this.blendEmotionSignals(assistantEmotion, userEmotion, hint);
     }

@@ -1,9 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { CharacterChatResponse, CharacterConversationSettings } from '../../types/character';
+import type { CharacterChatResponse, CharacterConversationSettings, CharacterEmotionPersonality } from '../../types/character';
 import type { RvcModel } from '../../types/rvc';
 import type { TtsModel } from '../../types/tts';
-import type { CharacterLearningSeparationProfileResponse } from '../../types';
+import type { AudioProcess, CharacterLearningSeparationProfileResponse } from '../../types';
+import { WaveformEditor } from '../components/WaveformEditor';
 
 type MessageRole = 'user' | 'assistant' | 'system';
 
@@ -33,6 +34,7 @@ interface StoredCharacterProfile {
     firstPerson?: string;
     personaNote?: string;
     speakingStyleNote?: string;
+    emotionPersonality?: CharacterEmotionPersonality;
     voice?: StoredCharacterVoiceSettings;
     voiceEnhance?: StoredVoiceEnhanceSettings;
     updatedAt?: string;
@@ -63,7 +65,8 @@ interface StoredVoiceEnhanceSettings {
     autoEmotionRefine?: boolean;
     enhanceFinalAudio?: boolean;
     autoAnalyzeAndEnhance?: boolean;
-    emotionLabelHint?: 'auto' | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited';
+    emotionLabelHint?: 'auto' | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited'
+        | 'fear' | 'surprise' | 'love' | 'embarrassed' | 'curious';
     useEmotionIntensityHint?: boolean;
     emotionIntensityHint?: number;
     ytDlpCookiesFile?: string;
@@ -86,8 +89,17 @@ const DEFAULT_CHARACTER_PROFILE: StoredCharacterProfile = {
     personaNote: '',
     speakingStyleNote: '',
 };
+const EMOTION_PERSONALITY_PRESETS: Record<string, CharacterEmotionPersonality> = {
+    standard: { intensityScale: 1.0, volatility: 0.3 },
+    cheerful: { intensityScale: 1.2, volatility: 0.35, baselineBias: { joy: 0.08, excited: 0.06, sad: -0.04, angry: -0.04 } },
+    gentle: { intensityScale: 0.9, volatility: 0.2, baselineBias: { love: 0.08, curious: 0.06, angry: -0.06, fear: -0.04 } },
+    shy: { intensityScale: 0.85, volatility: 0.25, baselineBias: { embarrassed: 0.10, fear: 0.06, angry: -0.08 } },
+    stoic: { intensityScale: 0.6, volatility: 0.15, baselineBias: { neutral: 0.12, excited: -0.06, love: -0.04 } },
+};
 const createSessionId = () => `char_ui_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
 const DEFAULT_RVC_SPEAKER_COUNT = 8;
+const APP_INPUT_TRANSCRIBE_INTERVAL_MS = 10_000;
+const APP_INPUT_MIN_SEGMENT_SEC = 3;
 const LEGACY_SETTINGS_STORAGE_KEY = 'character_studio_settings_v1';
 const CHARACTER_PROFILES_STORAGE_KEY = 'character_studio_profiles_v1';
 const USER_PROFILE_STORAGE_KEY = 'character_studio_user_profile_v1';
@@ -126,6 +138,9 @@ const CharacterStudioScreen: React.FC = () => {
     const [characterFirstPerson, setCharacterFirstPerson] = useState<string>(DEFAULT_CHARACTER_PROFILE.firstPerson || 'わたし');
     const [characterPersonaNote, setCharacterPersonaNote] = useState<string>('');
     const [characterSpeakingStyleNote, setCharacterSpeakingStyleNote] = useState<string>('');
+    const [emotionPersonalityPreset, setEmotionPersonalityPreset] = useState<string>('standard');
+    const [emotionIntensityScale, setEmotionIntensityScale] = useState<number>(1.0);
+    const [emotionVolatility, setEmotionVolatility] = useState<number>(0.3);
     const [userName, setUserName] = useState<string>('');
     const [userCallName, setUserCallName] = useState<string>('');
     const [userProfileNote, setUserProfileNote] = useState<string>('');
@@ -153,9 +168,9 @@ const CharacterStudioScreen: React.FC = () => {
     const [autoEmotionRefine, setAutoEmotionRefine] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.autoEmotionRefine !== false);
     const [enhanceFinalAudio, setEnhanceFinalAudio] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.enhanceFinalAudio !== false);
     const [autoAnalyzeAndEnhance, setAutoAnalyzeAndEnhance] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.autoAnalyzeAndEnhance !== false);
-    const [emotionLabelHint, setEmotionLabelHint] = useState<'auto' | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited'>(
-        DEFAULT_VOICE_ENHANCE_SETTINGS.emotionLabelHint || 'auto',
-    );
+    const [emotionLabelHint, setEmotionLabelHint] = useState<
+        'auto' | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited' | 'fear' | 'surprise' | 'love' | 'embarrassed' | 'curious'
+    >(DEFAULT_VOICE_ENHANCE_SETTINGS.emotionLabelHint || 'auto');
     const [useEmotionIntensityHint, setUseEmotionIntensityHint] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.useEmotionIntensityHint || false);
     const [emotionIntensityHint, setEmotionIntensityHint] = useState<number>(DEFAULT_VOICE_ENHANCE_SETTINGS.emotionIntensityHint || 0.55);
     const [sbv2ModelId, setSbv2ModelId] = useState<string>('');
@@ -169,7 +184,26 @@ const CharacterStudioScreen: React.FC = () => {
     const [rvcIndexOptions, setRvcIndexOptions] = useState<string[]>([]);
     const [rvcSpeakerCount, setRvcSpeakerCount] = useState<number>(DEFAULT_RVC_SPEAKER_COUNT);
 
+    // Dialogue Extract state
+    const [dialogueUrl, setDialogueUrl] = useState('');
+    const [dialogueDetectedTs, setDialogueDetectedTs] = useState<number | null>(null);
+    const [dialogueStartOverride, setDialogueStartOverride] = useState('');
+    const [dialogueDuration, setDialogueDuration] = useState(10);
+    const [isDialogueExtracting, setIsDialogueExtracting] = useState(false);
+    const [dialogueExtractStatus, setDialogueExtractStatus] = useState('');
+    const [waveformEditorData, setWaveformEditorData] = useState<{ base64?: string; fileName: string } | null>(null);
+    const [appAudioInputEnabled, setAppAudioInputEnabled] = useState(false);
+    const [appAudioCaptureRunning, setAppAudioCaptureRunning] = useState(false);
+    const [appAudioInputStatus, setAppAudioInputStatus] = useState('');
+    const [audioProcesses, setAudioProcesses] = useState<AudioProcess[]>([]);
+    const [selectedAppProcessPid, setSelectedAppProcessPid] = useState<number | null>(null);
+    const [isRefreshingAudioProcesses, setIsRefreshingAudioProcesses] = useState(false);
+
     const chatScrollRef = useRef<HTMLDivElement | null>(null);
+    const appInputCaptureActiveRef = useRef(false);
+    const appInputCaptureTranscribingRef = useRef(false);
+    const appInputLastTranscribedSamplesRef = useRef(0);
+    const appInputLastTranscribeTimeRef = useRef(0);
 
     const apiAvailable = useMemo(() => Boolean(window.electronAPI?.characterChatSend), []);
     const selectedSbv2Model = useMemo(
@@ -204,6 +238,16 @@ const CharacterStudioScreen: React.FC = () => {
         }
         return Array.from(merged).sort((a, b) => a.localeCompare(b));
     }, [characterId, characterProfiles]);
+    const sortedAudioProcesses = useMemo(() => (
+        [...audioProcesses].sort((a, b) => {
+            const titleA = String(a.title || '').trim();
+            const titleB = String(b.title || '').trim();
+            if (titleA && titleB) return titleA.localeCompare(titleB);
+            if (titleA) return -1;
+            if (titleB) return 1;
+            return String(a.name || '').localeCompare(String(b.name || ''));
+        })
+    ), [audioProcesses]);
     const hasSavedProfileForCurrentCharacter = useMemo(
         () => Boolean(characterProfiles[characterId.trim()]),
         [characterProfiles, characterId],
@@ -218,6 +262,15 @@ const CharacterStudioScreen: React.FC = () => {
             .map((method) => byMethod.get(method))
             .filter((method): method is NonNullable<typeof method> => Boolean(method));
     }, [separationProfile]);
+    const resolvedEmotionPersonality = useMemo<CharacterEmotionPersonality>(() => {
+        const preset = EMOTION_PERSONALITY_PRESETS[emotionPersonalityPreset] || EMOTION_PERSONALITY_PRESETS.standard;
+        return {
+            ...preset,
+            intensityScale: emotionIntensityScale,
+            volatility: emotionVolatility,
+        };
+    }, [emotionPersonalityPreset, emotionIntensityScale, emotionVolatility]);
+
     const conversationSettings = useMemo<CharacterConversationSettings>(() => ({
         character: {
             nameKanji: characterNameKanji.trim() || undefined,
@@ -227,6 +280,7 @@ const CharacterStudioScreen: React.FC = () => {
             firstPerson: characterFirstPerson.trim() || undefined,
             personaNote: characterPersonaNote.trim() || undefined,
             speakingStyleNote: characterSpeakingStyleNote.trim() || undefined,
+            emotionPersonality: resolvedEmotionPersonality,
         },
         user: {
             name: userName.trim() || undefined,
@@ -239,6 +293,7 @@ const CharacterStudioScreen: React.FC = () => {
         characterFirstPerson,
         characterPersonaNote,
         characterSpeakingStyleNote,
+        resolvedEmotionPersonality,
         userName,
         userCallName,
         userProfileNote,
@@ -247,15 +302,12 @@ const CharacterStudioScreen: React.FC = () => {
     const normalizeVoiceEnhanceSettings = (
         settings: StoredVoiceEnhanceSettings | undefined,
     ): StoredVoiceEnhanceSettings => {
-        const nextEmotionLabelHint = (
-            settings?.emotionLabelHint === 'auto'
-            || settings?.emotionLabelHint === 'neutral'
-            || settings?.emotionLabelHint === 'joy'
-            || settings?.emotionLabelHint === 'sad'
-            || settings?.emotionLabelHint === 'angry'
-            || settings?.emotionLabelHint === 'excited'
-        )
-            ? settings.emotionLabelHint
+        const VALID_EMOTION_HINTS = [
+            'auto', 'neutral', 'joy', 'sad', 'angry', 'excited',
+            'fear', 'surprise', 'love', 'embarrassed', 'curious',
+        ] as const;
+        const nextEmotionLabelHint = VALID_EMOTION_HINTS.includes(settings?.emotionLabelHint as typeof VALID_EMOTION_HINTS[number])
+            ? settings!.emotionLabelHint!
             : (DEFAULT_VOICE_ENHANCE_SETTINGS.emotionLabelHint || 'auto');
         const nextEmotionIntensityHintRaw = Number(settings?.emotionIntensityHint);
         const nextEmotionIntensityHint = Number.isFinite(nextEmotionIntensityHintRaw)
@@ -418,6 +470,16 @@ const CharacterStudioScreen: React.FC = () => {
         setCharacterFirstPerson(profile.firstPerson || 'わたし');
         setCharacterPersonaNote(profile.personaNote || '');
         setCharacterSpeakingStyleNote(profile.speakingStyleNote || '');
+        const ep = profile.emotionPersonality;
+        if (ep) {
+            setEmotionIntensityScale(typeof ep.intensityScale === 'number' ? Math.max(0.5, Math.min(1.5, ep.intensityScale)) : 1.0);
+            setEmotionVolatility(typeof ep.volatility === 'number' ? Math.max(0.1, Math.min(0.5, ep.volatility)) : 0.3);
+            setEmotionPersonalityPreset('custom');
+        } else {
+            setEmotionIntensityScale(1.0);
+            setEmotionVolatility(0.3);
+            setEmotionPersonalityPreset('standard');
+        }
         applyCharacterVoiceSettings(profile.voice || DEFAULT_CHARACTER_VOICE_SETTINGS);
         applyVoiceEnhanceSettings(profile.voiceEnhance || DEFAULT_VOICE_ENHANCE_SETTINGS);
     };
@@ -432,6 +494,7 @@ const CharacterStudioScreen: React.FC = () => {
         firstPerson: characterFirstPerson.trim(),
         personaNote: characterPersonaNote.trim(),
         speakingStyleNote: characterSpeakingStyleNote.trim(),
+        emotionPersonality: resolvedEmotionPersonality,
         voice: buildCharacterVoiceSettingsFromState(),
         voiceEnhance: buildVoiceEnhanceSettingsFromState(),
         updatedAt: new Date().toISOString(),
@@ -661,9 +724,282 @@ const CharacterStudioScreen: React.FC = () => {
         }
     };
 
+    const handleDialogueUrlChange = useCallback((url: string) => {
+        setDialogueUrl(url);
+        const match = url.match(/[?&]t=([^&\s#]+)/i);
+        if (!match) { setDialogueDetectedTs(null); return; }
+        const raw = match[1];
+        let secs: number | null = null;
+        if (/^\d+$/.test(raw)) {
+            secs = parseInt(raw, 10);
+        } else {
+            const hms = raw.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+            if (hms && (hms[1] || hms[2] || hms[3])) {
+                secs = (parseInt(hms[1] || '0', 10) * 3600)
+                    + (parseInt(hms[2] || '0', 10) * 60)
+                    + parseInt(hms[3] || '0', 10);
+            }
+        }
+        setDialogueDetectedTs(secs);
+    }, []);
+
+    const handleDialogueExtract = useCallback(async () => {
+        if (!dialogueUrl.trim()) return;
+        setIsDialogueExtracting(true);
+        setDialogueExtractStatus('音声を抽出中...');
+        try {
+            const extractResult = await window.electronAPI.dialogueExtractFromYoutube({
+                characterId: characterId || 'default',
+                sourceUrl: dialogueUrl,
+                startSec: dialogueStartOverride !== '' ? Number(dialogueStartOverride) : undefined,
+                durationSec: dialogueDuration,
+                separationPreference: singingSeparationPreference,
+                ytDlpCookiesFile: ytDlpCookiesFile || undefined,
+            });
+            if (!extractResult.success || !extractResult.vocalWavPath) {
+                setDialogueExtractStatus(`エラー: ${extractResult.error || '不明'}`);
+                return;
+            }
+            let loadPath = extractResult.vocalWavPath;
+            if (rvcModelId) {
+                setDialogueExtractStatus('BGM除去完了。RVC変換中...');
+                const rvcResult = await window.electronAPI.rvcConvert({
+                    inputPath: extractResult.vocalWavPath,
+                    modelId: rvcModelId,
+                    speakerId: rvcSpeakerId ?? 0,
+                });
+                if (rvcResult?.success && rvcResult.wavPath) {
+                    loadPath = rvcResult.wavPath;
+                }
+            }
+            setDialogueExtractStatus('WAVを読み込み中...');
+            const loaded = await window.electronAPI.dialogueLoadWavFile(loadPath);
+            if (loaded.success && loaded.base64) {
+                setWaveformEditorData({ base64: loaded.base64, fileName: loaded.fileName || 'dialogue.wav' });
+                setDialogueExtractStatus('完了。波形エディタで編集できます。');
+            } else {
+                setDialogueExtractStatus(`WAV読み込みエラー: ${loaded.error || '不明'}`);
+            }
+        } catch (e) {
+            setDialogueExtractStatus(`予期しないエラー: ${String(e)}`);
+        } finally {
+            setIsDialogueExtracting(false);
+        }
+    }, [dialogueUrl, dialogueStartOverride, dialogueDuration, characterId, singingSeparationPreference, ytDlpCookiesFile, rvcModelId, rvcSpeakerId]);
+
+    const handleDialogueLoadWav = useCallback(async () => {
+        const result = await window.electronAPI.selectFile(['wav'], false);
+        if (!result?.success || !result.path) return;
+        const loaded = await window.electronAPI.dialogueLoadWavFile(result.path);
+        if (loaded.success && loaded.base64) {
+            setWaveformEditorData({ base64: loaded.base64, fileName: loaded.fileName || 'audio.wav' });
+            setDialogueExtractStatus('');
+        } else {
+            setDialogueExtractStatus(`WAV読み込みエラー: ${loaded.error || '不明'}`);
+        }
+    }, []);
+
+    const handleOpenWaveformEditor = useCallback(() => {
+        setWaveformEditorData((prev) => prev ?? { fileName: 'audio.wav' });
+        setDialogueExtractStatus((prev) => prev || '波形エディタを開きました。Load WAV または Extract & Open Editor を使ってください。');
+    }, []);
+
+    const refreshAudioProcesses = useCallback(async (options?: { silent?: boolean }) => {
+        if (!window.electronAPI?.getAudioProcesses) return;
+        if (!options?.silent) {
+            setIsRefreshingAudioProcesses(true);
+            setAppAudioInputStatus('音声出力中のアプリ一覧を取得中...');
+        }
+        try {
+            const result = await window.electronAPI.getAudioProcesses();
+            if (!result.success || !Array.isArray(result.processes)) {
+                if (!options?.silent) {
+                    setAppAudioInputStatus(`アプリ一覧の取得に失敗: ${result.error || '不明'}`);
+                }
+                return;
+            }
+            setAudioProcesses(result.processes);
+            setSelectedAppProcessPid((prev) => {
+                if (prev && result.processes?.some((proc) => proc.pid === prev)) return prev;
+                const first = result.processes?.[0];
+                return first ? first.pid : null;
+            });
+            if (!options?.silent) {
+                setAppAudioInputStatus(`アプリ一覧を更新しました (${result.processes.length}件)。`);
+            }
+        } catch (error) {
+            if (!options?.silent) {
+                setAppAudioInputStatus(`アプリ一覧の取得エラー: ${String(error)}`);
+            }
+        } finally {
+            if (!options?.silent) {
+                setIsRefreshingAudioProcesses(false);
+            }
+        }
+    }, []);
+
+    const stopAppAudioInputCapture = useCallback(async (options?: { keepToggleOn?: boolean; reason?: string }) => {
+        appInputCaptureActiveRef.current = false;
+        appInputCaptureTranscribingRef.current = false;
+        appInputLastTranscribedSamplesRef.current = 0;
+        appInputLastTranscribeTimeRef.current = 0;
+        try {
+            window.electronAPI?.offProcessAudioData?.();
+        } catch {
+            // Ignore listener cleanup errors.
+        }
+        try {
+            if (window.electronAPI?.stopProcessCapture) {
+                await window.electronAPI.stopProcessCapture();
+            }
+        } catch (error) {
+            setAppAudioInputStatus(`アプリ音声取得の停止エラー: ${String(error)}`);
+        } finally {
+            setAppAudioCaptureRunning(false);
+            if (!options?.keepToggleOn) {
+                setAppAudioInputEnabled(false);
+            }
+            if (options?.reason) {
+                setAppAudioInputStatus(options.reason);
+            }
+        }
+    }, []);
+
+    const startAppAudioInputCapture = useCallback(async () => {
+        if (!apiAvailable) {
+            setAppAudioInputStatus('Electron API unavailable.');
+            setAppAudioInputEnabled(false);
+            return;
+        }
+        if (!selectedAppProcessPid) {
+            setAppAudioInputStatus('対象アプリを選択してください。');
+            setAppAudioInputEnabled(false);
+            return;
+        }
+
+        try {
+            window.electronAPI.offProcessAudioData?.();
+        } catch {
+            // Ignore stale listener cleanup.
+        }
+
+        setAppAudioInputStatus('アプリ音声取得を開始中...');
+        const startResult = await window.electronAPI.startProcessCapture(selectedAppProcessPid);
+        if (!startResult.success) {
+            setAppAudioInputStatus(`アプリ音声取得の開始失敗: ${startResult.error || '不明'}`);
+            setAppAudioInputEnabled(false);
+            setAppAudioCaptureRunning(false);
+            return;
+        }
+
+        appInputCaptureActiveRef.current = true;
+        appInputCaptureTranscribingRef.current = false;
+        appInputLastTranscribedSamplesRef.current = 0;
+        appInputLastTranscribeTimeRef.current = Date.now();
+        setAppAudioCaptureRunning(true);
+        setAppAudioInputStatus(`アプリ音声取得を開始しました (PID: ${selectedAppProcessPid})。文字起こしを入力欄に追記します。`);
+
+        window.electronAPI.onProcessAudioMetadata((metadata) => {
+            if (!appInputCaptureActiveRef.current) return;
+            const now = Date.now();
+            const totalSamples = Math.max(0, Number(metadata?.totalSamples || 0));
+            const sampleRate = Math.max(1, Number(metadata?.sampleRate || 16000));
+            const newSamples = totalSamples - appInputLastTranscribedSamplesRef.current;
+            const minSamples = sampleRate * APP_INPUT_MIN_SEGMENT_SEC;
+            const enoughTime = now - appInputLastTranscribeTimeRef.current >= APP_INPUT_TRANSCRIBE_INTERVAL_MS;
+            if (!enoughTime || newSamples < minSamples || appInputCaptureTranscribingRef.current) {
+                return;
+            }
+
+            const startSample = appInputLastTranscribedSamplesRef.current;
+            const endSample = totalSamples;
+            appInputLastTranscribedSamplesRef.current = endSample;
+            appInputLastTranscribeTimeRef.current = now;
+            appInputCaptureTranscribingRef.current = true;
+
+            setTimeout(async () => {
+                try {
+                    const result = await window.electronAPI.transcribeRecordingSegment(startSample, endSample);
+                    if (!appInputCaptureActiveRef.current) return;
+                    if (!result.success) {
+                        setAppAudioInputStatus(`文字起こし失敗: ${result.error || '不明'}`);
+                        return;
+                    }
+                    const transcript = String(result.text || '').trim();
+                    if (!transcript) {
+                        setAppAudioInputStatus(`音声取得中... (${Math.max(0, Math.round((endSample - startSample) / sampleRate))}秒区間 / 文字なし)`);
+                        return;
+                    }
+                    setInputText((prev) => {
+                        const base = prev.trim();
+                        return base ? `${base}\n${transcript}` : transcript;
+                    });
+                    setAppAudioInputStatus(`入力欄へ追記しました (${Math.max(0, Math.round((endSample - startSample) / sampleRate))}秒区間)。`);
+                } catch (error) {
+                    if (appInputCaptureActiveRef.current) {
+                        setAppAudioInputStatus(`文字起こしエラー: ${String(error)}`);
+                    }
+                } finally {
+                    appInputCaptureTranscribingRef.current = false;
+                }
+            }, 0);
+        });
+    }, [apiAvailable, selectedAppProcessPid]);
+
+    useEffect(() => {
+        const unsubscribe = window.electronAPI.onDialogueExtractProgress?.((progress) => {
+            if (progress?.message) {
+                setDialogueExtractStatus(progress.message);
+            }
+        });
+        return () => {
+            if (typeof unsubscribe === 'function') {
+                unsubscribe();
+            }
+        };
+    }, []);
+
     useEffect(() => {
         void refreshVoiceOptions();
     }, [apiAvailable]);
+
+    useEffect(() => {
+        if (!apiAvailable) return;
+        void refreshAudioProcesses({ silent: true });
+    }, [apiAvailable, refreshAudioProcesses]);
+
+    useEffect(() => {
+        if (!apiAvailable) return;
+        if (appAudioInputEnabled) {
+            if (!appInputCaptureActiveRef.current) {
+                void startAppAudioInputCapture();
+            }
+            return;
+        }
+        if (appAudioCaptureRunning || appInputCaptureActiveRef.current) {
+            void stopAppAudioInputCapture({ keepToggleOn: true, reason: 'アプリ音声取得を停止しました。' });
+        }
+    }, [
+        apiAvailable,
+        appAudioInputEnabled,
+        appAudioCaptureRunning,
+        startAppAudioInputCapture,
+        stopAppAudioInputCapture,
+    ]);
+
+    useEffect(() => {
+        return () => {
+            if (appInputCaptureActiveRef.current || appAudioCaptureRunning) {
+                void stopAppAudioInputCapture({ keepToggleOn: true });
+            } else {
+                try {
+                    window.electronAPI?.offProcessAudioData?.();
+                } catch {
+                    // Ignore cleanup errors.
+                }
+            }
+        };
+    }, [appAudioCaptureRunning, stopAppAudioInputCapture]);
 
     useEffect(() => {
         if (!apiAvailable) return;
@@ -940,7 +1276,8 @@ const CharacterStudioScreen: React.FC = () => {
             const voiceExpression: {
                 singing?: boolean;
                 autoEmotionRefine: boolean;
-                emotionLabelHint?: 'neutral' | 'joy' | 'sad' | 'angry' | 'excited';
+                emotionLabelHint?: 'neutral' | 'joy' | 'sad' | 'angry' | 'excited'
+                    | 'fear' | 'surprise' | 'love' | 'embarrassed' | 'curious';
                 emotionIntensityHint?: number;
             } = {
                 autoEmotionRefine,
@@ -1061,6 +1398,7 @@ const CharacterStudioScreen: React.FC = () => {
     });
 
     return (
+        <>
         <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--color-bg-secondary)', color: 'var(--color-text)' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid var(--color-border)' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -1182,6 +1520,50 @@ const CharacterStudioScreen: React.FC = () => {
                         style={{ width: '100%', marginBottom: '12px' }}
                         placeholder="例: 丁寧ベースで親しみやすく"
                     />
+
+                    <label style={{ display: 'block', fontSize: '12px', marginBottom: '6px' }}>
+                        Emotion Personality
+                    </label>
+                    <select
+                        value={emotionPersonalityPreset}
+                        onChange={(e) => {
+                            const preset = e.target.value;
+                            setEmotionPersonalityPreset(preset);
+                            if (preset !== 'custom' && EMOTION_PERSONALITY_PRESETS[preset]) {
+                                const p = EMOTION_PERSONALITY_PRESETS[preset];
+                                setEmotionIntensityScale(p.intensityScale ?? 1.0);
+                                setEmotionVolatility(p.volatility ?? 0.3);
+                            }
+                        }}
+                        style={{ width: '100%', marginBottom: '8px' }}
+                    >
+                        <option value="standard">Standard (標準)</option>
+                        <option value="cheerful">Cheerful (明るい・ハイテンション)</option>
+                        <option value="gentle">Gentle (優しい・穏やか)</option>
+                        <option value="shy">Shy (恥ずかしがり)</option>
+                        <option value="stoic">Stoic (感情を出さない)</option>
+                        <option value="custom">Custom</option>
+                    </select>
+                    <div style={{ display: 'flex', gap: '12px', marginBottom: '12px' }}>
+                        <label style={{ flex: 1, fontSize: '11px' }}>
+                            Intensity Scale: {emotionIntensityScale.toFixed(2)}
+                            <input
+                                type="range" min="0.5" max="1.5" step="0.05"
+                                value={emotionIntensityScale}
+                                onChange={(e) => { setEmotionIntensityScale(Number(e.target.value)); setEmotionPersonalityPreset('custom'); }}
+                                style={{ width: '100%' }}
+                            />
+                        </label>
+                        <label style={{ flex: 1, fontSize: '11px' }}>
+                            Volatility: {emotionVolatility.toFixed(2)}
+                            <input
+                                type="range" min="0.1" max="0.5" step="0.05"
+                                value={emotionVolatility}
+                                onChange={(e) => { setEmotionVolatility(Number(e.target.value)); setEmotionPersonalityPreset('custom'); }}
+                                style={{ width: '100%' }}
+                            />
+                        </label>
+                    </div>
 
                     <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
                         <button
@@ -1412,6 +1794,83 @@ const CharacterStudioScreen: React.FC = () => {
                         Force singing mode
                     </label>
 
+                    {/* ─── Dialogue Clip Extractor ─── */}
+                    <div style={{ margin: '12px 0 4px 0', borderTop: '1px solid var(--color-border)', paddingTop: '12px' }}>
+                        <h4 style={{ margin: '0 0 8px 0', fontSize: '13px' }}>Dialogue Clip Extractor</h4>
+                        <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>
+                            YouTube URL (タイムスタンプ付き対応)
+                        </label>
+                        <input
+                            type="text"
+                            value={dialogueUrl}
+                            onChange={(e) => handleDialogueUrlChange(e.target.value)}
+                            placeholder="https://youtu.be/xxxxx?t=83"
+                            style={{ width: '100%', marginBottom: '4px', boxSizing: 'border-box' }}
+                        />
+                        {dialogueDetectedTs !== null && (
+                            <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginBottom: '6px' }}>
+                                タイムスタンプ検出: {Math.floor(dialogueDetectedTs / 60)}:{String(dialogueDetectedTs % 60).padStart(2, '0')} ({dialogueDetectedTs}秒)
+                            </div>
+                        )}
+                        <div style={{ display: 'flex', gap: '8px', marginBottom: '6px' }}>
+                            <div style={{ flex: 1 }}>
+                                <label style={{ display: 'block', fontSize: '11px', marginBottom: '2px', color: 'var(--color-text-secondary)' }}>
+                                    開始位置オーバーライド (秒)
+                                </label>
+                                <input
+                                    type="number"
+                                    value={dialogueStartOverride}
+                                    onChange={(e) => setDialogueStartOverride(e.target.value)}
+                                    placeholder="省略時はURL ?t= を使用"
+                                    min={0}
+                                    style={{ width: '100%', boxSizing: 'border-box' }}
+                                />
+                            </div>
+                            <div style={{ flex: 1 }}>
+                                <label style={{ display: 'block', fontSize: '11px', marginBottom: '2px', color: 'var(--color-text-secondary)' }}>
+                                    抽出時間 (秒)
+                                </label>
+                                <input
+                                    type="number"
+                                    value={dialogueDuration}
+                                    onChange={(e) => setDialogueDuration(Math.max(1, Number(e.target.value)))}
+                                    min={1}
+                                    max={600}
+                                    style={{ width: '100%', boxSizing: 'border-box' }}
+                                />
+                            </div>
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px', marginBottom: '6px' }}>
+                            <button
+                                onClick={() => { void handleDialogueExtract(); }}
+                                disabled={isDialogueExtracting || !dialogueUrl.trim() || !apiAvailable}
+                                style={{ flex: 1, padding: '7px 8px', borderRadius: '6px', border: '1px solid var(--color-border)', background: isDialogueExtracting ? 'var(--color-surface)' : 'var(--color-primary, #3182ce)', color: '#fff', cursor: isDialogueExtracting || !dialogueUrl.trim() ? 'not-allowed' : 'pointer', opacity: isDialogueExtracting || !dialogueUrl.trim() ? 0.6 : 1, fontSize: '12px', fontWeight: 'bold' }}
+                            >
+                                {isDialogueExtracting ? '抽出中...' : 'Extract & Open Editor'}
+                            </button>
+                            <button
+                                onClick={() => { void handleDialogueLoadWav(); }}
+                                disabled={isDialogueExtracting}
+                                style={{ padding: '7px 10px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-surface)', color: 'var(--color-text)', cursor: 'pointer', fontSize: '12px' }}
+                            >
+                                Load WAV
+                            </button>
+                            <button
+                                onClick={handleOpenWaveformEditor}
+                                style={{ padding: '7px 10px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-surface)', color: 'var(--color-text)', cursor: 'pointer', fontSize: '12px' }}
+                                title="モードレスの波形エディタを開きます"
+                            >
+                                Open Editor
+                            </button>
+                        </div>
+                        {dialogueExtractStatus && (
+                            <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', padding: '4px 6px', background: 'rgba(15,23,42,0.3)', borderRadius: '4px', wordBreak: 'break-all' }}>
+                                {dialogueExtractStatus}
+                            </div>
+                        )}
+                    </div>
+                    {/* ─────────────────────────────── */}
+
                     <label
                         style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}
                         title="ONで感情強度の自己改善（履歴平滑化）を有効化します。"
@@ -1457,16 +1916,22 @@ const CharacterStudioScreen: React.FC = () => {
                     <select
                         value={emotionLabelHint}
                         onChange={(e) => setEmotionLabelHint(
-                            e.target.value as 'auto' | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited',
+                            e.target.value as 'auto' | 'neutral' | 'joy' | 'sad' | 'angry' | 'excited'
+                                | 'fear' | 'surprise' | 'love' | 'embarrassed' | 'curious',
                         )}
                         style={{ width: '100%', marginBottom: '8px' }}
                     >
                         <option value="auto">Auto</option>
                         <option value="neutral">Neutral</option>
-                        <option value="joy">Joy</option>
-                        <option value="sad">Sad</option>
-                        <option value="angry">Angry</option>
-                        <option value="excited">Excited</option>
+                        <option value="joy">Joy (喜び)</option>
+                        <option value="sad">Sad (悲しみ)</option>
+                        <option value="angry">Angry (怒り)</option>
+                        <option value="excited">Excited (興奮)</option>
+                        <option value="fear">Fear (恐怖/不安)</option>
+                        <option value="surprise">Surprise (驚き)</option>
+                        <option value="love">Love (愛情)</option>
+                        <option value="embarrassed">Embarrassed (恥ずかしさ)</option>
+                        <option value="curious">Curious (好奇心)</option>
                     </select>
 
                     <label
@@ -1628,9 +2093,16 @@ const CharacterStudioScreen: React.FC = () => {
                             <div key={msg.id} style={messageBubbleStyle(msg.role)}>
                                 <div style={{ fontSize: '11px', opacity: 0.75, marginBottom: '6px' }}>
                                     {msg.role.toUpperCase()}
-                                    {msg.role === 'assistant' && msg.emotionLabel && (
-                                        <span>{` | emotion=${msg.emotionLabel}${typeof msg.emotionIntensity === 'number' ? `(${msg.emotionIntensity.toFixed(2)})` : ''}`}</span>
-                                    )}
+                                    {msg.role === 'assistant' && msg.emotionLabel && (() => {
+                                        const EMOTION_ICON: Record<string, string> = {
+                                            neutral: '😐', joy: '😊', sad: '😢', angry: '😠', excited: '🤩',
+                                            fear: '😨', surprise: '😲', love: '💕', embarrassed: '😳', curious: '🤔',
+                                        };
+                                        const icon = EMOTION_ICON[msg.emotionLabel] || '';
+                                        return (
+                                            <span>{` | ${icon} ${msg.emotionLabel}${typeof msg.emotionIntensity === 'number' ? `(${msg.emotionIntensity.toFixed(2)})` : ''}`}</span>
+                                        );
+                                    })()}
                                 </div>
                                 {msg.role === 'assistant' && msg.voiceSnapshot && (
                                     <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', marginBottom: '6px' }}>
@@ -1661,6 +2133,56 @@ const CharacterStudioScreen: React.FC = () => {
                     </div>
 
                     <div style={{ borderTop: '1px solid var(--color-border)', padding: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        <div style={{ padding: '8px', border: '1px solid var(--color-border)', borderRadius: '8px', background: 'rgba(15,23,42,0.22)' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', marginBottom: '6px' }}>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={appAudioInputEnabled}
+                                        onChange={(e) => setAppAudioInputEnabled(e.target.checked)}
+                                        disabled={!apiAvailable}
+                                    />
+                                    アプリ音声取得を入力欄へ反映（トグル）
+                                </label>
+                                <button
+                                    onClick={() => { void refreshAudioProcesses(); }}
+                                    disabled={!apiAvailable || isRefreshingAudioProcesses}
+                                    style={{
+                                        padding: '5px 8px',
+                                        borderRadius: '6px',
+                                        border: '1px solid var(--color-border)',
+                                        background: 'var(--color-surface)',
+                                        color: 'var(--color-text)',
+                                        cursor: (!apiAvailable || isRefreshingAudioProcesses) ? 'not-allowed' : 'pointer',
+                                        opacity: (!apiAvailable || isRefreshingAudioProcesses) ? 0.6 : 1,
+                                        fontSize: '11px',
+                                    }}
+                                >
+                                    {isRefreshingAudioProcesses ? '更新中...' : 'アプリ一覧更新'}
+                                </button>
+                                {appAudioCaptureRunning && (
+                                    <span style={{ fontSize: '11px', color: '#34d399' }}>取得中</span>
+                                )}
+                            </div>
+                            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                                <select
+                                    value={selectedAppProcessPid ?? ''}
+                                    onChange={(e) => setSelectedAppProcessPid(e.target.value ? Number(e.target.value) : null)}
+                                    disabled={!apiAvailable || appAudioCaptureRunning || sortedAudioProcesses.length === 0}
+                                    style={{ flex: 1, minWidth: '220px' }}
+                                >
+                                    <option value="">音声出力中のアプリを選択</option>
+                                    {sortedAudioProcesses.map((proc) => (
+                                        <option key={proc.pid} value={proc.pid}>
+                                            {`${proc.title?.trim() || proc.name} (PID:${proc.pid})`}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+                            <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginTop: '6px', wordBreak: 'break-all' }}>
+                                {appAudioInputStatus || 'ONにすると選択アプリの音声を定期文字起こしして入力欄へ追記します。'}
+                            </div>
+                        </div>
                         <textarea
                             value={inputText}
                             onChange={(e) => setInputText(e.target.value)}
@@ -1701,6 +2223,20 @@ const CharacterStudioScreen: React.FC = () => {
                 </div>
             </div>
         </div>
+        {waveformEditorData && (
+            <WaveformEditor
+                wavBase64={waveformEditorData.base64}
+                fileName={waveformEditorData.fileName}
+                characterId={characterId}
+                rvcConfig={{
+                    modelId: rvcModelId.trim() || undefined,
+                    speakerId: Number.isFinite(rvcSpeakerId) ? rvcSpeakerId : 0,
+                    indexPath: rvcIndexPath.trim() || undefined,
+                }}
+                onClose={() => setWaveformEditorData(null)}
+            />
+        )}
+        </>
     );
 };
 

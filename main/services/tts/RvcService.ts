@@ -46,6 +46,8 @@ const HIGH_PITCH_SAFETY_THRESHOLD_HZ = 460;
 const LOCAL_ARTIFACT_SCAN_FRAME_MS = 12;
 const LOCAL_ARTIFACT_SCAN_HOP_MS = 6;
 const LOCAL_ARTIFACT_MARGIN_MS = 10;
+const POST_GUARD_BALANCED_DURATION_MS = 30_000;
+const POST_GUARD_SPEED_DURATION_MS = 90_000;
 
 interface ParsedPcm16WavFile {
     source: Buffer;
@@ -465,12 +467,17 @@ export class RvcService {
             const warningParts: string[] = [];
             const inputRewritten = this.maybeResolveInputPathFromConversionArchive(params);
             const effectiveParams = inputRewritten.params;
+            const latencyPriority = effectiveParams.latencyPriority === true;
             if (inputRewritten.warning) {
                 warningParts.push(inputRewritten.warning);
             }
 
-            const learningProfile = this.getOrCreateQualityLearningProfile(effectiveParams);
-            const inputConditioned = await this.maybePreconditionInputVocalForRvc(effectiveParams, learningProfile);
+            const learningProfile = latencyPriority
+                ? undefined
+                : this.getOrCreateQualityLearningProfile(effectiveParams);
+            const inputConditioned = latencyPriority
+                ? { params: effectiveParams, warnings: [] as string[], cleanupPaths: [] as string[] }
+                : await this.maybePreconditionInputVocalForRvc(effectiveParams, learningProfile);
             for (const warning of inputConditioned.warnings) {
                 warningParts.push(warning);
             }
@@ -482,7 +489,7 @@ export class RvcService {
             let requestBody = this.buildConvertRequestBody(requestParams);
 
             let highPitchRiskHintHz = 0;
-            if (this.shouldApplyHighPitchQualityProtect(requestParams)) {
+            if (!latencyPriority && this.shouldApplyHighPitchQualityProtect(requestParams)) {
                 const tuned = this.maybeTuneRequestForHighPitchRisk(requestParams, requestBody, learningProfile);
                 requestBody = tuned.requestBody;
                 if (tuned.warning) {
@@ -494,6 +501,9 @@ export class RvcService {
             }
 
             const baseResponse = await this.requestConvertBinary(`${endpoint}/convert`, requestBody);
+            if (baseResponse.warning) {
+                warningParts.push(baseResponse.warning);
+            }
             if (!baseResponse.success || !baseResponse.buffer) {
                 return {
                     success: false,
@@ -502,6 +512,20 @@ export class RvcService {
                         message: baseResponse.error || 'Conversion failed',
                     },
                 };
+            }
+
+            if (latencyPriority) {
+                let finalBuffer = baseResponse.buffer;
+                const quickClipGuard = this.applyOutputClipGuardIfNeeded(finalBuffer);
+                if (quickClipGuard.buffer) {
+                    finalBuffer = quickClipGuard.buffer;
+                }
+                if (quickClipGuard.warning) {
+                    warningParts.push(`fast ${quickClipGuard.warning}`);
+                }
+                warningParts.push('RVC latency-priority mode (skipped heavy post-processing/archive)');
+
+                return this.createConvertResultFromWavBuffer(finalBuffer, warningParts.join(' | ') || undefined);
             }
 
             const baseSnapshot = this.captureArtifactSnapshot(baseResponse.buffer, highPitchRiskHintHz);
@@ -634,6 +658,19 @@ export class RvcService {
             return { warnings };
         }
 
+        const durationMs = Math.max(0, Number(currentSnapshot.durationMs || 0));
+        if (durationMs >= POST_GUARD_SPEED_DURATION_MS) {
+            const extremeResidual = currentSnapshot.localArtifactRegions >= 20
+                || currentSnapshot.highBandPeak >= 0.34
+                || currentSnapshot.clipRatio > 0
+                || currentSnapshot.nearClipRatio >= 0.004;
+            if (!extremeResidual) {
+                return { warnings };
+            }
+        } else if (durationMs >= POST_GUARD_BALANCED_DURATION_MS && !severeResidual) {
+            return { warnings };
+        }
+
         const retryBody: Record<string, unknown> = { ...options.requestBody };
         const retryChanges: string[] = [];
 
@@ -687,6 +724,9 @@ export class RvcService {
         }
 
         const retryResp = await this.requestConvertBinary(`${options.endpoint}/convert`, retryBody);
+        if (retryResp.warning) {
+            warnings.push(retryResp.warning);
+        }
         if (!retryResp.success || !retryResp.buffer) {
             warnings.push(`High-pitch rescue retry failed (${retryResp.error || 'conversion failed'})`);
             return { warnings };
@@ -954,7 +994,7 @@ export class RvcService {
     private async requestConvertBinary(
         urlString: string,
         requestBody: Record<string, unknown>,
-    ): Promise<{ success: boolean; buffer?: Buffer; error?: string }> {
+    ): Promise<{ success: boolean; buffer?: Buffer; error?: string; warning?: string }> {
         if (this.verboseLogs) {
             console.log('[RvcService] Convert request:', {
                 ...requestBody,
@@ -962,11 +1002,51 @@ export class RvcService {
             });
         }
 
-        const response = await this.postJsonForBinary(
-            urlString,
-            requestBody,
-            CONVERT_REQUEST_TIMEOUT_MS,
-        );
+        let response: { statusCode: number; body: Buffer };
+        try {
+            response = await this.postJsonForBinary(
+                urlString,
+                requestBody,
+                CONVERT_REQUEST_TIMEOUT_MS,
+            );
+        } catch (error) {
+            const recovered = await this.tryRecoverFromConvertTransportError(urlString, error);
+            if (!recovered.retriedUrl) {
+                return {
+                    success: false,
+                    error: this.formatConvertTransportError(error),
+                    warning: recovered.warning,
+                };
+            }
+            try {
+                response = await this.postJsonForBinary(
+                    recovered.retriedUrl,
+                    requestBody,
+                    CONVERT_REQUEST_TIMEOUT_MS,
+                );
+            } catch (retryError) {
+                return {
+                    success: false,
+                    error: `${this.formatConvertTransportError(retryError)}${recovered.warning ? ` (${recovered.warning})` : ''}`,
+                    warning: recovered.warning,
+                };
+            }
+            if (this.verboseLogs) {
+                console.log('[RvcService] Convert transport recovered and retried:', recovered.warning || '(no detail)');
+            }
+            if (response.statusCode < 200 || response.statusCode >= 300) {
+                return {
+                    success: false,
+                    error: `Conversion failed: ${response.body.toString('utf-8')}`,
+                    warning: recovered.warning,
+                };
+            }
+            return {
+                success: true,
+                buffer: response.body,
+                warning: recovered.warning,
+            };
+        }
 
         if (response.statusCode < 200 || response.statusCode >= 300) {
             return {
@@ -979,6 +1059,73 @@ export class RvcService {
             success: true,
             buffer: response.body,
         };
+    }
+
+    private async tryRecoverFromConvertTransportError(
+        urlString: string,
+        error: unknown,
+    ): Promise<{ retriedUrl?: string; warning?: string }> {
+        if (!this.isRecoverableConvertTransportError(error)) {
+            return {};
+        }
+
+        const endpointBefore = this.runtime.getEndpoint();
+        if (this.verboseLogs) {
+            console.warn('[RvcService] Convert transport error; attempting runtime restart:', this.formatConvertTransportError(error));
+        }
+        const restarted = await this.runtime.restart({ verboseLogs: this.verboseLogs });
+        if (!restarted.success) {
+            const reason = restarted.error?.message || 'restart failed';
+            return {
+                warning: `RVC transport recovery failed (${reason})`,
+            };
+        }
+
+        const endpointAfter = this.runtime.getEndpoint();
+        if (!endpointAfter) {
+            return {
+                warning: 'RVC transport recovery failed (no endpoint after restart)',
+            };
+        }
+
+        const retriedUrl = this.rebindUrlToEndpoint(urlString, endpointAfter);
+        const warning = endpointAfter !== endpointBefore
+            ? `RVC server auto-restarted after transport reset (${endpointBefore || 'unknown'} -> ${endpointAfter})`
+            : 'RVC server auto-restarted after transport reset';
+        return { retriedUrl, warning };
+    }
+
+    private isRecoverableConvertTransportError(error: unknown): boolean {
+        const code = String((error as { code?: unknown })?.code || '').toUpperCase();
+        const message = this.formatConvertTransportError(error).toLowerCase();
+        return (
+            code === 'ECONNRESET'
+            || code === 'ECONNREFUSED'
+            || code === 'EPIPE'
+            || code === 'UND_ERR_SOCKET'
+            || message.includes('econnreset')
+            || message.includes('socket hang up')
+            || message.includes('econnrefused')
+            || message.includes('read epipe')
+        );
+    }
+
+    private formatConvertTransportError(error: unknown): string {
+        if (error instanceof Error) {
+            return error.message || error.name || String(error);
+        }
+        return String(error);
+    }
+
+    private rebindUrlToEndpoint(urlString: string, endpoint: string): string {
+        try {
+            const original = new URL(urlString);
+            const base = new URL(endpoint);
+            return new URL(`${original.pathname}${original.search}`, base).toString();
+        } catch {
+            const suffix = urlString.replace(/^https?:\/\/[^/]+/i, '');
+            return `${endpoint}${suffix.startsWith('/') ? '' : '/'}${suffix}`;
+        }
     }
 
     private createConvertResultFromWavBuffer(buffer: Buffer, warning?: string): RvcConvertResult {
@@ -1671,8 +1818,21 @@ export class RvcService {
         const beforePeak = this.measureWavPeakStats(parsed);
         const beforeHarsh = this.measureHighBandHarshnessStats(parsed);
         const highPitchHintHz = Math.max(0, Number(options.highPitchHintHz || 0));
+        const durationMs = Math.max(0, Number(parsed.durationMs || 0));
         const highPitchMode = highPitchHintHz >= 900;
         const ultraHighPitchMode = highPitchHintHz >= 1050;
+        const obviousNeed = (
+            beforePeak.clipRatio > 0
+            || beforePeak.nearClipRatio >= (highPitchMode ? 0.003 : 0.0045)
+            || beforeHarsh.highBandPeak >= (highPitchMode ? 0.31 : 0.36)
+            || beforeHarsh.highBandRatio >= (highPitchMode ? 0.23 : 0.32)
+        );
+        if (durationMs >= POST_GUARD_SPEED_DURATION_MS && !obviousNeed) {
+            return {};
+        }
+        if (durationMs >= POST_GUARD_BALANCED_DURATION_MS && !highPitchMode && !obviousNeed) {
+            return {};
+        }
         const learningLocalBiasRaw = this.clampFloat(options.learningProfile?.tuning.localRepairBias ?? 0, -0.25, 0.75, 0);
         const learningLocalBias = highPitchMode
             ? this.clampFloat(learningLocalBiasRaw, ultraHighPitchMode ? 0.02 : -0.02, 0.75, 0)
@@ -1685,7 +1845,7 @@ export class RvcService {
         const working = this.parsePcm16WavBuffer(buffer);
         let repairedClipRuns = 0;
         let changed = false;
-        const maxRegionsToRepair = highPitchMode
+        let maxRegionsToRepair = highPitchMode
             ? this.clampInt(
                 Math.max(
                     40,
@@ -1696,6 +1856,19 @@ export class RvcService {
                 48,
             )
             : this.clampInt(32 + Math.round(learningLocalBias * 10), 12, 64, 32);
+        const durationScale = durationMs >= POST_GUARD_SPEED_DURATION_MS
+            ? (ultraHighPitchMode ? 0.70 : 0.45)
+            : durationMs >= POST_GUARD_BALANCED_DURATION_MS
+                ? (highPitchMode ? 0.88 : 0.70)
+                : 1;
+        if (durationScale < 0.999) {
+            maxRegionsToRepair = this.clampInt(
+                Math.round(maxRegionsToRepair * durationScale),
+                highPitchMode ? 16 : 10,
+                64,
+                maxRegionsToRepair,
+            );
+        }
         const targetRegions = regions.slice(0, maxRegionsToRepair);
 
         for (const region of targetRegions) {
@@ -1748,10 +1921,28 @@ export class RvcService {
         const beforePeak = this.measureWavPeakStats(parsed);
         const beforeHarsh = this.measureHighBandHarshnessStats(parsed);
         const highPitchHintHz = Math.max(0, Number(options.highPitchHintHz || 0));
+        const durationMs = Math.max(0, Number(parsed.durationMs || 0));
         const learningFfmpegBiasRaw = this.clampFloat(options.learningProfile?.tuning.ffmpegRestoreBias ?? 0, -0.25, 0.45, 0);
         const learningFfmpegBias = (highPitchHintHz >= 900)
             ? this.clampFloat(learningFfmpegBiasRaw, highPitchHintHz >= 1050 ? 0.02 : -0.02, 0.45, 0)
             : learningFfmpegBiasRaw;
+        const cheapSevereSignal = (
+            beforePeak.clipRatio > 0
+            || beforePeak.nearClipRatio >= (highPitchHintHz >= 900 ? 0.003 : 0.005)
+            || beforeHarsh.highBandPeak >= (highPitchHintHz >= 900 ? 0.33 : 0.38)
+            || beforeHarsh.highBandRatio >= (highPitchHintHz >= 900 ? 0.24 : 0.34)
+        );
+        const cheapModerateSignal = (
+            beforePeak.nearClipRatio >= 0.002
+            || beforeHarsh.highBandPeak >= (highPitchHintHz >= 900 ? 0.28 : 0.34)
+            || beforeHarsh.highBandRatio >= (highPitchHintHz >= 900 ? 0.20 : 0.30)
+        );
+        if (durationMs >= POST_GUARD_SPEED_DURATION_MS && !cheapSevereSignal) {
+            return {};
+        }
+        if (durationMs >= POST_GUARD_BALANCED_DURATION_MS && !cheapModerateSignal) {
+            return {};
+        }
         const beforeRegions = this.scanLocalArtifactRegions(parsed, highPitchHintHz, learningFfmpegBias * 0.6);
 
         const extremeHighPitch = highPitchHintHz >= 900;
@@ -1820,7 +2011,14 @@ export class RvcService {
                 ].join(','),
             });
 
-            if (extremeHighPitch || beforeRegions.length >= 12 || beforeHarsh.highBandPeak >= 0.34) {
+            const allowAggressiveCandidate = (
+                durationMs < POST_GUARD_BALANCED_DURATION_MS
+                || ultraHighPitch
+                || beforeRegions.length >= 18
+                || beforeHarsh.highBandPeak >= 0.38
+                || beforePeak.clipRatio > 0
+            );
+            if (allowAggressiveCandidate && (extremeHighPitch || beforeRegions.length >= 12 || beforeHarsh.highBandPeak >= 0.34)) {
                 const strongDeesser = this.clampFloat(deesserIntensity + (ultraHighPitch ? 0.06 : 0.04), 0.10, ultraHighPitch ? 0.52 : 0.46, deesserIntensity);
                 const secondDeesser = this.clampFloat(strongDeesser * (ultraHighPitch ? 0.62 : 0.52), 0.06, 0.34, 0.12);
                 const secondFreq = this.clampFloat(deesserFreq + (ultraHighPitch ? 0.12 : 0.08), 0, 1, deesserFreq);

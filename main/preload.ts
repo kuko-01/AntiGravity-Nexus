@@ -592,6 +592,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
         return await ipcRenderer.invoke('character-learning-reset-separation-profile', characterId);
     },
 
+    dialogueExtractFromYoutube: async (params: any) => {
+        return await ipcRenderer.invoke('dialogue-extract-from-youtube', params);
+    },
+    onDialogueExtractProgress: (callback: (progress: { stage: string; message: string }) => void) => {
+        const handler = (_event: Electron.IpcRendererEvent, progress: { stage: string; message: string }) => callback(progress);
+        ipcRenderer.on('dialogue-extract-progress', handler);
+        return () => ipcRenderer.removeListener('dialogue-extract-progress', handler);
+    },
+
+    dialogueLoadWavFile: async (filePath: string) => {
+        return await ipcRenderer.invoke('dialogue-load-wav-file', filePath);
+    },
+
+    dialogueSaveTrainingMaterial: async (params: any) => {
+        return await ipcRenderer.invoke('dialogue-save-training-material', params);
+    },
+
     utilSelectDirectory: async () => {
         return await ipcRenderer.invoke('util:select-directory');
     },

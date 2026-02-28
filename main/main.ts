@@ -15,7 +15,7 @@ import { VoicePipelineService } from './services/tts/VoicePipelineService';
 import { RvcConvertParams, RvcPreset, VoiceExpressionSettings, VoiceSynthesizeParams, VoiceSynthesizeResult } from '../types/rvc';
 import { CharacterChatService } from './services/CharacterChatService';
 import { CharacterChatRequest, CharacterEmotionResult } from '../types/character';
-import { SingingLearningService } from './services/SingingLearningService';
+import { SingingLearningService, DialogueExtractParams } from './services/SingingLearningService';
 
 // .env ファイルを読み込み
 // .env ファイルを読み込み
@@ -3640,6 +3640,47 @@ ipcMain.handle('character-learning-reset-separation-profile', async (_event, cha
             profilePath: '',
             error: String(error),
         };
+    }
+});
+
+ipcMain.handle('dialogue-extract-from-youtube', async (event, params: DialogueExtractParams) => {
+    try {
+        const learningService = SingingLearningService.getInstance(ttsResourcesPath);
+        event.sender.send('dialogue-extract-progress', { stage: 'start', message: '抽出ジョブを開始しました...' });
+        const result = await learningService.extractDialogueClip(params, (progress) => {
+            event.sender.send('dialogue-extract-progress', progress);
+        });
+        event.sender.send('dialogue-extract-progress', {
+            stage: result.success ? 'complete' : 'error',
+            message: result.success ? '抽出処理が完了しました。' : `抽出処理エラー: ${result.error || '不明'}`,
+        });
+        return result;
+    } catch (error) {
+        console.error('[DialogueExtract] error:', error);
+        event.sender.send('dialogue-extract-progress', { stage: 'error', message: `予期しないエラー: ${String(error)}` });
+        return { success: false, sourceUrl: params?.sourceUrl || '', characterId: params?.characterId || '', startSec: 0, durationSec: 0, error: String(error) };
+    }
+});
+
+ipcMain.handle('dialogue-load-wav-file', async (_event, filePath: string) => {
+    try {
+        const data = fs.readFileSync(filePath);
+        return { success: true, base64: data.toString('base64'), fileName: path.basename(filePath) };
+    } catch (error) {
+        return { success: false, error: String(error) };
+    }
+});
+
+ipcMain.handle('dialogue-save-training-material', async (_event, params: { characterId: string; base64: string; fileName: string }) => {
+    try {
+        const localAppData = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Local');
+        const outDir = path.join(localAppData, 'AntiGravity', 'tts', 'singing_learning', params.characterId, 'dialogue_material');
+        fs.mkdirSync(outDir, { recursive: true });
+        const outPath = path.join(outDir, params.fileName);
+        fs.writeFileSync(outPath, Buffer.from(params.base64, 'base64'));
+        return { success: true, savedPath: outPath };
+    } catch (error) {
+        return { success: false, error: String(error) };
     }
 });
 

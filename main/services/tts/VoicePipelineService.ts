@@ -292,8 +292,29 @@ export class VoicePipelineService {
         return Math.max(min, Math.min(max, numeric));
     }
 
+    private buildAssistText(label: VoiceEmotionLabelHint, intensity: number): string | undefined {
+        if (intensity < 0.25) return undefined;
+        const map: Record<VoiceEmotionLabelHint, string> = {
+            neutral: '',
+            joy: '嬉しい笑顔で明るく',
+            sad: '悲しそうにゆっくり落ち着いて',
+            angry: '怒って力強くはっきりと',
+            excited: 'わくわくして元気よく高めのテンションで',
+            fear: '不安そうに少し震えながらそっと',
+            surprise: '驚いて思わず声が出るように',
+            love: '優しく温かくふんわりと',
+            embarrassed: '恥ずかしそうに小声で照れながら',
+            curious: '興味深そうに少し首を傾けながら',
+        };
+        return map[label] || undefined;
+    }
+
     private resolveEmotionLabel(value: unknown): VoiceEmotionLabelHint {
-        if (value === 'joy' || value === 'sad' || value === 'angry' || value === 'excited' || value === 'neutral') {
+        if (
+            value === 'joy' || value === 'sad' || value === 'angry' || value === 'excited' || value === 'neutral'
+            || value === 'fear' || value === 'surprise' || value === 'love'
+            || value === 'embarrassed' || value === 'curious'
+        ) {
             return value;
         }
         return 'neutral';
@@ -332,6 +353,30 @@ export class VoicePipelineService {
                     vibratoDepth = 0.06 + emotionIntensityHint * 0.12;
                     vibratoRateHz = 5.6 + emotionIntensityHint * 0.8;
                     dynamicBoost = 0.1 + emotionIntensityHint * 0.24;
+                    break;
+                case 'fear':
+                    vibratoDepth = 0.03 + emotionIntensityHint * 0.07;
+                    vibratoRateHz = 6.2 + emotionIntensityHint * 1.0;
+                    dynamicBoost = 0.02 + emotionIntensityHint * 0.06;
+                    break;
+                case 'surprise':
+                    vibratoDepth = 0.01 + emotionIntensityHint * 0.03;
+                    dynamicBoost = 0.12 + emotionIntensityHint * 0.22;
+                    break;
+                case 'love':
+                    vibratoDepth = 0.03 + emotionIntensityHint * 0.06;
+                    vibratoRateHz = 4.8 + emotionIntensityHint * 0.4;
+                    dynamicBoost = 0.05 + emotionIntensityHint * 0.12;
+                    break;
+                case 'embarrassed':
+                    vibratoDepth = 0.02 + emotionIntensityHint * 0.05;
+                    vibratoRateHz = 5.8 + emotionIntensityHint * 0.6;
+                    dynamicBoost = 0.01 + emotionIntensityHint * 0.05;
+                    break;
+                case 'curious':
+                    vibratoDepth = 0.02 + emotionIntensityHint * 0.04;
+                    vibratoRateHz = 5.4 + emotionIntensityHint * 0.4;
+                    dynamicBoost = 0.06 + emotionIntensityHint * 0.14;
                     break;
                 default:
                     vibratoDepth = 0.01 + emotionIntensityHint * 0.03;
@@ -1045,9 +1090,16 @@ export class VoicePipelineService {
             switch (params.mode) {
                 case 'sbv2': {
                     const sbv2Started = Date.now();
+                    const assistTextAuto = this.buildAssistText(
+                        resolvedExpression.emotionLabelHint,
+                        resolvedExpression.emotionIntensityHint,
+                    );
                     const sbv2Result = await this.sbv2.synthesize({
                         text: params.text,
                         ...(params.sbv2 || {}),
+                        assistText: params.sbv2?.assistText ?? assistTextAuto,
+                        assistTextWeight: params.sbv2?.assistTextWeight
+                            ?? (resolvedExpression.emotionIntensityHint > 0.6 ? 1.2 : 0.9),
                     });
 
                     if (!sbv2Result.success) {
@@ -1106,6 +1158,7 @@ export class VoicePipelineService {
                     const rvcResult = await this.rvc.convert({
                         ...params.rvc,
                         autoHighPitchQualityProtect: params.rvc?.autoHighPitchQualityProtect ?? true,
+                        latencyPriority: params.rvc?.latencyPriority ?? false,
                     });
 
                     if (!rvcResult.success) {
@@ -1157,9 +1210,16 @@ export class VoicePipelineService {
 
                 case 'sbv2+rvc': {
                     const sbv2Started = Date.now();
+                    const assistTextAutoRvc = this.buildAssistText(
+                        resolvedExpression.emotionLabelHint,
+                        resolvedExpression.emotionIntensityHint,
+                    );
                     const sbv2Result = await this.sbv2.synthesize({
                         text: params.text,
                         ...(params.sbv2 || {}),
+                        assistText: params.sbv2?.assistText ?? assistTextAutoRvc,
+                        assistTextWeight: params.sbv2?.assistTextWeight
+                            ?? (resolvedExpression.emotionIntensityHint > 0.6 ? 1.2 : 0.9),
                     });
 
                     if (!sbv2Result.success) {
@@ -1193,6 +1253,7 @@ export class VoicePipelineService {
                         inputPath: rvcInputPath,
                         inputBase64: rvcInputBase64,
                         autoHighPitchQualityProtect: params.rvc?.autoHighPitchQualityProtect ?? true,
+                        latencyPriority: params.rvc?.latencyPriority ?? true,
                     });
 
                     if (!rvcResult.success) {

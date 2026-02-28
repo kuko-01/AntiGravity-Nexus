@@ -278,6 +278,34 @@ export interface ElectronAPI {
     characterChatReset: (sessionId: string) => Promise<{ success: boolean; error?: string }>;
     characterLearningGetSeparationProfile: (characterId: string) => Promise<CharacterLearningSeparationProfileResponse>;
     characterLearningResetSeparationProfile: (characterId: string) => Promise<CharacterLearningSeparationProfileResponse>;
+    dialogueExtractFromYoutube: (params: {
+        characterId: string;
+        sourceUrl: string;
+        startSec?: number;
+        durationSec: number;
+        separationPreference?: string;
+        ytDlpCookiesFile?: string;
+    }) => Promise<{
+        success: boolean;
+        startSec: number;
+        durationSec: number;
+        vocalWavPath?: string;
+        method?: string;
+        warning?: string;
+        error?: string;
+    }>;
+    onDialogueExtractProgress: (callback: (progress: { stage: string; message: string }) => void) => (() => void) | void;
+    dialogueLoadWavFile: (filePath: string) => Promise<{
+        success: boolean;
+        base64?: string;
+        fileName?: string;
+        error?: string;
+    }>;
+    dialogueSaveTrainingMaterial: (params: {
+        characterId: string;
+        base64: string;
+        fileName: string;
+    }) => Promise<{ success: boolean; savedPath?: string; error?: string }>;
 }
 
 // Nano Studio Types

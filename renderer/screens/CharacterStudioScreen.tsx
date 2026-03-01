@@ -60,7 +60,7 @@ interface StoredUserProfile {
 
 interface StoredVoiceEnhanceSettings {
     singingTrainingMode?: boolean;
-    separationPreference?: 'auto' | 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    separationPreference?: 'auto' | 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
     forceSingingMode?: boolean;
     autoEmotionRefine?: boolean;
     enhanceFinalAudio?: boolean;
@@ -72,12 +72,13 @@ interface StoredVoiceEnhanceSettings {
     ytDlpCookiesFile?: string;
 }
 
-type SeparationMethodId = 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+type SeparationMethodId = 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
 
 const DEFAULT_CHARACTER_ID = 'aozuki_fox_v1';
-const SEPARATION_METHOD_ORDER: SeparationMethodId[] = ['uvr-ultimate', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+const SEPARATION_METHOD_ORDER: SeparationMethodId[] = ['uvr-ultimate', 'roformer', 'demucs', 'uvr5', 'ffmpeg-fallback'];
 const SEPARATION_METHOD_LABELS: Record<SeparationMethodId, string> = {
     'uvr-ultimate': 'UVR Ultimate',
+    roformer: 'Roformer',
     demucs: 'Demucs',
     uvr5: 'UVR5',
     'ffmpeg-fallback': 'FFmpeg fallback',
@@ -160,7 +161,7 @@ const CharacterStudioScreen: React.FC = () => {
     const [voiceEnabled, setVoiceEnabled] = useState<boolean>(true);
     const [voiceMode, setVoiceMode] = useState<'sbv2' | 'sbv2+rvc'>('sbv2+rvc');
     const [singingTrainingMode, setSingingTrainingMode] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.singingTrainingMode === true);
-    const [singingSeparationPreference, setSingingSeparationPreference] = useState<'auto' | 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback'>(
+    const [singingSeparationPreference, setSingingSeparationPreference] = useState<'auto' | 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback'>(
         DEFAULT_VOICE_ENHANCE_SETTINGS.separationPreference || 'auto',
     );
     const [ytDlpCookiesFile, setYtDlpCookiesFile] = useState<string>('');
@@ -191,6 +192,17 @@ const CharacterStudioScreen: React.FC = () => {
     const [dialogueDuration, setDialogueDuration] = useState(10);
     const [isDialogueExtracting, setIsDialogueExtracting] = useState(false);
     const [dialogueExtractStatus, setDialogueExtractStatus] = useState('');
+    const [singingLearningProgress, setSingingLearningProgress] = useState<{
+        active: boolean;
+        percent: number;
+        message: string;
+        stage: string;
+    }>({
+        active: false,
+        percent: 0,
+        message: '',
+        stage: '',
+    });
     const [waveformEditorData, setWaveformEditorData] = useState<{ base64?: string; fileName: string } | null>(null);
     const [appAudioInputEnabled, setAppAudioInputEnabled] = useState(false);
     const [appAudioCaptureRunning, setAppAudioCaptureRunning] = useState(false);
@@ -316,6 +328,7 @@ const CharacterStudioScreen: React.FC = () => {
         const nextSeparationPreference = (
             settings?.separationPreference === 'auto'
             || settings?.separationPreference === 'uvr-ultimate'
+            || settings?.separationPreference === 'roformer'
             || settings?.separationPreference === 'demucs'
             || settings?.separationPreference === 'uvr5'
             || settings?.separationPreference === 'ffmpeg-fallback'
@@ -960,6 +973,23 @@ const CharacterStudioScreen: React.FC = () => {
     }, []);
 
     useEffect(() => {
+        const unsubscribe = window.electronAPI.onSingingLearningProgress?.((progress) => {
+            if (!progress) return;
+            setSingingLearningProgress({
+                active: progress.stage !== 'done' && progress.stage !== 'error',
+                percent: Math.max(0, Math.min(100, Math.round(progress.percent || 0))),
+                message: progress.message || '',
+                stage: progress.stage || '',
+            });
+        });
+        return () => {
+            if (typeof unsubscribe === 'function') {
+                unsubscribe();
+            }
+        };
+    }, []);
+
+    useEffect(() => {
         void refreshVoiceOptions();
     }, [apiAvailable]);
 
@@ -1272,6 +1302,23 @@ const CharacterStudioScreen: React.FC = () => {
         });
 
         setIsSending(true);
+        const isLearningRequest = singingTrainingMode
+            && /(?:https?:\/\/)?(?:(?:www\.|music\.)?youtube\.com\/|youtu\.be\/)/i.test(text);
+        if (isLearningRequest) {
+            setSingingLearningProgress({
+                active: true,
+                percent: 0,
+                message: '歌唱学習ジョブを開始しています...',
+                stage: 'start',
+            });
+        } else {
+            setSingingLearningProgress({
+                active: false,
+                percent: 0,
+                message: '',
+                stage: '',
+            });
+        }
         try {
             const voiceExpression: {
                 singing?: boolean;
@@ -1332,6 +1379,16 @@ const CharacterStudioScreen: React.FC = () => {
             }
 
             setSessionId(response.sessionId || sessionId);
+            if (response.learning) {
+                setSingingLearningProgress({
+                    active: false,
+                    percent: 100,
+                    message: response.learning.success
+                        ? `歌唱学習の取り込みが完了しました。(${response.learning.method || 'unknown'})`
+                        : `歌唱学習に失敗しました: ${response.learning.error || '不明'}`,
+                    stage: response.learning.success ? 'done' : 'error',
+                });
+            }
             appendMessage({
                 id: response.turnId || `asst_${Date.now()}`,
                 role: 'assistant',
@@ -1355,6 +1412,14 @@ const CharacterStudioScreen: React.FC = () => {
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             setLastError(message);
+            if (isLearningRequest) {
+                setSingingLearningProgress({
+                    active: false,
+                    percent: 100,
+                    message: `歌唱学習エラー: ${message}`,
+                    stage: 'error',
+                });
+            }
             appendMessage({
                 id: `sys_ex_${Date.now()}`,
                 role: 'system',
@@ -1731,22 +1796,43 @@ const CharacterStudioScreen: React.FC = () => {
                         />
                         Singing learning mode (YouTube URL)
                     </label>
+                    {(singingLearningProgress.active || singingLearningProgress.message) && (
+                        <div style={{ marginBottom: '10px' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', fontSize: '12px', marginBottom: '4px', color: 'var(--color-text-muted)' }}>
+                                <span style={{ flex: 1 }}>{singingLearningProgress.message || '歌唱学習処理中...'}</span>
+                                <span>{Math.max(0, Math.min(100, singingLearningProgress.percent))}%</span>
+                            </div>
+                            <div style={{ width: '100%', height: '8px', borderRadius: '999px', background: 'rgba(148, 163, 184, 0.18)', overflow: 'hidden' }}>
+                                <div
+                                    style={{
+                                        width: `${Math.max(0, Math.min(100, singingLearningProgress.percent))}%`,
+                                        height: '100%',
+                                        background: singingLearningProgress.stage === 'error'
+                                            ? 'linear-gradient(90deg, #ef4444, #dc2626)'
+                                            : 'linear-gradient(90deg, #22c55e, #16a34a)',
+                                        transition: 'width 180ms ease',
+                                    }}
+                                />
+                            </div>
+                        </div>
+                    )}
 
                     <label
                         style={{ display: 'block', fontSize: '12px', marginBottom: '6px' }}
-                        title="歌唱学習の分離エンジン優先順です。Autoは UVR Ultimate → Demucs → UVR5 → FFmpeg の順に試します。"
+                        title="歌唱学習の分離エンジン優先順です。Autoは UVR Ultimate / Roformer / Demucs / UVR5 を品質比較し、失敗時は FFmpeg fallback へ進みます。"
                     >
                         Singing Separation Engine
                     </label>
                     <select
                         value={singingSeparationPreference}
                         onChange={(e) => setSingingSeparationPreference(
-                            e.target.value as 'auto' | 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback',
+                            e.target.value as 'auto' | 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback',
                         )}
                         style={{ width: '100%', marginBottom: '10px' }}
                     >
                         <option value="auto">Auto (Recommended)</option>
                         <option value="uvr-ultimate">UVR Ultimate</option>
+                        <option value="roformer">Roformer</option>
                         <option value="demucs">Demucs</option>
                         <option value="uvr5">UVR5 (RVC)</option>
                         <option value="ffmpeg-fallback">FFmpeg fallback</option>

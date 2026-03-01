@@ -58,7 +58,7 @@ export interface AppState {
 }
 
 export interface CharacterLearningSeparationMethodProfile {
-    method: 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    method: 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
     scoreEma: number;
     successCount: number;
     failureCount: number;
@@ -72,7 +72,7 @@ export interface CharacterLearningSeparationMethodProfile {
 export interface CharacterLearningSeparationProfileResponse {
     success: boolean;
     characterId: string;
-    preferredMethod: 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    preferredMethod: 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
     updatedAt: string;
     methods: CharacterLearningSeparationMethodProfile[];
     profilePath: string;
@@ -295,6 +295,9 @@ export interface ElectronAPI {
         error?: string;
     }>;
     onDialogueExtractProgress: (callback: (progress: { stage: string; message: string }) => void) => (() => void) | void;
+    onSingingLearningProgress: (
+        callback: (progress: { sessionId?: string; stage: string; message: string; percent: number }) => void,
+    ) => (() => void) | void;
     dialogueLoadWavFile: (filePath: string) => Promise<{
         success: boolean;
         base64?: string;

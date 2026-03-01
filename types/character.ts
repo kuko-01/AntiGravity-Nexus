@@ -64,7 +64,7 @@ export interface CharacterConversationSettings {
 
 export interface CharacterLearningRequest {
     singingTrainingMode?: boolean;
-    separationPreference?: 'auto' | 'uvr-ultimate' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    separationPreference?: 'auto' | 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
     ytDlpCookiesFile?: string;
 }
 
@@ -76,7 +76,7 @@ export interface CharacterLearningResult {
     vocalWavPath?: string;
     accompanimentWavPath?: string;
     datasetInputPath?: string;
-    method?: 'uvr-ultimate' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+    method?: 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
     warning?: string;
     error?: string;
 }

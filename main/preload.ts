@@ -600,6 +600,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
         ipcRenderer.on('dialogue-extract-progress', handler);
         return () => ipcRenderer.removeListener('dialogue-extract-progress', handler);
     },
+    onSingingLearningProgress: (
+        callback: (progress: { sessionId?: string; stage: string; message: string; percent: number }) => void,
+    ) => {
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            progress: { sessionId?: string; stage: string; message: string; percent: number },
+        ) => callback(progress);
+        ipcRenderer.on('singing-learning-progress', handler);
+        return () => ipcRenderer.removeListener('singing-learning-progress', handler);
+    },
 
     dialogueLoadWavFile: async (filePath: string) => {
         return await ipcRenderer.invoke('dialogue-load-wav-file', filePath);

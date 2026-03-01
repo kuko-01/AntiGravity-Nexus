@@ -11,7 +11,9 @@ import {
     SeparationStemQualityScore,
 } from './audio/SeparationQualityLibrary';
 
-type SeparationMethod = 'uvr-ultimate' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+const AUDIO_SEPARATOR_TORCH_CUDA_INDEX_URL = 'https://download.pytorch.org/whl/cu126';
+
+type SeparationMethod = 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
 type SeparationPreference = 'auto' | SeparationMethod;
 
 export interface SingingLearningIngestParams {
@@ -61,6 +63,12 @@ export interface DialogueExtractResult {
 export interface DialogueExtractProgressEvent {
     stage: string;
     message: string;
+}
+
+export interface SingingLearningProgressEvent {
+    stage: string;
+    message: string;
+    percent: number;
 }
 
 export interface SingingLearningSeparationMethodView {
@@ -438,7 +446,7 @@ export class SingingLearningService {
         try {
             const characterId = this.normalizeId(characterIdRaw, 'character_default');
             const profile = this.getOrCreateCharacterSeparationProfile(characterId);
-            const methods: SeparationMethod[] = ['uvr-ultimate', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+            const methods: SeparationMethod[] = ['uvr-ultimate', 'roformer', 'demucs', 'uvr5', 'ffmpeg-fallback'];
             const methodViews: SingingLearningSeparationMethodView[] = methods.map((method) => {
                 const methodProfile = profile.methods[method];
                 const attempts = methodProfile.successCount + methodProfile.failureCount;
@@ -484,7 +492,21 @@ export class SingingLearningService {
         return this.getSeparationProfile(characterId);
     }
 
-    async ingestFromYouTube(params: SingingLearningIngestParams): Promise<SingingLearningIngestResult> {
+    async ingestFromYouTube(
+        params: SingingLearningIngestParams,
+        onProgress?: (event: SingingLearningProgressEvent) => void,
+    ): Promise<SingingLearningIngestResult> {
+        const report = (stage: string, message: string, percent: number): void => {
+            try {
+                onProgress?.({
+                    stage,
+                    message,
+                    percent: this.clampInteger(Math.round(percent), 0, 100, 0),
+                });
+            } catch {
+                // Ignore progress callback failures.
+            }
+        };
         const characterId = this.normalizeId(params.characterId, 'character_default');
         const sourceUrl = String(params.sourceUrl || '').trim();
         if (!sourceUrl) {
@@ -510,6 +532,8 @@ export class SingingLearningService {
         fs.mkdirSync(instDir, { recursive: true });
         fs.mkdirSync(trainDir, { recursive: true });
 
+        report('start', '歌唱学習ジョブを開始しました...', 2);
+        report('download', 'YouTube音声を取得中...', 8);
         const downloaded = await this.downloadYouTubeAudio(sourceUrl, downloadDir, params.ytDlpCookiesFile);
         if (!downloaded.success || !downloaded.audioPath) {
             return {
@@ -531,6 +555,7 @@ export class SingingLearningService {
         if (separationPreference !== 'auto') {
             preWarnings.push(`Separation preference: ${separationPreference}.`);
         }
+        report('prepare', '音声を分離用に前処理しています...', 22);
         const prepared = await this.prepareSourceAudioForSeparation(sourceAudioPath, runDir);
         if (prepared.warning) {
             preWarnings.push(prepared.warning);
@@ -544,8 +569,13 @@ export class SingingLearningService {
         const successfulCandidates: SeparationQualityCandidate[] = [];
         let enhancementAlternativeCandidates: SeparationQualityCandidate[] = [];
         let separation: SeparationAttempt = { success: false, error: 'No separator attempted.' };
+        const separationProgressBase = 28;
+        const separationProgressSpan = 46;
 
-        for (const method of methodsForInitialPass) {
+        for (let index = 0; index < methodsForInitialPass.length; index += 1) {
+            const method = methodsForInitialPass[index];
+            const methodPercent = separationProgressBase + Math.floor((index / Math.max(1, methodsForInitialPass.length)) * separationProgressSpan);
+            report('separate', `音声分離中... (${method})`, methodPercent);
             const attempt = await this.runSeparationByMethod(method, sourceAudioPath, vocalDir, instDir);
             if (attempt.success) {
                 if (attempt.vocalWavPath) {
@@ -571,6 +601,7 @@ export class SingingLearningService {
 
         if (separationPreference === 'auto' && successfulCandidates.length > 0) {
             try {
+                report('rank', '分離候補を比較中...', 76);
                 const selected = await this.selectBestSeparationCandidate(successfulCandidates, runDir, characterId, sourceAudioPath);
                 separation = {
                     success: true,
@@ -580,10 +611,10 @@ export class SingingLearningService {
                     warning: selected.warning,
                 };
                 if (selected.scoredCandidates && selected.scoredCandidates.length > 0) {
-                    enhancementAlternativeCandidates = selected.scoredCandidates
-                        .map((entry) => entry.candidate)
-                        .filter((candidate) => candidate.vocalWavPath !== selected.candidate.vocalWavPath)
-                        .slice(0, 2);
+                    enhancementAlternativeCandidates = this.buildEnhancementAlternativeCandidates(
+                        selected.candidate,
+                        selected.scoredCandidates,
+                    );
                     if (selected.scoredCandidates.length > 1 && enhancementAlternativeCandidates.length === 0) {
                         separation.warning = [
                             selected.warning,
@@ -615,6 +646,7 @@ export class SingingLearningService {
         if ((!separation.success || !separation.vocalWavPath) && methodsForInitialPass.length < separationPlan.length) {
             const fallbackMethod = separationPlan.find((method) => !methodsForInitialPass.includes(method));
             if (fallbackMethod) {
+                report('fallback', `音声分離中... (${fallbackMethod} fallback)`, 74);
                 const fallbackAttempt = await this.runSeparationByMethod(fallbackMethod, sourceAudioPath, vocalDir, instDir);
                 separation = fallbackAttempt;
                 if (!fallbackAttempt.success && fallbackAttempt.error) {
@@ -649,12 +681,14 @@ export class SingingLearningService {
             };
         }
 
+        report('enhance', `抽出ボーカルを整形中... (${separation.method || 'unknown'})`, 84);
         const enhancedVocal = await this.enhanceSeparatedVocalTrack(
             separation.vocalWavPath,
             runDir,
             sourceAudioPath,
             separation.accompanimentWavPath,
             enhancementAlternativeCandidates,
+            separation.method,
         );
         if (enhancedVocal.vocalWavPath) {
             separation.vocalWavPath = enhancedVocal.vocalWavPath;
@@ -671,6 +705,7 @@ export class SingingLearningService {
 
         let datasetInputPath: string | undefined;
         try {
+            report('dataset', '学習素材を登録中...', 94);
             datasetInputPath = await this.copyToSbv2DatasetInput(characterId, trainingCopyPath);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -701,6 +736,7 @@ export class SingingLearningService {
             createdAt: new Date().toISOString(),
         });
 
+        report('done', `歌唱学習の取り込みが完了しました。(${separation.method || 'unknown'})`, 100);
         return {
             success: true,
             sourceUrl,
@@ -727,6 +763,7 @@ export class SingingLearningService {
         const now = new Date().toISOString();
         const initialScore: Record<SeparationMethod, number> = {
             'uvr-ultimate': 78,
+            roformer: 75,
             demucs: 76,
             uvr5: 72,
             'ffmpeg-fallback': 58,
@@ -748,6 +785,7 @@ export class SingingLearningService {
             preferredMethod: 'uvr-ultimate',
             methods: {
                 'uvr-ultimate': this.getDefaultMethodSeparationProfile('uvr-ultimate'),
+                roformer: this.getDefaultMethodSeparationProfile('roformer'),
                 demucs: this.getDefaultMethodSeparationProfile('demucs'),
                 uvr5: this.getDefaultMethodSeparationProfile('uvr5'),
                 'ffmpeg-fallback': this.getDefaultMethodSeparationProfile('ffmpeg-fallback'),
@@ -782,6 +820,7 @@ export class SingingLearningService {
             preferredMethod: this.normalizeSeparationMethod(raw.preferredMethod) || base.preferredMethod,
             methods: {
                 'uvr-ultimate': sanitizeMethod('uvr-ultimate'),
+                roformer: sanitizeMethod('roformer'),
                 demucs: sanitizeMethod('demucs'),
                 uvr5: sanitizeMethod('uvr5'),
                 'ffmpeg-fallback': sanitizeMethod('ffmpeg-fallback'),
@@ -853,14 +892,14 @@ export class SingingLearningService {
 
     private normalizeSeparationMethod(value: unknown): SeparationMethod | undefined {
         const normalized = String(value || '').trim().toLowerCase();
-        if (normalized === 'uvr-ultimate' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback') {
+        if (normalized === 'uvr-ultimate' || normalized === 'roformer' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback') {
             return normalized;
         }
         return undefined;
     }
 
     private resolvePreferredMethod(profile: PersistentCharacterSeparationProfile): SeparationMethod {
-        const methods: SeparationMethod[] = ['uvr-ultimate', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+        const methods: SeparationMethod[] = ['uvr-ultimate', 'roformer', 'demucs', 'uvr5', 'ffmpeg-fallback'];
         let bestMethod: SeparationMethod = methods[0];
         let bestScore = -Infinity;
         for (const method of methods) {
@@ -989,18 +1028,19 @@ export class SingingLearningService {
 
     private normalizeSeparationPreference(value: string | undefined): SeparationPreference {
         const normalized = String(value || '').trim().toLowerCase();
-        if (normalized === 'uvr-ultimate' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback') {
+        if (normalized === 'uvr-ultimate' || normalized === 'roformer' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback') {
             return normalized;
         }
         return 'auto';
     }
 
     private buildSeparationPlan(preference: SeparationPreference, characterId: string): SeparationMethod[] {
-        const defaultPlan: SeparationMethod[] = ['uvr-ultimate', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+        const defaultPlan: SeparationMethod[] = ['uvr-ultimate', 'roformer', 'demucs', 'uvr5', 'ffmpeg-fallback'];
         if (preference === 'auto') {
             const profile = this.getOrCreateCharacterSeparationProfile(characterId);
             const baselineBias: Record<SeparationMethod, number> = {
                 'uvr-ultimate': 2.5,
+                roformer: 3,
                 demucs: 2,
                 uvr5: 1,
                 'ffmpeg-fallback': -10,
@@ -1019,6 +1059,133 @@ export class SingingLearningService {
             return ranked;
         }
         return [preference, ...defaultPlan.filter((method) => method !== preference)];
+    }
+
+    private buildEnhancementAlternativeCandidates(
+        primaryCandidate: SeparationQualityCandidate,
+        scoredCandidates: ScoredSeparationCandidate[],
+    ): SeparationQualityCandidate[] {
+        if (scoredCandidates.length <= 1) {
+            return [];
+        }
+
+        const primaryPath = path.resolve(primaryCandidate.vocalWavPath);
+        const alternatives = scoredCandidates
+            .filter((entry) => path.resolve(entry.candidate.vocalWavPath) !== primaryPath)
+            .sort((a, b) => {
+                const affinityDiff = this.getEnsembleComplementPriority(primaryCandidate.method, b.candidate.method)
+                    - this.getEnsembleComplementPriority(primaryCandidate.method, a.candidate.method);
+                if (affinityDiff !== 0) {
+                    return affinityDiff;
+                }
+
+                const accompanimentDiff = Number(Boolean(b.candidate.accompanimentWavPath))
+                    - Number(Boolean(a.candidate.accompanimentWavPath));
+                if (accompanimentDiff !== 0) {
+                    return accompanimentDiff;
+                }
+
+                const finalScoreDiff = b.finalScore - a.finalScore;
+                if (Math.abs(finalScoreDiff) > 0.15) {
+                    return finalScoreDiff;
+                }
+
+                const aLeak = typeof a.score.leakageCorrelation === 'number' ? a.score.leakageCorrelation : 0.999;
+                const bLeak = typeof b.score.leakageCorrelation === 'number' ? b.score.leakageCorrelation : 0.999;
+                const leakDiff = aLeak - bLeak;
+                if (Math.abs(leakDiff) > 0.002) {
+                    return leakDiff;
+                }
+
+                return a.vocalMetrics.lowBandRatio - b.vocalMetrics.lowBandRatio;
+            });
+
+        return alternatives.map((entry) => entry.candidate).slice(0, 3);
+    }
+
+    private getEnsembleComplementPriority(primaryMethod: SeparationMethod, alternativeMethod: SeparationMethod): number {
+        if (primaryMethod === alternativeMethod) {
+            return -10;
+        }
+        if ((primaryMethod === 'roformer' && alternativeMethod === 'demucs')
+            || (primaryMethod === 'demucs' && alternativeMethod === 'roformer')) {
+            return 10;
+        }
+        if (primaryMethod === 'uvr-ultimate' && alternativeMethod === 'roformer') {
+            return 8;
+        }
+        if (primaryMethod === 'roformer' && alternativeMethod === 'uvr-ultimate') {
+            return 7;
+        }
+        if (primaryMethod === 'uvr-ultimate' && alternativeMethod === 'demucs') {
+            return 6;
+        }
+        if (primaryMethod === 'demucs' && alternativeMethod === 'uvr-ultimate') {
+            return 5;
+        }
+        if (alternativeMethod === 'uvr5') {
+            return 2;
+        }
+        if (alternativeMethod === 'ffmpeg-fallback') {
+            return -4;
+        }
+        return 0;
+    }
+
+    private shouldAdoptVocalEnsemble(
+        primaryMethod: SeparationMethod | undefined,
+        alternativeMethod: SeparationMethod,
+        beforeMetrics: SeparationStemQualityMetrics,
+        afterMetrics: SeparationStemQualityMetrics,
+        beforeScore: SeparationStemQualityScore,
+        afterScore: SeparationStemQualityScore,
+        beforeLeak: number,
+        afterLeak: number,
+        beforeLowBandLeak: number,
+        afterLowBandLeak: number,
+        beforeHighRoughness: number,
+        afterHighRoughness: number,
+    ): boolean {
+        const pairPriority = primaryMethod
+            ? this.getEnsembleComplementPriority(primaryMethod, alternativeMethod)
+            : 0;
+        const scoreGain = afterScore.score - beforeScore.score;
+        const scoreDrop = beforeScore.score - afterScore.score;
+        const leakImproved = beforeLeak - afterLeak;
+        const leakWorsened = afterLeak - beforeLeak;
+        const lowBandLeakImproved = beforeLowBandLeak - afterLowBandLeak;
+        const lowBandLeakWorsened = afterLowBandLeak - beforeLowBandLeak;
+        const lowImproved = beforeMetrics.lowBandRatio - afterMetrics.lowBandRatio;
+        const lowWorsened = afterMetrics.lowBandRatio - beforeMetrics.lowBandRatio;
+        const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+        const silenceRise = afterMetrics.silenceRatio - beforeMetrics.silenceRatio;
+        const highRoughDelta = afterHighRoughness - beforeHighRoughness;
+        const regressionSafe = (
+            scoreDrop <= (pairPriority >= 8 ? 2.0 : 1.6)
+            && speechDrop <= (pairPriority >= 8 ? 0.03 : 0.022)
+            && silenceRise <= (pairPriority >= 8 ? 0.055 : 0.045)
+            && lowWorsened <= 0.04
+            && leakWorsened <= (pairPriority >= 8 ? 0.010 : 0.006)
+            && lowBandLeakWorsened <= (pairPriority >= 8 ? 0.008 : 0.005)
+            && highRoughDelta <= Math.max(0.00035, beforeHighRoughness * (pairPriority >= 8 ? 0.16 : 0.12))
+        );
+        if (!regressionSafe) {
+            return false;
+        }
+
+        return (
+            scoreGain >= (pairPriority >= 8 ? 0.45 : 0.8)
+            || leakImproved >= (pairPriority >= 8 ? 0.012 : 0.018)
+            || lowBandLeakImproved >= (pairPriority >= 8 ? 0.010 : 0.014)
+            || (lowImproved >= 0.014 && highRoughDelta <= 0.00018 && speechDrop <= 0.020)
+            || (
+                pairPriority >= 8
+                && scoreGain >= -0.20
+                && leakImproved >= 0.010
+                && lowImproved >= 0.010
+                && lowBandLeakImproved >= 0.006
+            )
+        );
     }
 
     private buildDialogueFastAutoSeparationPlan(autoPlan: SeparationMethod[]): SeparationMethod[] {
@@ -1048,6 +1215,9 @@ export class SingingLearningService {
     }> {
         if (method === 'uvr-ultimate') {
             return this.trySeparateWithUvrUltimate(sourceAudioPath, vocalDir, accompanimentDir);
+        }
+        if (method === 'roformer') {
+            return this.trySeparateWithRoformer(sourceAudioPath, vocalDir, accompanimentDir);
         }
         if (method === 'demucs') {
             return this.trySeparateWithDemucs(sourceAudioPath, vocalDir, accompanimentDir);
@@ -1751,6 +1921,10 @@ export class SingingLearningService {
         const pythonScript = `
 import json
 import os
+import torch
+import onnxruntime as ort
+if hasattr(ort, 'preload_dlls'):
+    ort.preload_dlls()
 from audio_separator.separator import Separator
 
 input_path = r'''${sourceAudioPath.replace(/\\/g, '\\\\')}'''
@@ -1784,6 +1958,12 @@ errors = []
 vocal_file = None
 inst_file = None
 used_model = None
+runtime_info = {
+    'torch_cuda': bool(torch.cuda.is_available()),
+    'ort_providers': ort.get_available_providers(),
+    'torch_device': None,
+    'onnx_provider': None,
+}
 
 # Stage 1 - Vocal / Instrumental separation
 for model_name in vocal_model_candidates:
@@ -1794,6 +1974,8 @@ for model_name in vocal_model_candidates:
             output_dir=output_dir,
             output_format='WAV',
         )
+        runtime_info['torch_device'] = str(getattr(sep, 'torch_device', 'unknown'))
+        runtime_info['onnx_provider'] = getattr(sep, 'onnx_execution_provider', None)
         sep.load_model(model_filename=model_name)
         output_files = sep.separate(input_path, output_names)
         voc = [f for f in output_files if 'vocal' in os.path.basename(f).lower()]
@@ -1838,6 +2020,10 @@ print(json.dumps({
     'dereverb_model': dereverb_model_used,
     'vocal_file': dereverbed_file,
     'inst_file': inst_file,
+    'torch_cuda': runtime_info['torch_cuda'],
+    'ort_providers': runtime_info['ort_providers'],
+    'torch_device': runtime_info['torch_device'],
+    'onnx_provider': runtime_info['onnx_provider'],
 }, ensure_ascii=False))
 raise SystemExit(0)
 `.trim();
@@ -1874,6 +2060,10 @@ raise SystemExit(0)
             dereverb_model?: string;
             vocal_file?: string;
             inst_file?: string;
+            torch_cuda?: boolean;
+            ort_providers?: string[];
+            torch_device?: string;
+            onnx_provider?: string[] | string;
         }>(result.stdout || '');
 
         // Prefer the explicit paths returned by the script; fall back to directory scanning.
@@ -1918,12 +2108,213 @@ raise SystemExit(0)
         if (ffmpegTools.warning) warnings.push(ffmpegTools.warning);
         if (report?.model) warnings.push(`UVR Ultimate vocal model: ${report.model}`);
         if (report?.dereverb_model) warnings.push(`De-reverb: ${report.dereverb_model}`);
+        const runtimeInfo = this.formatAudioSeparatorRuntimeInfo(report);
+        if (runtimeInfo) warnings.push(runtimeInfo);
         if (!result.success) warnings.push(`UVR Ultimate exited with code ${result.code}, but stem files were produced and reused.`);
         if (!accompanimentCopyPath) warnings.push('UVR Ultimate extracted vocals but accompaniment stem was not found.');
 
         return {
             success: true,
             method: 'uvr-ultimate',
+            vocalWavPath: vocalCopyPath,
+            accompanimentWavPath: accompanimentCopyPath,
+            warning: warnings.length > 0 ? warnings.join(' ') : undefined,
+        };
+    }
+
+    private async trySeparateWithRoformer(
+        sourceAudioPath: string,
+        vocalDir: string,
+        accompanimentDir: string,
+    ): Promise<{
+        success: boolean;
+        method?: SeparationMethod;
+        vocalWavPath?: string;
+        accompanimentWavPath?: string;
+        warning?: string;
+        error?: string;
+    }> {
+        const runner = await this.resolveRoformerRuntime();
+        if (!runner.success || !runner.pythonExe) {
+            return {
+                success: false,
+                error: runner.error || 'Roformer runtime is unavailable.',
+            };
+        }
+
+        const ffmpegTools = await this.ensureFfmpegTools();
+        if (!ffmpegTools.ffmpegPath) {
+            return {
+                success: false,
+                error: ffmpegTools.error || 'ffmpeg not found. Roformer separation requires ffmpeg.',
+            };
+        }
+
+        const workDir = path.join(path.dirname(sourceAudioPath), 'roformer_work');
+        const outputDir = path.join(workDir, 'output');
+        const modelFileDir = path.join(this.baseDir, 'runtime', 'roformer_models');
+        fs.mkdirSync(workDir, { recursive: true });
+        fs.mkdirSync(outputDir, { recursive: true });
+        fs.mkdirSync(modelFileDir, { recursive: true });
+
+        const pythonScript = `
+import json
+import os
+import torch
+import onnxruntime as ort
+if hasattr(ort, 'preload_dlls'):
+    ort.preload_dlls()
+from audio_separator.separator import Separator
+
+input_path = r'''${sourceAudioPath.replace(/\\/g, '\\\\')}'''
+output_dir = r'''${outputDir.replace(/\\/g, '\\\\')}'''
+model_file_dir = r'''${modelFileDir.replace(/\\/g, '\\\\')}'''
+os.makedirs(output_dir, exist_ok=True)
+
+model_candidates = [
+    'model_bs_roformer_ep_317_sdr_12.9755.ckpt',
+    'mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt',
+]
+output_names = {
+    'Vocals': 'vocals_roformer',
+    'Instrumental': 'accompaniment_roformer',
+}
+
+errors = []
+vocal_file = None
+inst_file = None
+used_model = None
+runtime_info = {
+    'torch_cuda': bool(torch.cuda.is_available()),
+    'ort_providers': ort.get_available_providers(),
+    'torch_device': None,
+    'onnx_provider': None,
+}
+
+for model_name in model_candidates:
+    try:
+        sep = Separator(
+            log_level=30,
+            model_file_dir=model_file_dir,
+            output_dir=output_dir,
+            output_format='WAV',
+        )
+        runtime_info['torch_device'] = str(getattr(sep, 'torch_device', 'unknown'))
+        runtime_info['onnx_provider'] = getattr(sep, 'onnx_execution_provider', None)
+        sep.load_model(model_filename=model_name)
+        output_files = sep.separate(input_path, output_names)
+        voc = [f for f in output_files if 'vocal' in os.path.basename(f).lower()]
+        inst = [f for f in output_files if any(k in os.path.basename(f).lower() for k in ['instrumental', 'accompaniment', 'no_vocal', 'inst'])]
+        if voc:
+            vocal_file = voc[0]
+            inst_file = inst[0] if inst else None
+            used_model = model_name
+            break
+    except Exception as ex:
+        errors.append({'model': model_name, 'error': str(ex)})
+
+if vocal_file is None:
+    print(json.dumps({'ok': False, 'errors': errors}, ensure_ascii=False))
+    raise SystemExit(1)
+
+print(json.dumps({
+    'ok': True,
+    'model': used_model,
+    'vocal_file': vocal_file,
+    'inst_file': inst_file,
+    'torch_cuda': runtime_info['torch_cuda'],
+    'ort_providers': runtime_info['ort_providers'],
+    'torch_device': runtime_info['torch_device'],
+    'onnx_provider': runtime_info['onnx_provider'],
+}, ensure_ascii=False))
+raise SystemExit(0)
+`.trim();
+
+        const roformerEnv = this.buildEnvWithAdditionalPath(path.dirname(ffmpegTools.ffmpegPath), {
+            ...(runner.env || process.env),
+            PYTHONUTF8: '1',
+            PYTHONIOENCODING: 'utf-8',
+        });
+        const result = await this.runCommand(runner.pythonExe, ['-c', pythonScript], {
+            cwd: workDir,
+            env: roformerEnv,
+            timeoutMs: 120 * 60 * 1000,
+        });
+        try {
+            const logPath = path.join(workDir, `roformer_${Date.now()}.log`);
+            const payload = [
+                `code=${result.code}`,
+                '',
+                '[stderr]',
+                result.stderr || '',
+                '',
+                '[stdout]',
+                result.stdout || '',
+            ].join('\n');
+            fs.writeFileSync(logPath, payload, 'utf-8');
+        } catch {
+            // Ignore log write failures.
+        }
+
+        const report = this.tryParseLastJsonLine<{
+            ok?: boolean;
+            model?: string;
+            vocal_file?: string;
+            inst_file?: string;
+            torch_cuda?: boolean;
+            ort_providers?: string[];
+            torch_device?: string;
+            onnx_provider?: string[] | string;
+        }>(result.stdout || '');
+
+        let vocalStem: string | undefined;
+        if (report?.vocal_file && fs.existsSync(report.vocal_file)) {
+            vocalStem = report.vocal_file;
+        } else {
+            vocalStem = this.findStemFile(outputDir, ['vocals_roformer', 'main_vocal', 'vocals', 'vocal']);
+        }
+        if (!vocalStem) {
+            const details = this.takeTail([result.stderr, result.stdout].filter(Boolean).join('\n'), 900);
+            return {
+                success: false,
+                error: details
+                    ? `Roformer separation failed: ${details}`
+                    : this.formatCommandFailure('Roformer', result),
+            };
+        }
+
+        let accompanimentStem: string | undefined;
+        if (report?.inst_file && fs.existsSync(report.inst_file)) {
+            accompanimentStem = report.inst_file;
+        } else {
+            accompanimentStem = this.findStemFile(
+                outputDir,
+                ['accompaniment_roformer', 'instrumental', 'accompaniment', 'no_vocals', 'others'],
+                { allowAnyWavFallback: false },
+            );
+        }
+
+        const vocalCopyPath = path.join(vocalDir, `vocal_roformer_${Date.now()}.wav`);
+        fs.copyFileSync(vocalStem, vocalCopyPath);
+
+        let accompanimentCopyPath: string | undefined;
+        if (accompanimentStem) {
+            accompanimentCopyPath = path.join(accompanimentDir, `accompaniment_roformer_${Date.now()}.wav`);
+            fs.copyFileSync(accompanimentStem, accompanimentCopyPath);
+        }
+
+        const warnings: string[] = [];
+        if (runner.warning) warnings.push(runner.warning);
+        if (ffmpegTools.warning) warnings.push(ffmpegTools.warning);
+        if (report?.model) warnings.push(`Roformer model: ${report.model}`);
+        const runtimeInfo = this.formatAudioSeparatorRuntimeInfo(report);
+        if (runtimeInfo) warnings.push(runtimeInfo);
+        if (!result.success) warnings.push(`Roformer exited with code ${result.code}, but stem files were produced and reused.`);
+        if (!accompanimentCopyPath) warnings.push('Roformer extracted vocals but accompaniment stem was not found.');
+
+        return {
+            success: true,
+            method: 'roformer',
             vocalWavPath: vocalCopyPath,
             accompanimentWavPath: accompanimentCopyPath,
             warning: warnings.length > 0 ? warnings.join(' ') : undefined,
@@ -2269,15 +2660,21 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             }
         }
 
-        const probe = await this.runCommand(venvPython, ['-c', 'from audio_separator.separator import Separator; print("ok")'], {
-            timeoutMs: 30_000,
-        });
-        if (probe.success) {
+        const hasNvidiaGpu = await this.hasNvidiaGpuAvailable();
+        const probe = await this.probeAudioSeparatorRuntime(venvPython);
+        const probeSummary = this.summarizeAudioSeparatorProbe(probe);
+        if (probe.success && (!hasNvidiaGpu || this.audioSeparatorProbeUsesGpu(probe))) {
             return {
                 success: true,
                 pythonExe: venvPython,
-                warning: warnings.length > 0 ? warnings.join(' ') : undefined,
+                warning: [...warnings, probeSummary].filter(Boolean).join(' ') || undefined,
             };
+        }
+        if (probe.success && hasNvidiaGpu) {
+            warnings.push('Detected CPU-only audio-separator runtime on a CUDA-capable machine. Upgrading runtime to GPU stack.');
+            if (probeSummary) {
+                warnings.push(`Previous runtime: ${probeSummary}`);
+            }
         }
 
         const pipCheck = await this.runCommand(venvPython, ['-m', 'pip', '--version'], {
@@ -2298,9 +2695,7 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         await this.runCommand(venvPython, ['-m', 'pip', 'install', '-U', 'pip', 'setuptools', 'wheel'], {
             timeoutMs: 10 * 60 * 1000,
         });
-        const install = await this.runCommand(venvPython, ['-m', 'pip', 'install', '-U', 'audio-separator'], {
-            timeoutMs: 60 * 60 * 1000,
-        });
+        const install = await this.installAudioSeparatorRuntimeDependencies(venvPython);
         if (!install.success) {
             return {
                 success: false,
@@ -2308,22 +2703,281 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             };
         }
 
-        const verify = await this.runCommand(venvPython, ['-c', 'from audio_separator.separator import Separator; print("ok")'], {
-            timeoutMs: 30_000,
-        });
+        const verify = await this.probeAudioSeparatorRuntime(venvPython);
         if (!verify.success) {
             return {
                 success: false,
-                error: 'UVR Ultimate installation completed but audio_separator import failed.',
+                error: `UVR Ultimate installation completed but Separator import failed: ${this.takeTail(verify.stderr || verify.stdout, 700)}`,
             };
         }
 
+        const verifySummary = this.summarizeAudioSeparatorProbe(verify);
         warnings.push('UVR Ultimate runtime was auto-installed into isolated environment.');
         return {
             success: true,
             pythonExe: venvPython,
-            warning: warnings.join(' '),
+            warning: [...warnings, verifySummary].filter(Boolean).join(' '),
         };
+    }
+
+    private async resolveRoformerRuntime(): Promise<{
+        success: boolean;
+        pythonExe?: string;
+        env?: NodeJS.ProcessEnv;
+        warning?: string;
+        error?: string;
+    }> {
+        const runtimeRoot = path.join(this.baseDir, 'runtime');
+        const venvRoot = path.join(runtimeRoot, 'roformer_venv');
+        const venvPython = path.join(venvRoot, 'Scripts', 'python.exe');
+        fs.mkdirSync(runtimeRoot, { recursive: true });
+        const warnings: string[] = [];
+
+        if (!fs.existsSync(venvPython)) {
+            const manifest = this.loadRvcManifest();
+            const manifestPython = manifest?.pythonPath ? this.resolvePythonExecutable(manifest.pythonPath) : null;
+            const systemPython = await this.resolveExecutable('python');
+            const basePython = systemPython || manifestPython;
+            if (!basePython) {
+                return {
+                    success: false,
+                    error: 'Python runtime not found. Install Python 3 and make it available in PATH.',
+                };
+            }
+
+            const createVenv = await this.createIsolatedVenv(venvRoot, basePython);
+            if (!createVenv.success || !fs.existsSync(venvPython)) {
+                return {
+                    success: false,
+                    error: `Failed to create Roformer runtime: ${createVenv.error || 'unknown'}`,
+                };
+            }
+            if (createVenv.warning) {
+                warnings.push(createVenv.warning);
+            }
+        }
+
+        const hasNvidiaGpu = await this.hasNvidiaGpuAvailable();
+        const probe = await this.probeAudioSeparatorRuntime(venvPython);
+        const probeSummary = this.summarizeAudioSeparatorProbe(probe);
+        if (probe.success && (!hasNvidiaGpu || this.audioSeparatorProbeUsesGpu(probe))) {
+            return {
+                success: true,
+                pythonExe: venvPython,
+                warning: [...warnings, probeSummary].filter(Boolean).join(' ') || undefined,
+            };
+        }
+        if (probe.success && hasNvidiaGpu) {
+            warnings.push('Detected CPU-only audio-separator runtime on a CUDA-capable machine. Upgrading runtime to GPU stack.');
+            if (probeSummary) {
+                warnings.push(`Previous runtime: ${probeSummary}`);
+            }
+        }
+
+        const pipCheck = await this.runCommand(venvPython, ['-m', 'pip', '--version'], {
+            timeoutMs: 20_000,
+        });
+        if (!pipCheck.success) {
+            const ensurePip = await this.runCommand(venvPython, ['-m', 'ensurepip', '--upgrade'], {
+                timeoutMs: 3 * 60 * 1000,
+            });
+            if (!ensurePip.success) {
+                return {
+                    success: false,
+                    error: `pip is unavailable in Roformer runtime: ${this.takeTail(ensurePip.stderr || ensurePip.stdout, 700)}`,
+                };
+            }
+        }
+
+        await this.runCommand(venvPython, ['-m', 'pip', 'install', '-U', 'pip', 'setuptools', 'wheel'], {
+            timeoutMs: 10 * 60 * 1000,
+        });
+        const install = await this.installAudioSeparatorRuntimeDependencies(venvPython);
+        if (!install.success) {
+            return {
+                success: false,
+                error: `Failed to install Roformer runtime: ${this.takeTail(install.stderr || install.stdout, 900)}`,
+            };
+        }
+
+        const verify = await this.probeAudioSeparatorRuntime(venvPython);
+        if (!verify.success) {
+            return {
+                success: false,
+                error: `Roformer installation completed but Separator import failed: ${this.takeTail(verify.stderr || verify.stdout, 700)}`,
+            };
+        }
+
+        const verifySummary = this.summarizeAudioSeparatorProbe(verify);
+        warnings.push('Roformer runtime was auto-installed into isolated environment.');
+        return {
+            success: true,
+            pythonExe: venvPython,
+            warning: [...warnings, verifySummary].filter(Boolean).join(' '),
+        };
+    }
+
+    private probeAudioSeparatorRuntime(pythonExe: string): Promise<CommandResult> {
+        return this.runCommand(pythonExe, ['-c', [
+            'import torch',
+            'import onnxruntime as ort',
+            'preload = getattr(ort, "preload_dlls", None)',
+            'if preload: preload()',
+            'from audio_separator.separator import Separator',
+            'print("ok")',
+            'print("torch_cuda=" + str(torch.cuda.is_available()))',
+            'print("ort_providers=" + ",".join(ort.get_available_providers()))',
+        ].join('\n')], {
+            timeoutMs: 30_000,
+        });
+    }
+
+    private parseAudioSeparatorProbe(probe: Pick<CommandResult, 'stdout' | 'stderr'>): {
+        torchCuda?: boolean;
+        providers: string[];
+    } {
+        const output = [probe.stdout || '', probe.stderr || ''].filter(Boolean).join('\n');
+        const torchCudaMatch = output.match(/torch_cuda=(true|false)/i);
+        const providerMatch = output.match(/ort_providers=([^\r\n]+)/i);
+        return {
+            torchCuda: torchCudaMatch ? /^true$/i.test(torchCudaMatch[1]) : undefined,
+            providers: providerMatch
+                ? providerMatch[1].split(',').map((value) => value.trim()).filter(Boolean)
+                : [],
+        };
+    }
+
+    private audioSeparatorProbeUsesGpu(probe: Pick<CommandResult, 'stdout' | 'stderr'>): boolean {
+        const parsed = this.parseAudioSeparatorProbe(probe);
+        return parsed.torchCuda === true && parsed.providers.some((provider) => /CUDAExecutionProvider/i.test(provider));
+    }
+
+    private summarizeAudioSeparatorProbe(probe: Pick<CommandResult, 'stdout' | 'stderr'>): string | undefined {
+        const parsed = this.parseAudioSeparatorProbe(probe);
+        const parts: string[] = [];
+        if (typeof parsed.torchCuda === 'boolean') {
+            parts.push(`torch_cuda=${parsed.torchCuda}`);
+        }
+        if (parsed.providers.length > 0) {
+            parts.push(`providers=${parsed.providers.join('/')}`);
+        }
+        return parts.length > 0 ? `Audio-separator runtime: ${parts.join(', ')}` : undefined;
+    }
+
+    private formatAudioSeparatorRuntimeInfo(report: {
+        torch_cuda?: boolean;
+        ort_providers?: string[];
+        torch_device?: string;
+        onnx_provider?: string[] | string;
+    } | null | undefined): string | undefined {
+        if (!report) {
+            return undefined;
+        }
+        const parts: string[] = [];
+        if (typeof report.torch_cuda === 'boolean') {
+            parts.push(`torch_cuda=${report.torch_cuda}`);
+        }
+        if (report.torch_device) {
+            parts.push(`torch_device=${report.torch_device}`);
+        }
+        const onnxProvider = Array.isArray(report.onnx_provider)
+            ? report.onnx_provider.join('/')
+            : report.onnx_provider;
+        if (onnxProvider) {
+            parts.push(`onnx_provider=${onnxProvider}`);
+        }
+        if (report.ort_providers && report.ort_providers.length > 0) {
+            parts.push(`providers=${report.ort_providers.join('/')}`);
+        }
+        return parts.length > 0 ? `Audio-separator execution: ${parts.join(', ')}` : undefined;
+    }
+
+    private async installAudioSeparatorRuntimeDependencies(pythonExe: string): Promise<CommandResult> {
+        const installAudioSeparator = await this.runCommand(pythonExe, ['-m', 'pip', 'install', '-U', 'audio-separator'], {
+            timeoutMs: 60 * 60 * 1000,
+        });
+        if (!installAudioSeparator.success) {
+            return installAudioSeparator;
+        }
+
+        if (await this.hasNvidiaGpuAvailable()) {
+            const installOnnxRuntimeGpu = await this.runCommand(pythonExe, ['-m', 'pip', 'install', '-U', 'onnxruntime-gpu'], {
+                timeoutMs: 45 * 60 * 1000,
+            });
+            if (installOnnxRuntimeGpu.success) {
+                const verifyGpuProbe = await this.probeAudioSeparatorRuntime(pythonExe);
+                if (verifyGpuProbe.success && this.audioSeparatorProbeUsesGpu(verifyGpuProbe)) {
+                    return installOnnxRuntimeGpu;
+                }
+            }
+            const installGpuStack = await this.installGpuAudioSeparatorRuntimeDependencies(pythonExe);
+            if (installGpuStack.success) {
+                return installGpuStack;
+            }
+        }
+
+        const probeAfterBaseInstall = await this.probeAudioSeparatorRuntime(pythonExe);
+        if (probeAfterBaseInstall.success) {
+            return installAudioSeparator;
+        }
+
+        const missingOnnxRuntime = /No module named ['"]onnxruntime['"]/i.test(
+            `${probeAfterBaseInstall.stderr}\n${probeAfterBaseInstall.stdout}`,
+        );
+        if (!missingOnnxRuntime) {
+            return probeAfterBaseInstall;
+        }
+
+        const installOnnxRuntime = await this.runCommand(pythonExe, ['-m', 'pip', 'install', '-U', 'onnxruntime'], {
+            timeoutMs: 30 * 60 * 1000,
+        });
+        if (!installOnnxRuntime.success) {
+            return installOnnxRuntime;
+        }
+
+        const verify = await this.probeAudioSeparatorRuntime(pythonExe);
+        if (verify.success) {
+            return installOnnxRuntime;
+        }
+        return verify;
+    }
+
+    private async installGpuAudioSeparatorRuntimeDependencies(pythonExe: string): Promise<CommandResult> {
+        await this.runCommand(pythonExe, ['-m', 'pip', 'uninstall', '-y', 'onnxruntime', 'onnxruntime-gpu'], {
+            timeoutMs: 5 * 60 * 1000,
+        });
+        const installTorch = await this.runCommand(pythonExe, [
+            '-m', 'pip', 'install', '--upgrade', '--force-reinstall',
+            'torch', 'torchvision',
+            '--index-url', AUDIO_SEPARATOR_TORCH_CUDA_INDEX_URL,
+        ], {
+            timeoutMs: 120 * 60 * 1000,
+        });
+        if (!installTorch.success) {
+            return installTorch;
+        }
+
+        const installOnnxRuntimeGpu = await this.runCommand(pythonExe, ['-m', 'pip', 'install', '-U', 'onnxruntime-gpu'], {
+            timeoutMs: 45 * 60 * 1000,
+        });
+        if (!installOnnxRuntimeGpu.success) {
+            return installOnnxRuntimeGpu;
+        }
+
+        const verify = await this.probeAudioSeparatorRuntime(pythonExe);
+        if (verify.success) {
+            return installOnnxRuntimeGpu;
+        }
+        return verify;
+    }
+
+    private async hasNvidiaGpuAvailable(): Promise<boolean> {
+        const nvidiaSmi = await this.resolveExecutable('nvidia-smi');
+        if (!nvidiaSmi) {
+            return false;
+        }
+        const probe = await this.runCommand(nvidiaSmi, ['-L'], { timeoutMs: 15_000 });
+        return probe.success && /GPU\s+\d+:/i.test(probe.stdout || '');
     }
 
     private async resolveDemucsRunner(): Promise<{
@@ -2688,6 +3342,7 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         sourceAudioPath?: string,
         accompanimentWavPath?: string,
         alternativeCandidates: SeparationQualityCandidate[] = [],
+        primaryMethod?: SeparationMethod,
     ): Promise<{ vocalWavPath?: string; warning?: string }> {
         const sourcePath = String(vocalWavPath || '').trim();
         if (!sourcePath || !fs.existsSync(sourcePath)) {
@@ -2779,11 +3434,12 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         }
 
         if (analysisPrepared && alternativeCandidates.length > 0) {
-            const altCandidate = alternativeCandidates.find((candidate) => {
+            const usableAlternativeCandidates = alternativeCandidates.filter((candidate) => {
                 const p = String(candidate?.vocalWavPath || '').trim();
                 return !!p && fs.existsSync(p) && path.resolve(p) !== path.resolve(sourcePath);
             });
-            if (altCandidate) {
+            let ensembleApplied = false;
+            for (const altCandidate of usableAlternativeCandidates) {
                 const altMonoPath = path.join(analysisDir, `vocal_alt_${altCandidate.method}_${stamp}.wav`);
                 const altPrepared = await this.runCommand(ffmpegTools.ffmpegPath, [
                     '-y',
@@ -2819,6 +3475,10 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                         const beforeLeak = preparedAccMonoPath && fs.existsSync(preparedAccMonoPath)
                             ? SeparationQualityLibrary.estimateLeakageCorrelation(preparedVocalMonoPath, preparedAccMonoPath)
                             : 0;
+                        const beforeLowBandLeak = preparedAccMonoPath && fs.existsSync(preparedAccMonoPath)
+                            ? SeparationQualityLibrary.estimateLowBandLeakageCorrelation(preparedVocalMonoPath, preparedAccMonoPath)
+                            : beforeLeak;
+                        const beforeHighRoughness = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(preparedVocalMonoPath);
                         const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
 
                         const ensembleSummary = SeparationQualityLibrary.mergeVocalCandidatesWithReferenceMonoPcm16Wav(
@@ -2833,24 +3493,38 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                         const afterLeak = preparedAccMonoPath && fs.existsSync(preparedAccMonoPath)
                             ? SeparationQualityLibrary.estimateLeakageCorrelation(ensemblePath, preparedAccMonoPath)
                             : 0;
+                        const afterLowBandLeak = preparedAccMonoPath && fs.existsSync(preparedAccMonoPath)
+                            ? SeparationQualityLibrary.estimateLowBandLeakageCorrelation(ensemblePath, preparedAccMonoPath)
+                            : afterLeak;
+                        const afterHighRoughness = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(ensemblePath);
                         const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
-
-                        const improved = (
-                            afterScore.score >= beforeScore.score + 1.0
-                            || afterLeak <= beforeLeak - 0.02
-                            || (afterScore.score >= beforeScore.score - 0.5 && afterMetrics.lowBandRatio <= beforeMetrics.lowBandRatio - 0.02)
+                        const improved = this.shouldAdoptVocalEnsemble(
+                            primaryMethod,
+                            altCandidate.method,
+                            beforeMetrics,
+                            afterMetrics,
+                            beforeScore,
+                            afterScore,
+                            beforeLeak,
+                            afterLeak,
+                            beforeLowBandLeak,
+                            afterLowBandLeak,
+                            beforeHighRoughness,
+                            afterHighRoughness,
                         );
 
                         if (improved) {
                             cleanupInputPath = ensemblePath;
                             leakageForCleanupTuning = afterLeak;
                             enhancementNotes.push(
-                                `Vocal ensemble applied (${path.basename(sourcePath)} + ${altCandidate.method}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, corr=${ensembleSummary.avgInterCandidateCorrelation.toFixed(3)}, w=${ensembleSummary.avgPrimaryWeight.toFixed(2)}/${ensembleSummary.avgSecondaryWeight.toFixed(2)}).`,
+                                `Vocal ensemble applied (${primaryMethod || 'primary'} + ${altCandidate.method}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}, rough ${beforeHighRoughness.toFixed(4)}->${afterHighRoughness.toFixed(4)}, corr=${ensembleSummary.avgInterCandidateCorrelation.toFixed(3)}, w=${ensembleSummary.avgPrimaryWeight.toFixed(2)}/${ensembleSummary.avgSecondaryWeight.toFixed(2)}).`,
                             );
+                            ensembleApplied = true;
+                            break;
                         } else {
                             try { if (fs.existsSync(ensemblePath)) fs.unlinkSync(ensemblePath); } catch {}
                             enhancementNotes.push(
-                                `Vocal ensemble not adopted (${altCandidate.method}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}).`,
+                                `Vocal ensemble not adopted (${primaryMethod || 'primary'} + ${altCandidate.method}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}, rough ${beforeHighRoughness.toFixed(4)}->${afterHighRoughness.toFixed(4)}).`,
                             );
                         }
                     } catch (error) {
@@ -2862,7 +3536,11 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                         `Vocal ensemble skipped (${altCandidate.method} mono conversion failed: ${this.takeTail(altPrepared.stderr || altPrepared.stdout, 220)}).`,
                     );
                 }
-            } else {
+                if (ensembleApplied) {
+                    break;
+                }
+            }
+            if (!ensembleApplied && usableAlternativeCandidates.length === 0) {
                 enhancementNotes.push('Vocal ensemble skipped (no usable alternative candidate).');
             }
         }

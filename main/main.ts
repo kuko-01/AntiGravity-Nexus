@@ -3337,7 +3337,7 @@ const buildSingingLearningResultMessage = (result: {
     vocalWavPath?: string;
     accompanimentWavPath?: string;
     datasetInputPath?: string;
-    method?: 'uvr-ultimate' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+    method?: 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
     warning?: string;
     error?: string;
 }): string => {
@@ -3439,25 +3439,36 @@ const ensureVoiceServersForCharacter = async (
     return { success: true };
 };
 
-ipcMain.handle('character-chat-send', async (_event, request: CharacterChatRequest) => {
+ipcMain.handle('character-chat-send', async (event, request: CharacterChatRequest) => {
     try {
         const learningMode = request.learning?.singingTrainingMode === true;
         if (learningMode) {
             const learningService = SingingLearningService.getInstance(ttsResourcesPath);
             const youtubeUrl = learningService.extractYouTubeUrl(request.text || '');
             if (youtubeUrl) {
+                const sessionId = request.sessionId || `char_learning_${Date.now()}`;
                 console.log('[SingingLearning]', JSON.stringify({
                     phase: 'start',
                     characterId: request.characterId || 'default',
                     sourceUrl: youtubeUrl,
                 }));
+                event.sender.send('singing-learning-progress', {
+                    sessionId,
+                    stage: 'start',
+                    message: '歌唱学習ジョブを開始しました...',
+                    percent: 1,
+                });
                 const ingestResult = await learningService.ingestFromYouTube({
                     characterId: request.characterId || 'default',
                     sourceUrl: youtubeUrl,
                     separationPreference: request.learning?.separationPreference,
                     ytDlpCookiesFile: request.learning?.ytDlpCookiesFile,
+                }, (progress) => {
+                    event.sender.send('singing-learning-progress', {
+                        sessionId,
+                        ...progress,
+                    });
                 });
-                const sessionId = request.sessionId || `char_learning_${Date.now()}`;
                 const responseText = buildSingingLearningResultMessage(ingestResult);
                 console.log('[SingingLearning]', JSON.stringify({
                     phase: 'end',
@@ -3466,6 +3477,14 @@ ipcMain.handle('character-chat-send', async (_event, request: CharacterChatReque
                     warning: ingestResult.warning || null,
                     error: ingestResult.error || null,
                 }));
+                event.sender.send('singing-learning-progress', {
+                    sessionId,
+                    stage: ingestResult.success ? 'done' : 'error',
+                    message: ingestResult.success
+                        ? `歌唱学習の取り込みが完了しました。(${ingestResult.method || 'unknown'})`
+                        : `歌唱学習に失敗しました: ${ingestResult.error || '不明'}`,
+                    percent: 100,
+                });
                 return {
                     success: true,
                     sessionId,

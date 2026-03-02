@@ -6,21 +6,32 @@ import AdmZip from 'adm-zip';
 import { Sbv2Service } from './tts/Sbv2Service';
 import {
     SeparationMixtureConsistencyEstimate,
+    SeparationPerceptualQualityMetrics,
     SeparationQualityLibrary,
     SeparationStemQualityMetrics,
     SeparationStemQualityScore,
 } from './audio/SeparationQualityLibrary';
 
 const AUDIO_SEPARATOR_TORCH_CUDA_INDEX_URL = 'https://download.pytorch.org/whl/cu126';
+const DNSMOS_PRIMARY_MODEL_URL = 'https://raw.githubusercontent.com/microsoft/DNS-Challenge/master/DNSMOS/DNSMOS/sig_bak_ovr.onnx';
+const DNSMOS_P808_MODEL_URL = 'https://raw.githubusercontent.com/microsoft/DNS-Challenge/master/DNSMOS/DNSMOS/model_v8.onnx';
 
 type SeparationMethod = 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
 type SeparationPreference = 'auto' | SeparationMethod;
+type SingingLearningExportPreset = 'training_bright' | 'remix_clear';
 
 export interface SingingLearningIngestParams {
     characterId: string;
     sourceUrl: string;
     separationPreference?: SeparationPreference;
+    exportPresets?: SingingLearningExportPreset[];
     ytDlpCookiesFile?: string;
+}
+
+export interface SingingLearningComparisonExportResult {
+    preset: SingingLearningExportPreset;
+    wavPath: string;
+    warning?: string;
 }
 
 export interface SingingLearningIngestResult {
@@ -33,6 +44,7 @@ export interface SingingLearningIngestResult {
     accompanimentWavPath?: string;
     datasetInputPath?: string;
     method?: SeparationMethod;
+    comparisonExports?: SingingLearningComparisonExportResult[];
     warning?: string;
     error?: string;
 }
@@ -123,8 +135,23 @@ interface ScoredSeparationCandidate {
     candidate: SeparationQualityCandidate;
     score: SeparationStemQualityScore;
     vocalMetrics: SeparationStemQualityMetrics;
+    perceptualMetrics: SeparationPerceptualQualityMetrics;
+    dnsmos?: DnsmosInferenceResult;
     mixtureConsistency?: SeparationMixtureConsistencyEstimate;
+    baseScore: number;
+    priorAdjustment: number;
+    mixAdjustment: number;
+    perceptualAdjustment: number;
+    dnsmosAdjustment: number;
+    preservationAdjustment: number;
     finalScore: number;
+}
+
+interface DnsmosInferenceResult {
+    ovrl: number;
+    sig: number;
+    bak: number;
+    p808: number;
 }
 
 interface PersistentMethodSeparationProfile {
@@ -547,6 +574,7 @@ export class SingingLearningService {
 
         let sourceAudioPath = downloaded.audioPath;
         const separationPreference = this.normalizeSeparationPreference(params.separationPreference);
+        const exportPresets = this.normalizeExportPresets(params.exportPresets);
         const separationPlan = this.buildSeparationPlan(separationPreference, characterId);
         const preWarnings: string[] = [];
         if (downloaded.warning) {
@@ -704,6 +732,7 @@ export class SingingLearningService {
         fs.copyFileSync(separation.vocalWavPath, trainingCopyPath);
 
         let datasetInputPath: string | undefined;
+        let comparisonExports: SingingLearningComparisonExportResult[] | undefined;
         try {
             report('dataset', '学習素材を登録中...', 94);
             datasetInputPath = await this.copyToSbv2DatasetInput(characterId, trainingCopyPath);
@@ -724,6 +753,20 @@ export class SingingLearningService {
             };
         }
 
+        if (exportPresets.length > 0) {
+            report('export', '比較用エクスポートを生成中...', 97);
+            const renderedExports = await this.renderComparisonExports({
+                runDir,
+                canonicalVocalWavPath: separation.vocalWavPath,
+                accompanimentWavPath: separation.accompanimentWavPath,
+                presets: exportPresets,
+            });
+            comparisonExports = renderedExports.exports;
+            if (renderedExports.warning) {
+                separation.warning = [separation.warning, renderedExports.warning].filter(Boolean).join(' ') || undefined;
+            }
+        }
+
         this.writeRunMetadata(runDir, {
             sourceUrl,
             characterId,
@@ -733,6 +776,7 @@ export class SingingLearningService {
             datasetInputPath,
             method: separation.method,
             separationPreference,
+            comparisonExports,
             createdAt: new Date().toISOString(),
         });
 
@@ -747,6 +791,7 @@ export class SingingLearningService {
             accompanimentWavPath: separation.accompanimentWavPath,
             datasetInputPath,
             method: separation.method,
+            comparisonExports,
             warning: [...preWarnings, separation.warning].filter(Boolean).join(' ') || undefined,
         };
     }
@@ -1034,6 +1079,20 @@ export class SingingLearningService {
         return 'auto';
     }
 
+    private normalizeExportPresets(
+        presets: readonly SingingLearningExportPreset[] | undefined,
+    ): SingingLearningExportPreset[] {
+        const normalized: SingingLearningExportPreset[] = [];
+        for (const preset of presets || []) {
+            if (preset === 'training_bright' || preset === 'remix_clear') {
+                if (!normalized.includes(preset)) {
+                    normalized.push(preset);
+                }
+            }
+        }
+        return normalized;
+    }
+
     private buildSeparationPlan(preference: SeparationPreference, characterId: string): SeparationMethod[] {
         const defaultPlan: SeparationMethod[] = ['uvr-ultimate', 'roformer', 'demucs', 'uvr5', 'ffmpeg-fallback'];
         if (preference === 'auto') {
@@ -1088,6 +1147,16 @@ export class SingingLearningService {
                 const finalScoreDiff = b.finalScore - a.finalScore;
                 if (Math.abs(finalScoreDiff) > 0.15) {
                     return finalScoreDiff;
+                }
+
+                const artifactDiff = a.perceptualMetrics.artifactScore - b.perceptualMetrics.artifactScore;
+                if (Math.abs(artifactDiff) > 0.025) {
+                    return artifactDiff;
+                }
+
+                const reverbDiff = a.perceptualMetrics.reverbTailRatio - b.perceptualMetrics.reverbTailRatio;
+                if (Math.abs(reverbDiff) > 0.03) {
+                    return reverbDiff;
                 }
 
                 const aLeak = typeof a.score.leakageCorrelation === 'number' ? a.score.leakageCorrelation : 0.999;
@@ -1262,6 +1331,12 @@ export class SingingLearningService {
         const analysisDir = path.join(runDir, 'analysis');
         fs.mkdirSync(analysisDir, { recursive: true });
         const analysisWarnings: string[] = [];
+        const dnsmosRuntime = await this.resolveDnsmosRuntime();
+        if (!dnsmosRuntime.success && dnsmosRuntime.error) {
+            analysisWarnings.push(`dnsmos_unavailable(${dnsmosRuntime.error})`);
+        } else if (dnsmosRuntime.warning) {
+            analysisWarnings.push(dnsmosRuntime.warning);
+        }
         let mixtureAnalysisPath: string | undefined;
         const sourcePath = String(sourceAudioPath || '').trim();
         if (sourcePath && fs.existsSync(sourcePath)) {
@@ -1290,6 +1365,8 @@ export class SingingLearningService {
 
             try {
                 const vocalMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(vocalAnalysisPath);
+                const perceptualMetrics = SeparationQualityLibrary.analyzePerceptualQualityMonoPcm16Wav(vocalAnalysisPath);
+                let dnsmos: DnsmosInferenceResult | undefined;
                 let leakageCorrelation: number | undefined;
                 let accompanimentAnalysisPath: string | undefined;
                 if (candidate.accompanimentWavPath && fs.existsSync(candidate.accompanimentWavPath)) {
@@ -1309,6 +1386,27 @@ export class SingingLearningService {
                         );
                     } else {
                         accompanimentAnalysisPath = undefined;
+                    }
+                }
+                if (dnsmosRuntime.success) {
+                    const dnsmosInputPath = path.join(analysisDir, `candidate_${index + 1}_${candidate.method}_vocal_dnsmos.wav`);
+                    const dnsmosPrepared = await this.renderDnsmosInputMonoPcm16(
+                        ffmpegTools.ffmpegPath,
+                        candidate.vocalWavPath,
+                        dnsmosInputPath,
+                    );
+                    if (dnsmosPrepared && fs.existsSync(dnsmosInputPath)) {
+                        const dnsmosResult = await this.computeDnsmosForWav(dnsmosInputPath, dnsmosRuntime);
+                        if (dnsmosResult.success && dnsmosResult.result) {
+                            dnsmos = dnsmosResult.result;
+                            if (dnsmosResult.warning) {
+                                analysisWarnings.push(dnsmosResult.warning);
+                            }
+                        } else if (dnsmosResult.error) {
+                            analysisWarnings.push(`dnsmos_failed(${candidate.method}): ${dnsmosResult.error}`);
+                        }
+                    } else {
+                        analysisWarnings.push(`dnsmos_preprocess_failed(${candidate.method})`);
                     }
                 }
                 const score = SeparationQualityLibrary.scoreFromMetrics(vocalMetrics, leakageCorrelation);
@@ -1345,13 +1443,21 @@ export class SingingLearningService {
                     }
                 }
 
-                const finalScore = this.clampNumber(score.score + prior + mixAdjustment, 0, 100, score.score);
+                const baseScore = this.clampNumber(score.score + prior + mixAdjustment, 0, 100, score.score);
                 scoredCandidates.push({
                     candidate,
                     score,
                     vocalMetrics,
+                    perceptualMetrics,
+                    dnsmos,
                     mixtureConsistency,
-                    finalScore,
+                    baseScore,
+                    priorAdjustment: prior,
+                    mixAdjustment,
+                    perceptualAdjustment: 0,
+                    dnsmosAdjustment: 0,
+                    preservationAdjustment: 0,
+                    finalScore: baseScore,
                 });
             } catch (error) {
                 analysisWarnings.push(
@@ -1372,6 +1478,18 @@ export class SingingLearningService {
                 ].filter(Boolean).join(' '),
                 scoredCandidates: [],
             };
+        }
+
+        for (const entry of scoredCandidates) {
+            entry.perceptualAdjustment = this.calculatePerceptualAdjustment(entry, scoredCandidates);
+            entry.dnsmosAdjustment = this.calculateDnsmosAdjustment(entry, scoredCandidates);
+            entry.preservationAdjustment = this.calculateVocalPreservationAdjustment(entry, scoredCandidates);
+            entry.finalScore = this.clampNumber(
+                entry.baseScore + entry.perceptualAdjustment + entry.dnsmosAdjustment + entry.preservationAdjustment,
+                0,
+                100,
+                entry.baseScore,
+            );
         }
 
         scoredCandidates.sort((a, b) => {
@@ -1413,6 +1531,16 @@ export class SingingLearningService {
                 return highBandDiff;
             }
 
+            const artifactDiff = a.perceptualMetrics.artifactScore - b.perceptualMetrics.artifactScore; // lower is better
+            if (Math.abs(artifactDiff) > 0.02) {
+                return artifactDiff;
+            }
+
+            const reverbDiff = a.perceptualMetrics.reverbTailRatio - b.perceptualMetrics.reverbTailRatio; // lower is better
+            if (Math.abs(reverbDiff) > 0.025) {
+                return reverbDiff;
+            }
+
             // Prefer stronger vocal activity if everything else is similar.
             const speechDiff = b.vocalMetrics.speechActivityRatio - a.vocalMetrics.speechActivityRatio;
             if (Math.abs(speechDiff) > 0.02) {
@@ -1423,11 +1551,11 @@ export class SingingLearningService {
         });
         const best = scoredCandidates[0];
         const ranking = scoredCandidates
-            .map((entry) => `${entry.candidate.method}:${entry.finalScore.toFixed(2)}(raw=${entry.score.score.toFixed(2)},leak=${(entry.score.leakageCorrelation ?? 0).toFixed(3)},low=${entry.vocalMetrics.lowBandRatio.toFixed(2)},mx=${entry.mixtureConsistency?.normalizedError?.toFixed(3) ?? 'n/a'},mlx=${entry.mixtureConsistency?.lowBandResidualRatio?.toFixed(3) ?? 'n/a'})`)
+            .map((entry) => `${entry.candidate.method}:${entry.finalScore.toFixed(2)}(raw=${entry.score.score.toFixed(2)},mixAdj=${entry.mixAdjustment.toFixed(2)},percAdj=${entry.perceptualAdjustment.toFixed(2)},dnsAdj=${entry.dnsmosAdjustment.toFixed(2)},presAdj=${entry.preservationAdjustment.toFixed(2)},leak=${(entry.score.leakageCorrelation ?? 0).toFixed(3)},reverb=${entry.perceptualMetrics.reverbTailRatio.toFixed(3)},artifact=${entry.perceptualMetrics.artifactScore.toFixed(3)},flux=${entry.perceptualMetrics.highBandFluxVariance.toFixed(4)},low=${entry.vocalMetrics.lowBandRatio.toFixed(2)},mx=${entry.mixtureConsistency?.normalizedError?.toFixed(3) ?? 'n/a'},mlx=${entry.mixtureConsistency?.lowBandResidualRatio?.toFixed(3) ?? 'n/a'},speech=${entry.vocalMetrics.speechActivityRatio.toFixed(2)},sil=${entry.vocalMetrics.silenceRatio.toFixed(2)},dnsmos=${entry.dnsmos ? `${entry.dnsmos.ovrl.toFixed(2)}/${entry.dnsmos.sig.toFixed(2)}/${entry.dnsmos.p808.toFixed(2)}` : 'n/a'})`)
             .join(', ');
         const second = scoredCandidates[1];
         const tieBreakUsed = !!second && Math.abs(best.finalScore - second.finalScore) <= 0.25;
-        const scoreDetail = `Selected ${best.candidate.method} by automatic quality ranking (score=${best.finalScore.toFixed(2)}, raw=${best.score.score.toFixed(2)}, leak=${(best.score.leakageCorrelation ?? 0).toFixed(3)}, low=${best.vocalMetrics.lowBandRatio.toFixed(2)}, mixErr=${best.mixtureConsistency?.normalizedError?.toFixed(3) ?? 'n/a'}, lowMixErr=${best.mixtureConsistency?.lowBandResidualRatio?.toFixed(3) ?? 'n/a'}, rms=${best.vocalMetrics.rmsDb.toFixed(2)}dB, speech=${best.vocalMetrics.speechActivityRatio.toFixed(2)}${tieBreakUsed ? ', tie-break=mix/leak/bleed' : ''}).`;
+        const scoreDetail = `Selected ${best.candidate.method} by automatic quality ranking (score=${best.finalScore.toFixed(2)}, raw=${best.score.score.toFixed(2)}, mixAdj=${best.mixAdjustment.toFixed(2)}, perceptualAdj=${best.perceptualAdjustment.toFixed(2)}, dnsAdj=${best.dnsmosAdjustment.toFixed(2)}, preserveAdj=${best.preservationAdjustment.toFixed(2)}, leak=${(best.score.leakageCorrelation ?? 0).toFixed(3)}, reverb=${best.perceptualMetrics.reverbTailRatio.toFixed(3)}, artifact=${best.perceptualMetrics.artifactScore.toFixed(3)}, flux=${best.perceptualMetrics.highBandFluxVariance.toFixed(4)}, low=${best.vocalMetrics.lowBandRatio.toFixed(2)}, mixErr=${best.mixtureConsistency?.normalizedError?.toFixed(3) ?? 'n/a'}, lowMixErr=${best.mixtureConsistency?.lowBandResidualRatio?.toFixed(3) ?? 'n/a'}, rms=${best.vocalMetrics.rmsDb.toFixed(2)}dB, speech=${best.vocalMetrics.speechActivityRatio.toFixed(2)}, silence=${best.vocalMetrics.silenceRatio.toFixed(2)}, dnsmos=${best.dnsmos ? `${best.dnsmos.ovrl.toFixed(2)}/${best.dnsmos.sig.toFixed(2)}/${best.dnsmos.p808.toFixed(2)}` : 'n/a'}${tieBreakUsed ? ', tie-break=mix/leak/bleed/perceptual' : ''}).`;
 
         return {
             candidate: best.candidate,
@@ -1458,6 +1586,527 @@ export class SingingLearningService {
             outputPath,
         ], { timeoutMs: 20 * 60 * 1000 });
         return convert.success && fs.existsSync(outputPath);
+    }
+
+    private async renderDnsmosInputMonoPcm16(
+        ffmpegPath: string,
+        inputPath: string,
+        outputPath: string,
+    ): Promise<boolean> {
+        const convert = await this.runCommand(ffmpegPath, [
+            '-y',
+            '-i', inputPath,
+            '-vn',
+            '-ac', '1',
+            '-ar', '16000',
+            '-c:a', 'pcm_s16le',
+            '-t', '120',
+            outputPath,
+        ], { timeoutMs: 20 * 60 * 1000 });
+        return convert.success && fs.existsSync(outputPath);
+    }
+
+    private getComparisonExportConfig(preset: SingingLearningExportPreset): {
+        filter: string;
+        speechDropLimit: number;
+        roughnessRiseLimit: number;
+        silenceRiseLimit?: number;
+        leakageRiseLimit?: number;
+    } {
+        if (preset === 'training_bright') {
+            return {
+                filter: 'highshelf=f=9000:g=1.5:t=q:w=0.8,alimiter=limit=0.98',
+                speechDropLimit: 0.01,
+                roughnessRiseLimit: 0.0005,
+                silenceRiseLimit: 0.02,
+            };
+        }
+        return {
+            filter: 'highshelf=f=10000:g=2.0:t=q:w=0.8,equalizer=f=2200:t=q:w=1.0:g=1.0,dynaudnorm=f=250:g=7:p=0.95:m=6,alimiter=limit=0.98',
+            speechDropLimit: 0.015,
+            roughnessRiseLimit: 0.0008,
+            leakageRiseLimit: 0.015,
+        };
+    }
+
+    private removeFileIfExists(filePath: string | undefined): void {
+        if (!filePath) {
+            return;
+        }
+        try {
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+            }
+        } catch {
+            // Ignore cleanup failures.
+        }
+    }
+
+    private async analyzeComparisonExportWav(params: {
+        ffmpegPath: string;
+        inputPath: string;
+        analysisPath: string;
+        accompanimentAnalysisPath?: string;
+    }): Promise<{
+        success: boolean;
+        metrics?: SeparationStemQualityMetrics;
+        roughness?: number;
+        leakageCorrelation?: number;
+        error?: string;
+    }> {
+        const prepared = await this.renderAnalysisMonoPcm16(
+            params.ffmpegPath,
+            params.inputPath,
+            params.analysisPath,
+        );
+        if (!prepared || !fs.existsSync(params.analysisPath)) {
+            return {
+                success: false,
+                error: 'analysis preprocess failed',
+            };
+        }
+
+        const metrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(params.analysisPath);
+        const roughness = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(params.analysisPath);
+        const leakageCorrelation = params.accompanimentAnalysisPath && fs.existsSync(params.accompanimentAnalysisPath)
+            ? SeparationQualityLibrary.estimateLeakageCorrelation(params.analysisPath, params.accompanimentAnalysisPath)
+            : undefined;
+
+        return {
+            success: true,
+            metrics,
+            roughness,
+            leakageCorrelation,
+        };
+    }
+
+    private async renderComparisonExports(params: {
+        runDir: string;
+        canonicalVocalWavPath: string;
+        accompanimentWavPath?: string;
+        presets: SingingLearningExportPreset[];
+    }): Promise<{
+        exports: SingingLearningComparisonExportResult[];
+        warning?: string;
+    }> {
+        const presets = this.normalizeExportPresets(params.presets);
+        if (presets.length === 0) {
+            return { exports: [] };
+        }
+
+        const ffmpegTools = await this.ensureFfmpegTools();
+        if (!ffmpegTools.ffmpegPath) {
+            return {
+                exports: [],
+                warning: ffmpegTools.error
+                    ? `Comparison export skipped: ffmpeg unavailable (${ffmpegTools.error}).`
+                    : 'Comparison export skipped: ffmpeg unavailable.',
+            };
+        }
+
+        const enhancedDir = path.join(params.runDir, 'enhanced');
+        const analysisDir = path.join(params.runDir, 'analysis');
+        fs.mkdirSync(enhancedDir, { recursive: true });
+        fs.mkdirSync(analysisDir, { recursive: true });
+
+        const analysisStamp = `${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+        const canonicalAnalysisPath = path.join(analysisDir, `comparison_canonical_${analysisStamp}.wav`);
+        let accompanimentAnalysisPath: string | undefined;
+        const warnings: string[] = [];
+        const exports: SingingLearningComparisonExportResult[] = [];
+
+        const canonicalAnalysis = await this.analyzeComparisonExportWav({
+            ffmpegPath: ffmpegTools.ffmpegPath,
+            inputPath: params.canonicalVocalWavPath,
+            analysisPath: canonicalAnalysisPath,
+        });
+        if (!canonicalAnalysis.success || !canonicalAnalysis.metrics || typeof canonicalAnalysis.roughness !== 'number') {
+            return {
+                exports: [],
+                warning: `Comparison export skipped: canonical analysis failed (${canonicalAnalysis.error || 'unknown error'}).`,
+            };
+        }
+
+        if (params.accompanimentWavPath && fs.existsSync(params.accompanimentWavPath)) {
+            accompanimentAnalysisPath = path.join(analysisDir, `comparison_accompaniment_${analysisStamp}.wav`);
+            const accompanimentPrepared = await this.renderAnalysisMonoPcm16(
+                ffmpegTools.ffmpegPath,
+                params.accompanimentWavPath,
+                accompanimentAnalysisPath,
+            );
+            if (!accompanimentPrepared || !fs.existsSync(accompanimentAnalysisPath)) {
+                accompanimentAnalysisPath = undefined;
+                warnings.push('Comparison export leak guard skipped because accompaniment analysis failed.');
+            }
+        }
+
+        const canonicalLeakage = accompanimentAnalysisPath
+            ? SeparationQualityLibrary.estimateLeakageCorrelation(canonicalAnalysisPath, accompanimentAnalysisPath)
+            : undefined;
+
+        for (const preset of presets) {
+            const config = this.getComparisonExportConfig(preset);
+            const stamp = `${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+            const outputPath = path.join(enhancedDir, `vocal_${preset}_${stamp}.wav`);
+            const outputAnalysisPath = path.join(analysisDir, `comparison_${preset}_${stamp}.wav`);
+            const render = await this.runCommand(ffmpegTools.ffmpegPath, [
+                '-y',
+                '-i', params.canonicalVocalWavPath,
+                '-vn',
+                '-af', config.filter,
+                '-c:a', 'pcm_s16le',
+                outputPath,
+            ], {
+                timeoutMs: 20 * 60 * 1000,
+                env: this.buildEnvWithAdditionalPath(path.dirname(ffmpegTools.ffmpegPath)),
+            });
+
+            if (!render.success || !fs.existsSync(outputPath)) {
+                this.removeFileIfExists(outputPath);
+                warnings.push(`Comparison export skipped (${preset}: ffmpeg filter failed ${this.takeTail(render.stderr || render.stdout, 220) || 'unknown error'}).`);
+                continue;
+            }
+
+            const outputAnalysis = await this.analyzeComparisonExportWav({
+                ffmpegPath: ffmpegTools.ffmpegPath,
+                inputPath: outputPath,
+                analysisPath: outputAnalysisPath,
+                accompanimentAnalysisPath,
+            });
+            if (!outputAnalysis.success || !outputAnalysis.metrics || typeof outputAnalysis.roughness !== 'number') {
+                this.removeFileIfExists(outputPath);
+                warnings.push(`Comparison export skipped (${preset}: ${outputAnalysis.error || 'analysis failed'}).`);
+                continue;
+            }
+
+            const speechDrop = canonicalAnalysis.metrics.speechActivityRatio - outputAnalysis.metrics.speechActivityRatio;
+            const silenceRise = outputAnalysis.metrics.silenceRatio - canonicalAnalysis.metrics.silenceRatio;
+            const roughnessRise = outputAnalysis.roughness - canonicalAnalysis.roughness;
+            const leakageRise = typeof outputAnalysis.leakageCorrelation === 'number' && typeof canonicalLeakage === 'number'
+                ? outputAnalysis.leakageCorrelation - canonicalLeakage
+                : undefined;
+
+            let rejectReason: string | undefined;
+            if (speechDrop > config.speechDropLimit) {
+                rejectReason = `speech regression exceeded threshold (${speechDrop.toFixed(4)}>${config.speechDropLimit.toFixed(4)})`;
+            } else if (typeof config.silenceRiseLimit === 'number' && silenceRise > config.silenceRiseLimit) {
+                rejectReason = `silence regression exceeded threshold (${silenceRise.toFixed(4)}>${config.silenceRiseLimit.toFixed(4)})`;
+            } else if (roughnessRise > config.roughnessRiseLimit) {
+                rejectReason = `roughness regression exceeded threshold (${roughnessRise.toFixed(4)}>${config.roughnessRiseLimit.toFixed(4)})`;
+            } else if (
+                typeof config.leakageRiseLimit === 'number'
+                && typeof leakageRise === 'number'
+                && leakageRise > config.leakageRiseLimit
+            ) {
+                rejectReason = `leakage regression exceeded threshold (${leakageRise.toFixed(4)}>${config.leakageRiseLimit.toFixed(4)})`;
+            }
+
+            if (rejectReason) {
+                this.removeFileIfExists(outputPath);
+                warnings.push(`Comparison export skipped (${preset}: ${rejectReason}).`);
+                continue;
+            }
+
+            const successWarning = [
+                `Comparison export generated (${preset}, speech=${canonicalAnalysis.metrics.speechActivityRatio.toFixed(2)}->${outputAnalysis.metrics.speechActivityRatio.toFixed(2)}, rough=${canonicalAnalysis.roughness.toFixed(4)}->${outputAnalysis.roughness.toFixed(4)}`,
+                typeof canonicalLeakage === 'number' && typeof outputAnalysis.leakageCorrelation === 'number'
+                    ? `, leak=${canonicalLeakage.toFixed(3)}->${outputAnalysis.leakageCorrelation.toFixed(3)}`
+                    : '',
+                ').',
+            ].join('');
+            warnings.push(successWarning);
+            exports.push({
+                preset,
+                wavPath: outputPath,
+                warning: successWarning,
+            });
+        }
+
+        return {
+            exports,
+            warning: [ffmpegTools.warning, ...warnings].filter(Boolean).join(' ') || undefined,
+        };
+    }
+
+    private calculatePerceptualAdjustment(
+        entry: Pick<ScoredSeparationCandidate, 'perceptualMetrics' | 'vocalMetrics' | 'score' | 'mixtureConsistency'>,
+        scoredCandidates: Array<Pick<ScoredSeparationCandidate, 'perceptualMetrics' | 'vocalMetrics' | 'score' | 'mixtureConsistency'>>,
+    ): number {
+        if (scoredCandidates.length <= 1) {
+            return 0;
+        }
+
+        const lowestArtifact = Math.min(...scoredCandidates.map((candidate) => candidate.perceptualMetrics.artifactScore));
+        const lowestReverb = Math.min(...scoredCandidates.map((candidate) => candidate.perceptualMetrics.reverbTailRatio));
+        const bestSpeech = Math.max(...scoredCandidates.map((candidate) => candidate.vocalMetrics.speechActivityRatio));
+        const lowestLeak = Math.min(...scoredCandidates.map((candidate) => candidate.score.leakageCorrelation ?? 0.999));
+
+        const artifact = entry.perceptualMetrics.artifactScore;
+        const reverb = entry.perceptualMetrics.reverbTailRatio;
+        const speech = entry.vocalMetrics.speechActivityRatio;
+        const silence = entry.vocalMetrics.silenceRatio;
+        const leak = entry.score.leakageCorrelation ?? 0.2;
+        const mixErr = entry.mixtureConsistency?.normalizedError;
+
+        const artifactGap = Math.max(0, artifact - lowestArtifact);
+        const reverbGap = Math.max(0, reverb - lowestReverb);
+        let penalty = 0;
+
+        if (artifactGap > 0.04) {
+            penalty += Math.min(12, (artifactGap - 0.04) * 26);
+        }
+        if (artifact > 0.36) {
+            penalty += Math.min(8, (artifact - 0.36) * 18);
+        }
+        if (reverbGap > 0.05) {
+            penalty += Math.min(10, (reverbGap - 0.05) * 24);
+        }
+        if (reverb > 0.24) {
+            penalty += Math.min(6, (reverb - 0.24) * 16);
+        }
+        if (artifact > 0.46 && speech < Math.max(0.46, bestSpeech - 0.08)) {
+            penalty += 4.5;
+        }
+        if (reverb > 0.28 && silence > 0.24) {
+            penalty += 3.5;
+        }
+        if (
+            typeof mixErr === 'number'
+            && mixErr < 0.11
+            && speech < 0.50
+            && artifact > 0.34
+        ) {
+            penalty += 2.5;
+        }
+
+        let boost = 0;
+        if (artifact <= lowestArtifact + 0.03) {
+            boost += Math.min(3.2, Math.max(0, 0.30 - artifact) * 9);
+        }
+        if (reverb <= lowestReverb + 0.03) {
+            boost += Math.min(2.8, Math.max(0, 0.20 - reverb) * 10);
+        }
+        if (artifact < 0.24 && reverb < 0.16) {
+            boost += 1.5;
+        }
+        if (speech >= bestSpeech - 0.02 && leak <= lowestLeak + 0.015) {
+            boost += 1.2;
+        }
+
+        return this.roundNumber(boost - penalty, 2);
+    }
+
+    private calculateDnsmosAdjustment(
+        entry: Pick<ScoredSeparationCandidate, 'dnsmos' | 'vocalMetrics' | 'score'>,
+        scoredCandidates: Array<Pick<ScoredSeparationCandidate, 'dnsmos' | 'vocalMetrics' | 'score'>>,
+    ): number {
+        if (!entry.dnsmos) {
+            return 0;
+        }
+
+        const available = scoredCandidates.filter((candidate) => candidate.dnsmos);
+        if (available.length <= 1) {
+            return 0;
+        }
+
+        const bestOvrl = Math.max(...available.map((candidate) => candidate.dnsmos?.ovrl ?? 0));
+        const bestSig = Math.max(...available.map((candidate) => candidate.dnsmos?.sig ?? 0));
+        const bestP808 = Math.max(...available.map((candidate) => candidate.dnsmos?.p808 ?? 0));
+        const ovrl = entry.dnsmos.ovrl;
+        const sig = entry.dnsmos.sig;
+        const p808 = entry.dnsmos.p808;
+        const speech = entry.vocalMetrics.speechActivityRatio;
+        const leak = entry.score.leakageCorrelation ?? 0.2;
+
+        const ovrlGap = Math.max(0, bestOvrl - ovrl);
+        const sigGap = Math.max(0, bestSig - sig);
+        const p808Gap = Math.max(0, bestP808 - p808);
+
+        let penalty = 0;
+        if (ovrlGap > 0.16) {
+            penalty += Math.min(4.8, (ovrlGap - 0.16) * 8.5);
+        }
+        if (sigGap > 0.16) {
+            penalty += Math.min(4.8, (sigGap - 0.16) * 9.0);
+        }
+        if (p808Gap > 0.18) {
+            penalty += Math.min(3.5, (p808Gap - 0.18) * 6.5);
+        }
+        if (ovrl < 2.55) {
+            penalty += Math.min(3.5, (2.55 - ovrl) * 3.6);
+        }
+        if (sig < 2.65) {
+            penalty += Math.min(3.8, (2.65 - sig) * 3.8);
+        }
+
+        let boost = 0;
+        if (ovrl >= bestOvrl - 0.10) {
+            boost += 1.2;
+        }
+        if (sig >= bestSig - 0.10) {
+            boost += 1.4;
+        }
+        if (p808 >= bestP808 - 0.10) {
+            boost += 0.8;
+        }
+        if (ovrl >= 3.0 && sig >= 3.0) {
+            boost += 0.9;
+        }
+        if (speech >= 0.55 && leak <= 0.10 && ovrl >= 2.9) {
+            boost += 0.6;
+        }
+
+        return this.roundNumber(boost - penalty, 2);
+    }
+
+    private calculateVocalPreservationAdjustment(
+        entry: Pick<ScoredSeparationCandidate, 'score' | 'vocalMetrics' | 'mixtureConsistency'>,
+        scoredCandidates: Array<Pick<ScoredSeparationCandidate, 'score' | 'vocalMetrics' | 'mixtureConsistency'>>,
+    ): number {
+        if (scoredCandidates.length <= 1) {
+            return 0;
+        }
+
+        const bestSpeech = Math.max(...scoredCandidates.map((candidate) => candidate.vocalMetrics.speechActivityRatio));
+        const lowestSilence = Math.min(...scoredCandidates.map((candidate) => candidate.vocalMetrics.silenceRatio));
+        const bestRms = Math.max(...scoredCandidates.map((candidate) => candidate.vocalMetrics.rmsDb));
+
+        // Only apply this guard when at least one candidate appears to preserve continuous singing reasonably well.
+        if (bestSpeech < 0.48) {
+            return 0;
+        }
+
+        const speech = entry.vocalMetrics.speechActivityRatio;
+        const silence = entry.vocalMetrics.silenceRatio;
+        const rmsDb = entry.vocalMetrics.rmsDb;
+        const leak = typeof entry.score.leakageCorrelation === 'number' ? entry.score.leakageCorrelation : 0.2;
+        const mixErr = entry.mixtureConsistency?.normalizedError;
+
+        const speechGap = Math.max(0, bestSpeech - speech);
+        const silenceGap = Math.max(0, silence - lowestSilence);
+        const rmsGap = Math.max(0, bestRms - rmsDb);
+
+        let penalty = 0;
+        if (speechGap > 0.035) {
+            penalty += Math.min(18, (speechGap - 0.035) * 82);
+        }
+        if (speech < 0.52) {
+            penalty += Math.min(8, (0.52 - speech) * 34);
+        }
+        if (silenceGap > 0.035) {
+            penalty += Math.min(10, (silenceGap - 0.035) * 34);
+        }
+        if (silence > 0.27) {
+            penalty += Math.min(7, (silence - 0.27) * 24);
+        }
+        if (rmsGap > 1.3 && rmsDb < -19.2) {
+            penalty += Math.min(8, (rmsGap - 1.3) * 2.6);
+        }
+
+        // Very low reconstruction error with weak speech often indicates over-suppression rather than clean extraction.
+        if (
+            typeof mixErr === 'number'
+            && mixErr < 0.12
+            && leak < 0.14
+            && speech < 0.50
+            && silence > 0.26
+        ) {
+            penalty += 6;
+        }
+
+        let boost = 0;
+        if (speech >= bestSpeech - 0.015) {
+            boost += Math.min(4, Math.max(0, 0.09 - leak) * 45);
+        }
+        if (silence <= lowestSilence + 0.02 && rmsDb >= bestRms - 1.0) {
+            boost += 1.5;
+        }
+
+        return this.roundNumber(boost - penalty, 2);
+    }
+
+    private analyzeCanonicalQaMetrics(filePath: string): {
+        stemMetrics: SeparationStemQualityMetrics;
+        perceptualMetrics: SeparationPerceptualQualityMetrics;
+    } {
+        return {
+            stemMetrics: SeparationQualityLibrary.analyzeMonoPcm16Wav(filePath),
+            perceptualMetrics: SeparationQualityLibrary.analyzePerceptualQualityMonoPcm16Wav(filePath),
+        };
+    }
+
+    private evaluateCanonicalQaSoftFail(metrics: {
+        stemMetrics: SeparationStemQualityMetrics;
+        perceptualMetrics: SeparationPerceptualQualityMetrics;
+    }): { softFail: boolean; reason?: string } {
+        const artifact = metrics.perceptualMetrics.artifactScore;
+        const reverb = metrics.perceptualMetrics.reverbTailRatio;
+        const speech = metrics.stemMetrics.speechActivityRatio;
+        const silence = metrics.stemMetrics.silenceRatio;
+
+        if (artifact > 0.62) {
+            return { softFail: true, reason: `artifactScore=${artifact.toFixed(3)}` };
+        }
+        if (reverb > 0.34) {
+            return { softFail: true, reason: `reverb=${reverb.toFixed(3)}` };
+        }
+        if (artifact > 0.48 && reverb > 0.24) {
+            return { softFail: true, reason: `artifact/reverb=${artifact.toFixed(3)}/${reverb.toFixed(3)}` };
+        }
+        if (artifact > 0.44 && speech < 0.46 && silence > 0.24) {
+            return { softFail: true, reason: `artifact/speech=${artifact.toFixed(3)}/${speech.toFixed(2)}` };
+        }
+        return { softFail: false };
+    }
+
+    private shouldAdoptCanonicalQaFallback(
+        currentMetrics: {
+            stemMetrics: SeparationStemQualityMetrics;
+            perceptualMetrics: SeparationPerceptualQualityMetrics;
+        },
+        fallbackMetrics: {
+            stemMetrics: SeparationStemQualityMetrics;
+            perceptualMetrics: SeparationPerceptualQualityMetrics;
+        },
+    ): boolean {
+        const speechDrop = currentMetrics.stemMetrics.speechActivityRatio - fallbackMetrics.stemMetrics.speechActivityRatio;
+        const silenceRise = fallbackMetrics.stemMetrics.silenceRatio - currentMetrics.stemMetrics.silenceRatio;
+        const artifactImprovement = currentMetrics.perceptualMetrics.artifactScore - fallbackMetrics.perceptualMetrics.artifactScore;
+        const reverbImprovement = currentMetrics.perceptualMetrics.reverbTailRatio - fallbackMetrics.perceptualMetrics.reverbTailRatio;
+        const roughnessImprovement = currentMetrics.perceptualMetrics.highBandRoughness - fallbackMetrics.perceptualMetrics.highBandRoughness;
+
+        const regressionSafe = speechDrop <= 0.028 && silenceRise <= 0.045;
+        if (!regressionSafe) {
+            return false;
+        }
+
+        return (
+            artifactImprovement >= 0.08
+            || reverbImprovement >= 0.07
+            || (artifactImprovement >= 0.05 && reverbImprovement >= 0.03)
+            || (roughnessImprovement >= 0.0006 && artifactImprovement >= 0.03)
+        );
+    }
+
+    private async renderCanonicalQaFallback(
+        ffmpegPath: string,
+        inputPath: string,
+        outputPath: string,
+        filters: string,
+    ): Promise<boolean> {
+        const render = await this.runCommand(ffmpegPath, [
+            '-y',
+            '-i', inputPath,
+            '-vn',
+            '-af', filters,
+            '-ar', '44100',
+            '-ac', '1',
+            outputPath,
+        ], {
+            timeoutMs: 20 * 60 * 1000,
+            env: this.buildEnvWithAdditionalPath(path.dirname(ffmpegPath)),
+        });
+        return render.success && fs.existsSync(outputPath);
     }
 
     private async copyToSbv2DatasetInput(characterId: string, vocalWavPath: string): Promise<string> {
@@ -1933,6 +2582,23 @@ model_file_dir = r'''${modelFileDir.replace(/\\/g, '\\\\')}'''
 dereverb_dir = os.path.join(output_dir, 'dereverb')
 os.makedirs(dereverb_dir, exist_ok=True)
 
+def resolve_output_path(file_path, base_dir):
+    if not file_path:
+        return None
+    candidates = []
+    if os.path.isabs(file_path):
+        candidates.append(file_path)
+    else:
+        candidates.append(file_path)
+        candidates.append(os.path.join(base_dir, file_path))
+        candidates.append(os.path.join(base_dir, os.path.basename(file_path)))
+    for candidate in candidates:
+        absolute_candidate = os.path.abspath(candidate)
+        if os.path.exists(absolute_candidate):
+            return absolute_candidate
+    fallback_name = os.path.basename(file_path)
+    return os.path.abspath(os.path.join(base_dir, fallback_name))
+
 # Stage 1 model candidates ordered by quality (SDR benchmark, 2024-2025)
 # BS-RoFormer ~13 dB > Mel-RoFormer ~10 dB > Kim_Vocal ~9 dB > MDX-Net ~8.5 dB
 vocal_model_candidates = [
@@ -1978,8 +2644,9 @@ for model_name in vocal_model_candidates:
         runtime_info['onnx_provider'] = getattr(sep, 'onnx_execution_provider', None)
         sep.load_model(model_filename=model_name)
         output_files = sep.separate(input_path, output_names)
-        voc = [f for f in output_files if 'vocal' in os.path.basename(f).lower()]
-        inst = [f for f in output_files if any(k in os.path.basename(f).lower() for k in ['instrumental', 'accompaniment', 'no_vocal', 'inst'])]
+        resolved_output_files = [resolve_output_path(f, output_dir) for f in output_files]
+        voc = [f for f in resolved_output_files if f and 'vocal' in os.path.basename(f).lower()]
+        inst = [f for f in resolved_output_files if f and any(k in os.path.basename(f).lower() for k in ['instrumental', 'accompaniment', 'no_vocal', 'inst'])]
         if voc:
             vocal_file = voc[0]
             inst_file = inst[0] if inst else None
@@ -2007,8 +2674,9 @@ for dr_model in dereverb_model_candidates:
         dr_outputs = dr_sep.separate(vocal_file)
         if not dr_outputs:
             continue
-        no_reverb = [f for f in dr_outputs if any(k in os.path.basename(f).lower() for k in ['no reverb', 'noreverb', 'no_reverb', 'dry'])]
-        dereverbed_file = no_reverb[0] if no_reverb else dr_outputs[0]
+        resolved_dr_outputs = [resolve_output_path(f, dereverb_dir) for f in dr_outputs]
+        no_reverb = [f for f in resolved_dr_outputs if f and any(k in os.path.basename(f).lower() for k in ['no reverb', 'noreverb', 'no_reverb', 'dry'])]
+        dereverbed_file = no_reverb[0] if no_reverb else resolved_dr_outputs[0]
         dereverb_model_used = dr_model
         break
     except Exception as ex:
@@ -2118,6 +2786,202 @@ raise SystemExit(0)
             method: 'uvr-ultimate',
             vocalWavPath: vocalCopyPath,
             accompanimentWavPath: accompanimentCopyPath,
+            warning: warnings.length > 0 ? warnings.join(' ') : undefined,
+        };
+    }
+
+    private async tryDereverbVocalStem(
+        inputVocalPath: string,
+        runDir: string,
+    ): Promise<{
+        success: boolean;
+        outputPath?: string;
+        model?: string;
+        warning?: string;
+        error?: string;
+    }> {
+        const runner = await this.resolveUvrUltimateRuntime();
+        if (!runner.success || !runner.pythonExe) {
+            return {
+                success: false,
+                error: runner.error || 'Audio-separator runtime is unavailable for de-reverb.',
+            };
+        }
+
+        const ffmpegTools = await this.ensureFfmpegTools();
+        if (!ffmpegTools.ffmpegPath) {
+            return {
+                success: false,
+                error: ffmpegTools.error || 'ffmpeg not found. De-reverb requires ffmpeg.',
+            };
+        }
+
+        const workDir = path.join(runDir, 'dereverb_work');
+        const outputDir = path.join(workDir, 'output');
+        const modelFileDir = path.join(this.baseDir, 'runtime', 'uvr_ultimate_models');
+        fs.mkdirSync(workDir, { recursive: true });
+        fs.mkdirSync(outputDir, { recursive: true });
+        fs.mkdirSync(modelFileDir, { recursive: true });
+
+        const script = `
+import json
+import os
+import onnxruntime as ort
+preload = getattr(ort, "preload_dlls", None)
+if preload:
+    preload()
+from audio_separator.separator import Separator
+
+input_path = r'''${inputVocalPath.replace(/\\/g, '\\\\')}'''
+output_dir = r'''${outputDir.replace(/\\/g, '\\\\')}'''
+model_file_dir = r'''${modelFileDir.replace(/\\/g, '\\\\')}'''
+os.makedirs(output_dir, exist_ok=True)
+
+def resolve_output_path(file_path, base_dir):
+    if not file_path:
+        return None
+    candidates = []
+    if os.path.isabs(file_path):
+        candidates.append(file_path)
+    else:
+        candidates.append(file_path)
+        candidates.append(os.path.join(base_dir, file_path))
+        candidates.append(os.path.join(base_dir, os.path.basename(file_path)))
+    for candidate in candidates:
+        absolute_candidate = os.path.abspath(candidate)
+        if os.path.exists(absolute_candidate):
+            return absolute_candidate
+    fallback_name = os.path.basename(file_path)
+    return os.path.abspath(os.path.join(base_dir, fallback_name))
+
+model_candidates = [
+    'Reverb_HQ_By_FoxJoy.onnx',
+    'UVR-De-Echo-Normal.pth',
+]
+runtime_info = {
+    'torch_cuda': False,
+    'ort_providers': ort.get_available_providers(),
+    'torch_device': None,
+    'onnx_provider': None,
+}
+errors = []
+
+for model_name in model_candidates:
+    try:
+        sep = Separator(
+            log_level=30,
+            model_file_dir=model_file_dir,
+            output_dir=output_dir,
+            output_format='WAV',
+        )
+        runtime_info['torch_cuda'] = bool(getattr(__import__('torch').cuda, 'is_available')())
+        runtime_info['torch_device'] = str(getattr(sep, 'torch_device', 'unknown'))
+        runtime_info['onnx_provider'] = getattr(sep, 'onnx_execution_provider', None)
+        sep.load_model(model_filename=model_name)
+        output_files = sep.separate(input_path)
+        resolved_output_files = [resolve_output_path(f, output_dir) for f in output_files]
+        dry_outputs = [f for f in resolved_output_files if f and any(k in os.path.basename(f).lower() for k in ['no reverb', 'noreverb', 'no_reverb', 'dry'])]
+        existing_outputs = [f for f in resolved_output_files if f and os.path.exists(f)]
+        best_output = dry_outputs[0] if dry_outputs else (existing_outputs[0] if existing_outputs else None)
+        if best_output:
+            print(json.dumps({
+                'ok': True,
+                'model': model_name,
+                'output_file': best_output,
+                **runtime_info,
+            }, ensure_ascii=False))
+            raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as ex:
+        errors.append({'model': model_name, 'error': str(ex)})
+
+print(json.dumps({
+    'ok': False,
+    'errors': errors,
+    **runtime_info,
+}, ensure_ascii=False))
+raise SystemExit(1)
+`.trim();
+
+        const result = await this.runCommand(runner.pythonExe, ['-c', script], {
+            cwd: workDir,
+            env: runner.env || process.env,
+            timeoutMs: 90 * 60 * 1000,
+        });
+
+        try {
+            const logPath = path.join(workDir, `dereverb_${Date.now()}.log`);
+            const payload = [
+                `code=${result.code}`,
+                '',
+                '[stderr]',
+                result.stderr || '',
+                '',
+                '[stdout]',
+                result.stdout || '',
+            ].join('\n');
+            fs.writeFileSync(logPath, payload, 'utf-8');
+        } catch {
+            // Ignore log write failures.
+        }
+
+        const report = this.tryParseLastJsonLine<{
+            ok?: boolean;
+            model?: string;
+            output_file?: string;
+            torch_cuda?: boolean;
+            ort_providers?: string[];
+            torch_device?: string;
+            onnx_provider?: string[] | string;
+        }>(result.stdout || '');
+
+        const rawOutputPath = report?.output_file && fs.existsSync(report.output_file)
+            ? report.output_file
+            : this.findStemFile(outputDir, ['no_reverb', 'noreverb', 'dry', 'vocals'], { allowAnyWavFallback: true });
+        if (!rawOutputPath) {
+            const details = this.takeTail([result.stderr, result.stdout].filter(Boolean).join('\n'), 900);
+            return {
+                success: false,
+                error: details
+                    ? `De-reverb failed: ${details}`
+                    : this.formatCommandFailure('de-reverb', result),
+            };
+        }
+
+        const enhancedDir = path.join(runDir, 'enhanced');
+        fs.mkdirSync(enhancedDir, { recursive: true });
+        const normalizedOutputPath = path.join(enhancedDir, `vocal_dereverb_${Date.now()}.wav`);
+        const convert = await this.runCommand(ffmpegTools.ffmpegPath, [
+            '-y',
+            '-i', rawOutputPath,
+            '-vn',
+            '-ac', '1',
+            '-ar', '44100',
+            '-c:a', 'pcm_s16le',
+            normalizedOutputPath,
+        ], {
+            timeoutMs: 20 * 60 * 1000,
+            env: this.buildEnvWithAdditionalPath(path.dirname(ffmpegTools.ffmpegPath)),
+        });
+        if (!convert.success || !fs.existsSync(normalizedOutputPath)) {
+            return {
+                success: false,
+                error: `De-reverb normalization failed (${this.takeTail(convert.stderr || convert.stdout, 260) || 'unknown error'}).`,
+            };
+        }
+
+        const warnings: string[] = [];
+        if (runner.warning) warnings.push(runner.warning);
+        if (ffmpegTools.warning) warnings.push(ffmpegTools.warning);
+        const runtimeInfo = this.formatAudioSeparatorRuntimeInfo(report);
+        if (runtimeInfo) warnings.push(runtimeInfo);
+        if (!result.success) warnings.push(`De-reverb exited with code ${result.code}, but output stem was reused.`);
+
+        return {
+            success: true,
+            outputPath: normalizedOutputPath,
+            model: report?.model,
             warning: warnings.length > 0 ? warnings.join(' ') : undefined,
         };
     }
@@ -2817,6 +3681,435 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         };
     }
 
+    private probeDnsmosRuntime(pythonExe: string): Promise<CommandResult> {
+        return this.runCommand(pythonExe, ['-c', [
+            'import numpy',
+            'import onnxruntime as ort',
+            'preload = getattr(ort, "preload_dlls", None)',
+            'if preload: preload()',
+            'print("ok")',
+            'print("providers=" + ",".join(ort.get_available_providers()))',
+        ].join('\n')], {
+            timeoutMs: 30_000,
+        });
+    }
+
+    private parseDnsmosProbe(probe: Pick<CommandResult, 'stdout' | 'stderr'>): {
+        providers: string[];
+    } {
+        const output = [probe.stdout || '', probe.stderr || ''].filter(Boolean).join('\n');
+        const providerMatch = output.match(/providers=([^\r\n]+)/i);
+        return {
+            providers: providerMatch
+                ? providerMatch[1].split(',').map((value) => value.trim()).filter(Boolean)
+                : [],
+        };
+    }
+
+    private dnsmosProbeUsesGpu(probe: Pick<CommandResult, 'stdout' | 'stderr'>): boolean {
+        return this.parseDnsmosProbe(probe).providers.some((provider) => /CUDAExecutionProvider/i.test(provider));
+    }
+
+    private summarizeDnsmosProbe(probe: Pick<CommandResult, 'stdout' | 'stderr'>): string | undefined {
+        const parsed = this.parseDnsmosProbe(probe);
+        if (parsed.providers.length <= 0) {
+            return undefined;
+        }
+        return `DNSMOS runtime: providers=${parsed.providers.join('/')}`;
+    }
+
+    private async ensureDnsmosModels(modelDir: string): Promise<{
+        success: boolean;
+        primaryModelPath?: string;
+        p808ModelPath?: string;
+        warning?: string;
+        error?: string;
+    }> {
+        try {
+            fs.mkdirSync(modelDir, { recursive: true });
+        } catch (error) {
+            return {
+                success: false,
+                error: `Failed to create DNSMOS model directory: ${error instanceof Error ? error.message : String(error)}`,
+            };
+        }
+
+        const primaryModelPath = path.join(modelDir, 'sig_bak_ovr.onnx');
+        const p808ModelPath = path.join(modelDir, 'model_v8.onnx');
+        const warnings: string[] = [];
+
+        if (!fs.existsSync(primaryModelPath)) {
+            const download = await this.downloadFile(DNSMOS_PRIMARY_MODEL_URL, primaryModelPath);
+            if (!download.success || !fs.existsSync(primaryModelPath)) {
+                return {
+                    success: false,
+                    error: `Failed to download DNSMOS primary model: ${download.error || DNSMOS_PRIMARY_MODEL_URL}`,
+                };
+            }
+            warnings.push('DNSMOS primary model was auto-downloaded.');
+        }
+        if (!fs.existsSync(p808ModelPath)) {
+            const download = await this.downloadFile(DNSMOS_P808_MODEL_URL, p808ModelPath);
+            if (!download.success || !fs.existsSync(p808ModelPath)) {
+                return {
+                    success: false,
+                    error: `Failed to download DNSMOS P808 model: ${download.error || DNSMOS_P808_MODEL_URL}`,
+                };
+            }
+            warnings.push('DNSMOS P808 model was auto-downloaded.');
+        }
+
+        return {
+            success: true,
+            primaryModelPath,
+            p808ModelPath,
+            warning: warnings.length > 0 ? warnings.join(' ') : undefined,
+        };
+    }
+
+    private async installDnsmosRuntimeDependencies(
+        pythonExe: string,
+        preferGpu: boolean,
+    ): Promise<CommandResult> {
+        await this.runCommand(pythonExe, ['-m', 'pip', 'uninstall', '-y', 'onnxruntime', 'onnxruntime-gpu'], {
+            timeoutMs: 5 * 60 * 1000,
+        });
+        const installNumpy = await this.runCommand(pythonExe, ['-m', 'pip', 'install', '-U', 'numpy'], {
+            timeoutMs: 30 * 60 * 1000,
+        });
+        if (!installNumpy.success) {
+            return installNumpy;
+        }
+        if (preferGpu) {
+            const installGpu = await this.runCommand(pythonExe, ['-m', 'pip', 'install', '-U', 'onnxruntime-gpu'], {
+                timeoutMs: 45 * 60 * 1000,
+            });
+            if (installGpu.success) {
+                const probe = await this.probeDnsmosRuntime(pythonExe);
+                if (probe.success && this.dnsmosProbeUsesGpu(probe)) {
+                    return installGpu;
+                }
+            }
+        }
+        return this.runCommand(pythonExe, ['-m', 'pip', 'install', '-U', 'onnxruntime'], {
+            timeoutMs: 30 * 60 * 1000,
+        });
+    }
+
+    private async resolveDnsmosRuntime(): Promise<{
+        success: boolean;
+        pythonExe?: string;
+        env?: NodeJS.ProcessEnv;
+        primaryModelPath?: string;
+        p808ModelPath?: string;
+        warning?: string;
+        error?: string;
+    }> {
+        const runtimeRoot = path.join(this.baseDir, 'runtime');
+        const venvRoot = path.join(runtimeRoot, 'dnsmos_venv');
+        const modelDir = path.join(runtimeRoot, 'dnsmos_models');
+        const venvPython = path.join(venvRoot, 'Scripts', 'python.exe');
+        fs.mkdirSync(runtimeRoot, { recursive: true });
+        const warnings: string[] = [];
+
+        if (!fs.existsSync(venvPython)) {
+            const manifest = this.loadRvcManifest();
+            const manifestPython = manifest?.pythonPath ? this.resolvePythonExecutable(manifest.pythonPath) : null;
+            const systemPython = await this.resolveExecutable('python');
+            const basePython = systemPython || manifestPython;
+            if (!basePython) {
+                return {
+                    success: false,
+                    error: 'Python runtime not found for DNSMOS.',
+                };
+            }
+
+            const createVenv = await this.createIsolatedVenv(venvRoot, basePython);
+            if (!createVenv.success || !fs.existsSync(venvPython)) {
+                return {
+                    success: false,
+                    error: `Failed to create DNSMOS runtime: ${createVenv.error || 'unknown'}`,
+                };
+            }
+            if (createVenv.warning) {
+                warnings.push(createVenv.warning);
+            }
+        }
+
+        const preferGpu = await this.hasNvidiaGpuAvailable();
+        let probe = await this.probeDnsmosRuntime(venvPython);
+        if (!probe.success || (preferGpu && !this.dnsmosProbeUsesGpu(probe))) {
+            const pipCheck = await this.runCommand(venvPython, ['-m', 'pip', '--version'], {
+                timeoutMs: 20_000,
+            });
+            if (!pipCheck.success) {
+                const ensurePip = await this.runCommand(venvPython, ['-m', 'ensurepip', '--upgrade'], {
+                    timeoutMs: 3 * 60 * 1000,
+                });
+                if (!ensurePip.success) {
+                    return {
+                        success: false,
+                        error: `pip is unavailable in DNSMOS runtime: ${this.takeTail(ensurePip.stderr || ensurePip.stdout, 700)}`,
+                    };
+                }
+            }
+
+            await this.runCommand(venvPython, ['-m', 'pip', 'install', '-U', 'pip', 'setuptools', 'wheel'], {
+                timeoutMs: 10 * 60 * 1000,
+            });
+            const install = await this.installDnsmosRuntimeDependencies(venvPython, preferGpu);
+            if (!install.success) {
+                return {
+                    success: false,
+                    error: `Failed to install DNSMOS runtime: ${this.takeTail(install.stderr || install.stdout, 900)}`,
+                };
+            }
+            probe = await this.probeDnsmosRuntime(venvPython);
+            if (!probe.success) {
+                return {
+                    success: false,
+                    error: `DNSMOS runtime installation completed but import probe failed: ${this.takeTail(probe.stderr || probe.stdout, 700)}`,
+                };
+            }
+            warnings.push('DNSMOS runtime was auto-installed into isolated environment.');
+        }
+
+        const models = await this.ensureDnsmosModels(modelDir);
+        if (!models.success || !models.primaryModelPath || !models.p808ModelPath) {
+            return {
+                success: false,
+                error: models.error || 'DNSMOS model files are unavailable.',
+            };
+        }
+        if (models.warning) {
+            warnings.push(models.warning);
+        }
+
+        const probeSummary = this.summarizeDnsmosProbe(probe);
+        return {
+            success: true,
+            pythonExe: venvPython,
+            env: process.env,
+            primaryModelPath: models.primaryModelPath,
+            p808ModelPath: models.p808ModelPath,
+            warning: [...warnings, probeSummary].filter(Boolean).join(' ') || undefined,
+        };
+    }
+
+    private async computeDnsmosForWav(
+        preparedInputPath: string,
+        runtimeOverride?: {
+            success: boolean;
+            pythonExe?: string;
+            env?: NodeJS.ProcessEnv;
+            primaryModelPath?: string;
+            p808ModelPath?: string;
+            warning?: string;
+            error?: string;
+        },
+    ): Promise<{
+        success: boolean;
+        result?: DnsmosInferenceResult;
+        warning?: string;
+        error?: string;
+    }> {
+        const runtime = runtimeOverride || await this.resolveDnsmosRuntime();
+        if (!runtime.success || !runtime.pythonExe || !runtime.primaryModelPath || !runtime.p808ModelPath) {
+            return {
+                success: false,
+                error: runtime.error || 'DNSMOS runtime unavailable.',
+            };
+        }
+
+        const script = `
+import json
+import math
+import wave
+import numpy as np
+import onnxruntime as ort
+
+preload = getattr(ort, "preload_dlls", None)
+if preload:
+    preload()
+
+INPUT_WAV = r'''${preparedInputPath.replace(/\\/g, '\\\\')}'''
+PRIMARY_MODEL = r'''${runtime.primaryModelPath.replace(/\\/g, '\\\\')}'''
+P808_MODEL = r'''${runtime.p808ModelPath.replace(/\\/g, '\\\\')}'''
+SAMPLING_RATE = 16000
+INPUT_LENGTH = 9.01
+
+def hz_to_mel(hz):
+    return 2595.0 * math.log10(1.0 + (hz / 700.0))
+
+def mel_to_hz(mel):
+    return 700.0 * ((10.0 ** (mel / 2595.0)) - 1.0)
+
+def build_mel_filterbank(sr, n_fft, n_mels, fmin, fmax):
+    fft_freqs = np.linspace(0, sr / 2.0, int(n_fft // 2) + 1, dtype=np.float32)
+    mel_points = np.linspace(hz_to_mel(fmin), hz_to_mel(fmax), n_mels + 2, dtype=np.float32)
+    hz_points = np.array([mel_to_hz(m) for m in mel_points], dtype=np.float32)
+    bins = np.floor((n_fft + 1) * hz_points / sr).astype(np.int32)
+    filters = np.zeros((n_mels, int(n_fft // 2) + 1), dtype=np.float32)
+    for i in range(n_mels):
+        left = max(0, bins[i])
+        center = max(left + 1, bins[i + 1])
+        right = max(center + 1, bins[i + 2])
+        for j in range(left, min(center, filters.shape[1])):
+            filters[i, j] = (j - left) / max(1, center - left)
+        for j in range(center, min(right, filters.shape[1])):
+            filters[i, j] = (right - j) / max(1, right - center)
+        width_hz = max(1.0, hz_points[i + 2] - hz_points[i])
+        filters[i, :] *= (2.0 / width_hz)
+    return filters
+
+def resample_linear(audio, orig_sr, target_sr):
+    if orig_sr == target_sr:
+        return audio.astype(np.float32)
+    duration = len(audio) / float(orig_sr)
+    target_len = max(1, int(round(duration * target_sr)))
+    old_x = np.linspace(0.0, duration, num=len(audio), endpoint=False, dtype=np.float64)
+    new_x = np.linspace(0.0, duration, num=target_len, endpoint=False, dtype=np.float64)
+    return np.interp(new_x, old_x, audio).astype(np.float32)
+
+def read_wav_mono_float(path):
+    with wave.open(path, "rb") as wav:
+        channels = wav.getnchannels()
+        sample_width = wav.getsampwidth()
+        sample_rate = wav.getframerate()
+        frame_count = wav.getnframes()
+        raw = wav.readframes(frame_count)
+    if sample_width != 2:
+        raise RuntimeError(f"DNSMOS requires PCM16 WAV input, got sample_width={sample_width}")
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    return audio.astype(np.float32), sample_rate
+
+def frame_audio(audio, frame_size, hop_length):
+    pad = frame_size // 2
+    padded = np.pad(audio, (pad, pad), mode="reflect")
+    frames = []
+    for start in range(0, max(1, len(padded) - frame_size + 1), hop_length):
+        frame = padded[start:start + frame_size]
+        if len(frame) < frame_size:
+            frame = np.pad(frame, (0, frame_size - len(frame)))
+        frames.append(frame)
+    if not frames:
+        frames.append(np.pad(padded[:frame_size], (0, max(0, frame_size - len(padded[:frame_size])))))
+    return np.stack(frames, axis=0)
+
+def audio_melspec(audio, sr=16000, n_mels=120, frame_size=320, hop_length=160):
+    n_fft = frame_size + 1
+    frames = frame_audio(audio, n_fft, hop_length).astype(np.float32)
+    window = np.hanning(n_fft).astype(np.float32)
+    stft = np.fft.rfft(frames * window[None, :], axis=1)
+    power = (np.abs(stft) ** 2).astype(np.float32)
+    mel_fb = build_mel_filterbank(sr, n_fft, n_mels, 0.0, sr / 2.0)
+    mel_spec = np.maximum(1e-10, np.matmul(power, mel_fb.T))
+    ref = np.max(mel_spec) if mel_spec.size else 1.0
+    mel_db = 10.0 * np.log10(np.maximum(1e-10, mel_spec)) - 10.0 * math.log10(max(1e-10, float(ref)))
+    mel_norm = (mel_db + 40.0) / 40.0
+    return mel_norm.astype(np.float32)
+
+def get_polyfit_val(sig, bak, ovr):
+    p_ovr = np.poly1d([-0.06766283, 1.11546468, 0.04602535])
+    p_sig = np.poly1d([-0.08397278, 1.22083953, 0.0052439])
+    p_bak = np.poly1d([-0.13166888, 1.60915514, -0.39604546])
+    return float(p_sig(sig)), float(p_bak(bak)), float(p_ovr(ovr))
+
+audio, sr = read_wav_mono_float(INPUT_WAV)
+if sr != SAMPLING_RATE:
+    audio = resample_linear(audio, sr, SAMPLING_RATE)
+actual_len = len(audio)
+len_samples = int(INPUT_LENGTH * SAMPLING_RATE)
+while len(audio) < len_samples:
+    audio = np.concatenate([audio, audio])
+
+num_hops = int(np.floor(len(audio) / SAMPLING_RATE) - INPUT_LENGTH) + 1
+hop_len_samples = SAMPLING_RATE
+
+available_providers = ort.get_available_providers()
+providers = [provider for provider in ["CUDAExecutionProvider", "CPUExecutionProvider"] if provider in available_providers]
+if not providers:
+    providers = available_providers
+primary_sess = ort.InferenceSession(PRIMARY_MODEL, providers=providers)
+p808_sess = ort.InferenceSession(P808_MODEL, providers=providers)
+primary_name = primary_sess.get_inputs()[0].name
+p808_name = p808_sess.get_inputs()[0].name
+
+pred_sig = []
+pred_bak = []
+pred_ovr = []
+pred_p808 = []
+
+for idx in range(max(1, num_hops)):
+    start = int(idx * hop_len_samples)
+    end = int((idx + INPUT_LENGTH) * hop_len_samples)
+    audio_seg = audio[start:end]
+    if len(audio_seg) < len_samples:
+        continue
+    input_features = np.array(audio_seg, dtype=np.float32)[np.newaxis, :]
+    p808_input_features = np.array(audio_melspec(audio_seg[:-160]), dtype=np.float32)[np.newaxis, :, :]
+    p808_mos = float(p808_sess.run(None, {p808_name: p808_input_features})[0][0][0])
+    mos_sig_raw, mos_bak_raw, mos_ovr_raw = primary_sess.run(None, {primary_name: input_features})[0][0]
+    mos_sig, mos_bak, mos_ovr = get_polyfit_val(float(mos_sig_raw), float(mos_bak_raw), float(mos_ovr_raw))
+    pred_sig.append(mos_sig)
+    pred_bak.append(mos_bak)
+    pred_ovr.append(mos_ovr)
+    pred_p808.append(p808_mos)
+
+if not pred_sig:
+    raise RuntimeError("DNSMOS produced no scoring windows")
+
+print(json.dumps({
+    "ok": True,
+    "ovrl": float(np.mean(np.array(pred_ovr, dtype=np.float32))),
+    "sig": float(np.mean(np.array(pred_sig, dtype=np.float32))),
+    "bak": float(np.mean(np.array(pred_bak, dtype=np.float32))),
+    "p808": float(np.mean(np.array(pred_p808, dtype=np.float32))),
+    "providers": available_providers,
+    "session_provider": primary_sess.get_providers(),
+    "duration_sec": float(actual_len / SAMPLING_RATE),
+}, ensure_ascii=False))
+`.trim();
+
+        const result = await this.runCommand(runtime.pythonExe, ['-c', script], {
+            env: runtime.env || process.env,
+            timeoutMs: 20 * 60 * 1000,
+        });
+        const report = this.tryParseLastJsonLine<{
+            ok?: boolean;
+            ovrl?: number;
+            sig?: number;
+            bak?: number;
+            p808?: number;
+            providers?: string[];
+            session_provider?: string[];
+        }>(result.stdout || '');
+        if (!result.success || !report?.ok) {
+            return {
+                success: false,
+                warning: runtime.warning,
+                error: `DNSMOS inference failed: ${this.takeTail(result.stderr || result.stdout, 500) || 'unknown error'}`,
+            };
+        }
+
+        const runtimeDetails = Array.isArray(report.session_provider) && report.session_provider.length > 0
+            ? `DNSMOS execution: provider=${report.session_provider.join('/')}`
+            : undefined;
+
+        return {
+            success: true,
+            result: {
+                ovrl: Number(report.ovrl || 0),
+                sig: Number(report.sig || 0),
+                bak: Number(report.bak || 0),
+                p808: Number(report.p808 || 0),
+            },
+            warning: runtimeDetails,
+        };
+    }
+
     private probeAudioSeparatorRuntime(pythonExe: string): Promise<CommandResult> {
         return this.runCommand(pythonExe, ['-c', [
             'import torch',
@@ -3374,6 +4667,7 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         let metricsSummary = '';
         const enhancementNotes: string[] = [];
         let cleanupInputPath = sourcePath;
+        let preDereverbFallbackPath: string | undefined;
         let preparedAccMonoPath: string | undefined;
         let preparedMixMonoPath: string | undefined;
         let leakageForCleanupTuning: number | undefined;
@@ -3542,6 +4836,98 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             }
             if (!ensembleApplied && usableAlternativeCandidates.length === 0) {
                 enhancementNotes.push('Vocal ensemble skipped (no usable alternative candidate).');
+            }
+        }
+
+        if (analysisPrepared && primaryMethod !== 'uvr-ultimate') {
+            try {
+                const dereverbInputPath = cleanupInputPath === sourcePath ? preparedVocalMonoPath : cleanupInputPath;
+                if (!fs.existsSync(dereverbInputPath)) {
+                    throw new Error(`dereverb input not found: ${dereverbInputPath}`);
+                }
+
+                const beforeMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(dereverbInputPath);
+                const beforeLeak = preparedAccMonoPath && fs.existsSync(preparedAccMonoPath)
+                    ? SeparationQualityLibrary.estimateLeakageCorrelation(dereverbInputPath, preparedAccMonoPath)
+                    : 0;
+                const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
+                const beforeHighRough = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(dereverbInputPath);
+                const dereverbPressure = Math.max(
+                    beforeLeak >= 0.050 ? 1 : 0,
+                    beforeHighRough >= 0.015 ? 1 : 0,
+                    (beforeMetrics.speechActivityRatio >= 0.40 && beforeMetrics.highBandRatio >= 0.17) ? 1 : 0,
+                );
+
+                if (dereverbPressure <= 0) {
+                    enhancementNotes.push(
+                        `Dereverb skipped (pressure low: leak=${beforeLeak.toFixed(3)}, rough=${beforeHighRough.toFixed(4)}, speech=${beforeMetrics.speechActivityRatio.toFixed(2)}).`,
+                    );
+                } else {
+                    const dereverbAttempt = await this.tryDereverbVocalStem(dereverbInputPath, runDir);
+                    if (!dereverbAttempt.success || !dereverbAttempt.outputPath || !fs.existsSync(dereverbAttempt.outputPath)) {
+                        enhancementNotes.push(
+                            `Dereverb skipped (${dereverbAttempt.error || 'model output unavailable'}).`,
+                        );
+                    } else {
+                        const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(dereverbAttempt.outputPath);
+                        const afterLeak = preparedAccMonoPath && fs.existsSync(preparedAccMonoPath)
+                            ? SeparationQualityLibrary.estimateLeakageCorrelation(dereverbAttempt.outputPath, preparedAccMonoPath)
+                            : beforeLeak;
+                        const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
+                        const afterHighRough = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(dereverbAttempt.outputPath);
+                        const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+                        const silenceRise = afterMetrics.silenceRatio - beforeMetrics.silenceRatio;
+                        const leakImprovement = beforeLeak - afterLeak;
+                        const roughImprovement = beforeHighRough - afterHighRough;
+                        const highLoss = beforeMetrics.highBandRatio - afterMetrics.highBandRatio;
+                        const rmsDrop = beforeMetrics.rmsDb - afterMetrics.rmsDb;
+                        const regressionSafe = (
+                            speechDrop <= 0.022
+                            && silenceRise <= 0.035
+                            && highLoss <= 0.030
+                            && rmsDrop <= 1.8
+                        );
+                        const improved = regressionSafe && (
+                            afterScore.score >= beforeScore.score + 0.8
+                            || leakImprovement >= 0.012
+                            || roughImprovement >= 0.00045
+                            || (roughImprovement >= 0.00028 && leakImprovement >= 0.004)
+                            || (
+                                afterScore.score >= beforeScore.score - 0.25
+                                && leakImprovement >= 0.008
+                                && speechDrop <= 0.015
+                            )
+                        );
+
+                        if (improved) {
+                            const previousCleanupPath = cleanupInputPath;
+                            preDereverbFallbackPath = dereverbInputPath;
+                            if (
+                                previousCleanupPath !== sourcePath
+                                && previousCleanupPath !== preparedVocalMonoPath
+                                && previousCleanupPath !== dereverbAttempt.outputPath
+                            ) {
+                                try { if (fs.existsSync(previousCleanupPath)) fs.unlinkSync(previousCleanupPath); } catch {}
+                            }
+                            cleanupInputPath = dereverbAttempt.outputPath;
+                            leakageForCleanupTuning = afterLeak;
+                            enhancementNotes.push(
+                                `Dereverb applied (${dereverbAttempt.model || 'auto'}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, rough ${beforeHighRough.toFixed(4)}->${afterHighRough.toFixed(4)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}).`,
+                            );
+                        } else {
+                            try { if (fs.existsSync(dereverbAttempt.outputPath)) fs.unlinkSync(dereverbAttempt.outputPath); } catch {}
+                            enhancementNotes.push(
+                                `Dereverb not adopted (${dereverbAttempt.model || 'auto'}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, rough ${beforeHighRough.toFixed(4)}->${afterHighRough.toFixed(4)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}).`,
+                            );
+                        }
+
+                        if (dereverbAttempt.warning) {
+                            enhancementNotes.push(`Dereverb runtime: ${dereverbAttempt.warning}`);
+                        }
+                    }
+                }
+            } catch (error) {
+                enhancementNotes.push(`Dereverb skipped (${error instanceof Error ? error.message : String(error)}).`);
             }
         }
 
@@ -3728,6 +5114,9 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                         debleedInputPath,
                         preparedAccMonoPath,
                     );
+                    const beforeHighRough = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(
+                        debleedInputPath,
+                    );
                     const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
 
                     const debleedSummary = SeparationQualityLibrary.reduceBleedWithReferenceMonoPcm16Wav(
@@ -3741,24 +5130,41 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                         debleedPath,
                         preparedAccMonoPath,
                     );
+                    const afterHighRough = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(
+                        debleedPath,
+                    );
                     const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
                     leakageForCleanupTuning = afterLeak;
+                    const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+                    const highRoughWorsened = afterHighRough - beforeHighRough;
+                    const regressionSafe = speechDrop <= 0.028 && highRoughWorsened <= 0.00075;
 
-                    const improved = (
-                        afterScore.score >= beforeScore.score + 1.5
-                        || afterLeak <= beforeLeak - 0.03
-                        || (afterScore.score > beforeScore.score && afterMetrics.highBandRatio <= beforeMetrics.highBandRatio)
+                    const improved = regressionSafe && (
+                        afterScore.score >= beforeScore.score + 1.2
+                        || afterLeak <= beforeLeak - 0.025
+                        || (
+                            afterLeak <= beforeLeak - 0.012
+                            && speechDrop <= 0.020
+                            && afterMetrics.highBandRatio <= beforeMetrics.highBandRatio + 0.008
+                            && highRoughWorsened <= 0.00035
+                        )
+                        || (
+                            afterScore.score >= beforeScore.score - 0.25
+                            && afterLeak < beforeLeak - 0.008
+                            && afterMetrics.highBandRatio <= beforeMetrics.highBandRatio
+                            && speechDrop <= 0.015
+                        )
                     );
 
                     if (improved) {
                         cleanupInputPath = debleedPath;
                         enhancementNotes.push(
-                            `Reference de-bleed applied (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, avgGain=${debleedSummary.avgAbsLeakGain.toFixed(3)}).`,
+                            `Reference de-bleed applied (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, avgGain=${debleedSummary.avgAbsLeakGain.toFixed(3)}, highGain=${debleedSummary.avgAbsHighLeakGain.toFixed(3)}).`,
                         );
                     } else {
                         try { if (fs.existsSync(debleedPath)) fs.unlinkSync(debleedPath); } catch {}
                         enhancementNotes.push(
-                            `Reference de-bleed not adopted (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}).`,
+                            `Reference de-bleed not adopted (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}, rough ${beforeHighRough.toFixed(4)}->${afterHighRough.toFixed(4)}).`,
                         );
                     }
                 } catch (error) {
@@ -3891,6 +5297,118 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             }
         }
 
+        if (preparedAccMonoPath && fs.existsSync(preparedAccMonoPath) && fs.existsSync(cleanupInputPath)) {
+            const residualMusicTrimPath = path.join(enhancedDir, `vocal_music_only_removed_residual_${stamp}.wav`);
+            try {
+                const residualInputPath = cleanupInputPath === sourcePath && analysisPrepared
+                    ? preparedVocalMonoPath
+                    : cleanupInputPath;
+                if (!fs.existsSync(residualInputPath)) {
+                    throw new Error(`Residual music-only cleanup input not found: ${residualInputPath}`);
+                }
+
+                const beforeMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(residualInputPath);
+                const beforeLeak = SeparationQualityLibrary.estimateLeakageCorrelation(residualInputPath, preparedAccMonoPath);
+                const beforeLowBandLeak = SeparationQualityLibrary.estimateLowBandLeakageCorrelation(
+                    residualInputPath,
+                    preparedAccMonoPath,
+                );
+                const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
+                const beforePerceptual = SeparationQualityLibrary.analyzePerceptualQualityMonoPcm16Wav(residualInputPath);
+                const residualCleanupPressure = this.clampNumber(
+                    Math.max(0, beforeLeak - 0.09) * 2.8
+                    + Math.max(0, beforeLowBandLeak - 0.08) * 2.2
+                    + Math.max(0, beforeMetrics.silenceRatio - 0.34) * 0.8
+                    - Math.max(0, beforeMetrics.speechActivityRatio - 0.66) * 0.35,
+                    0,
+                    1.8,
+                    0,
+                );
+                const residualSuppressionGainBase = beforeMetrics.speechActivityRatio >= 0.62
+                    ? (beforeLeak >= 0.10 ? 0.14 : 0.18)
+                    : beforeMetrics.speechActivityRatio >= 0.50
+                        ? (beforeLeak >= 0.10 ? 0.18 : 0.22)
+                        : (beforeLeak >= 0.10 ? 0.24 : 0.32);
+                const residualSuppressionGain = this.clampNumber(
+                    residualSuppressionGainBase
+                    - (residualCleanupPressure * 0.06)
+                    + (beforeMetrics.speechActivityRatio >= 0.70 ? 0.02 : 0),
+                    0.08,
+                    0.40,
+                    0.20,
+                );
+                const trimSummary = SeparationQualityLibrary.removeMusicOnlySectionsWithReferenceMonoPcm16Wav(
+                    residualInputPath,
+                    preparedAccMonoPath,
+                    residualMusicTrimPath,
+                    { preserveTimeline: true, preserveTimelineAttenuation: residualSuppressionGain },
+                );
+                const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(residualMusicTrimPath);
+                const afterLeak = SeparationQualityLibrary.estimateLeakageCorrelation(residualMusicTrimPath, preparedAccMonoPath);
+                const afterLowBandLeak = SeparationQualityLibrary.estimateLowBandLeakageCorrelation(
+                    residualMusicTrimPath,
+                    preparedAccMonoPath,
+                );
+                const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
+                const afterPerceptual = SeparationQualityLibrary.analyzePerceptualQualityMonoPcm16Wav(residualMusicTrimPath);
+                const leakImprovementAbs = beforeLeak - afterLeak;
+                const lowBandLeakImprovementAbs = beforeLowBandLeak - afterLowBandLeak;
+                const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+                const silenceRise = afterMetrics.silenceRatio - beforeMetrics.silenceRatio;
+                const midBandDrop = beforeMetrics.midBandRatio - afterMetrics.midBandRatio;
+                const artifactRise = afterPerceptual.artifactScore - beforePerceptual.artifactScore;
+                const roughRise = afterPerceptual.highBandRoughness - beforePerceptual.highBandRoughness;
+                const outputStillUsable = trimSummary.outputDurationMs >= 15_000;
+                const regressionSafe = (
+                    speechDrop <= 0.03
+                    && silenceRise <= 0.08
+                    && midBandDrop <= 0.035
+                    && artifactRise <= 0.025
+                    && roughRise <= 0.0008
+                );
+                const improved = outputStillUsable && regressionSafe && (
+                    afterScore.score >= beforeScore.score + 0.5
+                    || leakImprovementAbs >= 0.008
+                    || afterLowBandLeak <= beforeLowBandLeak - 0.005
+                    || (
+                        trimSummary.removedDurationMs >= 120
+                        && leakImprovementAbs >= 0.005
+                        && lowBandLeakImprovementAbs >= 0.002
+                        && artifactRise <= 0.010
+                    )
+                    || (
+                        trimSummary.removedSegments >= 2
+                        && leakImprovementAbs >= 0.006
+                        && speechDrop <= 0.016
+                    )
+                    || (
+                        beforePerceptual.artifactScore >= 0.11
+                        && afterPerceptual.artifactScore <= beforePerceptual.artifactScore - 0.015
+                        && leakImprovementAbs >= 0.003
+                    )
+                );
+
+                if (improved) {
+                    if (cleanupInputPath !== sourcePath && cleanupInputPath !== residualInputPath) {
+                        try { if (fs.existsSync(cleanupInputPath)) fs.unlinkSync(cleanupInputPath); } catch {}
+                    }
+                    cleanupInputPath = residualMusicTrimPath;
+                    leakageForCleanupTuning = afterLeak;
+                    enhancementNotes.push(
+                        `Residual music-only cleanup applied (suppressed ${trimSummary.removedDurationMs}ms in ${trimSummary.removedSegments} segments, gain=${residualSuppressionGain.toFixed(2)}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, artifact ${beforePerceptual.artifactScore.toFixed(3)}->${afterPerceptual.artifactScore.toFixed(3)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}).`,
+                    );
+                } else {
+                    try { if (fs.existsSync(residualMusicTrimPath)) fs.unlinkSync(residualMusicTrimPath); } catch {}
+                    enhancementNotes.push(
+                        `Residual music-only cleanup not adopted (suppressed ${trimSummary.removedDurationMs}ms in ${trimSummary.removedSegments} segments, gain=${residualSuppressionGain.toFixed(2)}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, artifact ${beforePerceptual.artifactScore.toFixed(3)}->${afterPerceptual.artifactScore.toFixed(3)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}).`,
+                    );
+                }
+            } catch (error) {
+                enhancementNotes.push(`Residual music-only cleanup skipped (${error instanceof Error ? error.message : String(error)}).`);
+                try { if (fs.existsSync(residualMusicTrimPath)) fs.unlinkSync(residualMusicTrimPath); } catch {}
+            }
+        }
+
         if (fs.existsSync(cleanupInputPath)) {
             const highSmoothInputPath = cleanupInputPath === sourcePath
                 ? (analysisPrepared ? preparedVocalMonoPath : cleanupInputPath)
@@ -3922,7 +5440,12 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                         highImproved >= 0.012
                         || (highImproved >= 0.006 && roughImproved >= 0.00035)
                         || (smoothingSummary.roughnessAfter <= smoothingSummary.roughnessBefore * 0.90 && highImproved >= 0.004)
-                    ) && scoreDrop <= 1.2 && leakWorsened <= 0.018 && speechDrop <= 0.04;
+                        || (
+                            roughImproved >= 0.00048
+                            && beforeMetrics.highBandRatio >= 0.22
+                            && smoothingSummary.avgAmount >= 0.10
+                        )
+                    ) && scoreDrop <= 1.2 && leakWorsened <= 0.018 && speechDrop <= 0.035;
 
                     if (improved) {
                         if (cleanupInputPath !== sourcePath && cleanupInputPath !== highSmoothInputPath) {
@@ -3960,7 +5483,8 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
         if (analysisReady) {
             try {
                 const metrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(analysisMonoPath);
-                const highBandRoughness = SeparationQualityLibrary.estimateHighBandRoughnessMonoPcm16Wav(analysisMonoPath);
+                const perceptualMetrics = SeparationQualityLibrary.analyzePerceptualQualityMonoPcm16Wav(analysisMonoPath);
+                const highBandRoughness = perceptualMetrics.highBandRoughness;
                 const lowBandLeakForCleanup = (preparedAccMonoPath && fs.existsSync(preparedAccMonoPath))
                     ? SeparationQualityLibrary.estimateLowBandLeakageCorrelation(analysisMonoPath, preparedAccMonoPath)
                     : undefined;
@@ -4014,7 +5538,7 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                         `Low-end bleed guard enabled (${gateSafe ? 'mode=hp+soft-gate' : 'mode=soft-hp'}, extra highpass=${extraHighpassHz}Hz${typeof leakageForCleanupTuning === 'number' ? `, leakage=${leakageForCleanupTuning.toFixed(3)}` : ''}).`,
                     );
                 }
-                metricsSummary = `Adaptive cleanup tuned from analysis (rms=${metrics.rmsDb.toFixed(2)}dB, low=${metrics.lowBandRatio.toFixed(2)}, high=${metrics.highBandRatio.toFixed(2)}, rough=${highBandRoughness.toFixed(4)}, nearClip=${metrics.nearClipRatio.toFixed(4)}, speech=${metrics.speechActivityRatio.toFixed(2)}${typeof lowBandLeakForCleanup === 'number' ? `, lowLeak=${lowBandLeakForCleanup.toFixed(3)}` : ''}).`;
+                metricsSummary = `Adaptive cleanup tuned from analysis (rms=${metrics.rmsDb.toFixed(2)}dB, low=${metrics.lowBandRatio.toFixed(2)}, high=${metrics.highBandRatio.toFixed(2)}, rough=${highBandRoughness.toFixed(4)}, flux=${perceptualMetrics.highBandFluxVariance.toFixed(4)}, artifact=${perceptualMetrics.artifactScore.toFixed(3)}, reverb=${perceptualMetrics.reverbTailRatio.toFixed(3)}, nearClip=${metrics.nearClipRatio.toFixed(4)}, speech=${metrics.speechActivityRatio.toFixed(2)}${typeof lowBandLeakForCleanup === 'number' ? `, lowLeak=${lowBandLeakForCleanup.toFixed(3)}` : ''}).`;
             } catch {
                 // Keep default filters when analysis fails.
             }
@@ -4068,6 +5592,11 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
                 highImproved >= 0.010
                 || (highImproved >= 0.005 && roughImproved >= 0.00030)
                 || (smoothingSummary.roughnessAfter <= smoothingSummary.roughnessBefore * 0.92 && highImproved >= 0.0035)
+                || (
+                    roughImproved >= 0.00040
+                    && beforeMetrics.highBandRatio >= 0.20
+                    && smoothingSummary.avgAmount >= 0.09
+                )
             ) && speechDrop <= 0.03 && rmsDiff <= 1.0 && crestDiff <= 2.4;
 
             if (improved) {
@@ -4083,6 +5612,82 @@ print(json.dumps({'ok': True, 'logs': infos[-3:]}))
             }
         } catch (error) {
             enhancementNotes.push(`Post-cleanup high-band smoothing skipped (${error instanceof Error ? error.message : String(error)}).`);
+        }
+
+        try {
+            const currentQa = this.analyzeCanonicalQaMetrics(finalEnhancedPath);
+            const softFail = this.evaluateCanonicalQaSoftFail(currentQa);
+            if (softFail.softFail) {
+                let qaRecovered = false;
+
+                const fallbackCandidate = alternativeCandidates.find((candidate) => {
+                    const p = String(candidate?.vocalWavPath || '').trim();
+                    return !!p && fs.existsSync(p) && path.resolve(p) !== path.resolve(sourcePath);
+                });
+                if (fallbackCandidate?.vocalWavPath) {
+                    const fallbackCandidatePath = path.join(enhancedDir, `vocal_qa_fallback_${fallbackCandidate.method}_${stamp}.wav`);
+                    const renderedFallback = await this.renderCanonicalQaFallback(
+                        ffmpegTools.ffmpegPath,
+                        fallbackCandidate.vocalWavPath,
+                        fallbackCandidatePath,
+                        defaultFilters,
+                    );
+                    if (renderedFallback) {
+                        const fallbackQa = this.analyzeCanonicalQaMetrics(fallbackCandidatePath);
+                        if (this.shouldAdoptCanonicalQaFallback(currentQa, fallbackQa)) {
+                            finalEnhancedPath = fallbackCandidatePath;
+                            qaRecovered = true;
+                            enhancementNotes.push(
+                                `Canonical QA fallback applied (2nd candidate=${fallbackCandidate.method}, artifact ${currentQa.perceptualMetrics.artifactScore.toFixed(3)}->${fallbackQa.perceptualMetrics.artifactScore.toFixed(3)}, reverb ${currentQa.perceptualMetrics.reverbTailRatio.toFixed(3)}->${fallbackQa.perceptualMetrics.reverbTailRatio.toFixed(3)}, speech ${currentQa.stemMetrics.speechActivityRatio.toFixed(2)}->${fallbackQa.stemMetrics.speechActivityRatio.toFixed(2)}).`,
+                            );
+                        } else {
+                            this.removeFileIfExists(fallbackCandidatePath);
+                            enhancementNotes.push(
+                                `Canonical QA fallback not adopted (2nd candidate=${fallbackCandidate.method}, artifact ${currentQa.perceptualMetrics.artifactScore.toFixed(3)}->${fallbackQa.perceptualMetrics.artifactScore.toFixed(3)}, reverb ${currentQa.perceptualMetrics.reverbTailRatio.toFixed(3)}->${fallbackQa.perceptualMetrics.reverbTailRatio.toFixed(3)}, speech ${currentQa.stemMetrics.speechActivityRatio.toFixed(2)}->${fallbackQa.stemMetrics.speechActivityRatio.toFixed(2)}).`,
+                            );
+                        }
+                    } else {
+                        this.removeFileIfExists(fallbackCandidatePath);
+                        enhancementNotes.push(`Canonical QA fallback skipped (2nd candidate=${fallbackCandidate.method} render failed).`);
+                    }
+                }
+
+                if (!qaRecovered && preDereverbFallbackPath && fs.existsSync(preDereverbFallbackPath)) {
+                    const dereverbRollbackPath = path.join(enhancedDir, `vocal_qa_fallback_pre_dereverb_${stamp}.wav`);
+                    const renderedRollback = await this.renderCanonicalQaFallback(
+                        ffmpegTools.ffmpegPath,
+                        preDereverbFallbackPath,
+                        dereverbRollbackPath,
+                        defaultFilters,
+                    );
+                    if (renderedRollback) {
+                        const rollbackQa = this.analyzeCanonicalQaMetrics(dereverbRollbackPath);
+                        if (this.shouldAdoptCanonicalQaFallback(currentQa, rollbackQa)) {
+                            finalEnhancedPath = dereverbRollbackPath;
+                            qaRecovered = true;
+                            enhancementNotes.push(
+                                `Canonical QA fallback applied (pre-dereverb stem, artifact ${currentQa.perceptualMetrics.artifactScore.toFixed(3)}->${rollbackQa.perceptualMetrics.artifactScore.toFixed(3)}, reverb ${currentQa.perceptualMetrics.reverbTailRatio.toFixed(3)}->${rollbackQa.perceptualMetrics.reverbTailRatio.toFixed(3)}, speech ${currentQa.stemMetrics.speechActivityRatio.toFixed(2)}->${rollbackQa.stemMetrics.speechActivityRatio.toFixed(2)}).`,
+                            );
+                        } else {
+                            this.removeFileIfExists(dereverbRollbackPath);
+                            enhancementNotes.push(
+                                `Canonical QA fallback not adopted (pre-dereverb stem, artifact ${currentQa.perceptualMetrics.artifactScore.toFixed(3)}->${rollbackQa.perceptualMetrics.artifactScore.toFixed(3)}, reverb ${currentQa.perceptualMetrics.reverbTailRatio.toFixed(3)}->${rollbackQa.perceptualMetrics.reverbTailRatio.toFixed(3)}, speech ${currentQa.stemMetrics.speechActivityRatio.toFixed(2)}->${rollbackQa.stemMetrics.speechActivityRatio.toFixed(2)}).`,
+                            );
+                        }
+                    } else {
+                        this.removeFileIfExists(dereverbRollbackPath);
+                        enhancementNotes.push('Canonical QA fallback skipped (pre-dereverb stem render failed).');
+                    }
+                }
+
+                if (!qaRecovered) {
+                    enhancementNotes.push(
+                        `Canonical QA soft-fail retained current stem (${softFail.reason || 'artifact/reverb threshold exceeded'}, artifact=${currentQa.perceptualMetrics.artifactScore.toFixed(3)}, reverb=${currentQa.perceptualMetrics.reverbTailRatio.toFixed(3)}, speech=${currentQa.stemMetrics.speechActivityRatio.toFixed(2)}).`,
+                    );
+                }
+            }
+        } catch (error) {
+            enhancementNotes.push(`Canonical QA gate skipped (${error instanceof Error ? error.message : String(error)}).`);
         }
 
         return {

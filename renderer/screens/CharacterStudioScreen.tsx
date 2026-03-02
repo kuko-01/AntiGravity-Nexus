@@ -1,6 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { CharacterChatResponse, CharacterConversationSettings, CharacterEmotionPersonality } from '../../types/character';
+import type {
+    CharacterChatResponse,
+    CharacterConversationSettings,
+    CharacterEmotionPersonality,
+    SingingLearningComparisonExportSettings,
+} from '../../types/character';
 import type { RvcModel } from '../../types/rvc';
 import type { TtsModel } from '../../types/tts';
 import type { AudioProcess, CharacterLearningSeparationProfileResponse } from '../../types';
@@ -61,6 +66,7 @@ interface StoredUserProfile {
 interface StoredVoiceEnhanceSettings {
     singingTrainingMode?: boolean;
     separationPreference?: 'auto' | 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    singingComparisonExports?: SingingLearningComparisonExportSettings;
     forceSingingMode?: boolean;
     autoEmotionRefine?: boolean;
     enhanceFinalAudio?: boolean;
@@ -119,6 +125,10 @@ const DEFAULT_CHARACTER_VOICE_SETTINGS: StoredCharacterVoiceSettings = {
 const DEFAULT_VOICE_ENHANCE_SETTINGS: StoredVoiceEnhanceSettings = {
     singingTrainingMode: false,
     separationPreference: 'auto',
+    singingComparisonExports: {
+        trainingBright: false,
+        remixClear: false,
+    },
     forceSingingMode: false,
     autoEmotionRefine: true,
     enhanceFinalAudio: true,
@@ -163,6 +173,12 @@ const CharacterStudioScreen: React.FC = () => {
     const [singingTrainingMode, setSingingTrainingMode] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.singingTrainingMode === true);
     const [singingSeparationPreference, setSingingSeparationPreference] = useState<'auto' | 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback'>(
         DEFAULT_VOICE_ENHANCE_SETTINGS.separationPreference || 'auto',
+    );
+    const [trainingBrightExport, setTrainingBrightExport] = useState<boolean>(
+        DEFAULT_VOICE_ENHANCE_SETTINGS.singingComparisonExports?.trainingBright === true,
+    );
+    const [remixClearExport, setRemixClearExport] = useState<boolean>(
+        DEFAULT_VOICE_ENHANCE_SETTINGS.singingComparisonExports?.remixClear === true,
     );
     const [ytDlpCookiesFile, setYtDlpCookiesFile] = useState<string>('');
     const [forceSingingMode, setForceSingingMode] = useState<boolean>(DEFAULT_VOICE_ENHANCE_SETTINGS.forceSingingMode || false);
@@ -335,9 +351,14 @@ const CharacterStudioScreen: React.FC = () => {
         )
             ? settings.separationPreference
             : (DEFAULT_VOICE_ENHANCE_SETTINGS.separationPreference || 'auto');
+        const nextComparisonExports: SingingLearningComparisonExportSettings = {
+            trainingBright: settings?.singingComparisonExports?.trainingBright === true,
+            remixClear: settings?.singingComparisonExports?.remixClear === true,
+        };
         return {
             singingTrainingMode: settings?.singingTrainingMode === true,
             separationPreference: nextSeparationPreference,
+            singingComparisonExports: nextComparisonExports,
             ytDlpCookiesFile: typeof settings?.ytDlpCookiesFile === 'string' ? settings.ytDlpCookiesFile : '',
             forceSingingMode: settings?.forceSingingMode === true,
             autoEmotionRefine: settings?.autoEmotionRefine !== false,
@@ -353,6 +374,8 @@ const CharacterStudioScreen: React.FC = () => {
         const normalized = normalizeVoiceEnhanceSettings(settings);
         setSingingTrainingMode(normalized.singingTrainingMode === true);
         setSingingSeparationPreference(normalized.separationPreference || 'auto');
+        setTrainingBrightExport(normalized.singingComparisonExports?.trainingBright === true);
+        setRemixClearExport(normalized.singingComparisonExports?.remixClear === true);
         setYtDlpCookiesFile(normalized.ytDlpCookiesFile || '');
         setForceSingingMode(normalized.forceSingingMode || false);
         setAutoEmotionRefine(normalized.autoEmotionRefine !== false);
@@ -367,6 +390,10 @@ const CharacterStudioScreen: React.FC = () => {
         normalizeVoiceEnhanceSettings({
             singingTrainingMode,
             separationPreference: singingSeparationPreference,
+            singingComparisonExports: {
+                trainingBright: trainingBrightExport,
+                remixClear: remixClearExport,
+            },
             ytDlpCookiesFile,
             forceSingingMode,
             autoEmotionRefine,
@@ -1205,6 +1232,12 @@ const CharacterStudioScreen: React.FC = () => {
 
         parts.push(`learn=${singingTrainingMode ? 'on' : 'off'}`);
         parts.push(`sep=${singingSeparationPreference}`);
+        if (trainingBrightExport || remixClearExport) {
+            parts.push(`cmp=${[
+                trainingBrightExport ? 'bright' : '',
+                remixClearExport ? 'remix' : '',
+            ].filter(Boolean).join('+')}`);
+        }
         parts.push(`singing=${forceSingingMode ? 'forced' : 'auto'}`);
         parts.push(`refine=${autoEmotionRefine ? 'on' : 'off'}`);
         parts.push(`enhance=${enhanceFinalAudio ? 'on' : 'off'}`);
@@ -1346,6 +1379,10 @@ const CharacterStudioScreen: React.FC = () => {
                 learning: {
                     singingTrainingMode,
                     separationPreference: singingSeparationPreference,
+                    singingComparisonExports: {
+                        trainingBright: trainingBrightExport,
+                        remixClear: remixClearExport,
+                    },
                     ytDlpCookiesFile: ytDlpCookiesFile || undefined,
                 },
                 withVoice: voiceEnabled,
@@ -1816,6 +1853,32 @@ const CharacterStudioScreen: React.FC = () => {
                             </div>
                         </div>
                     )}
+                    <div style={{ marginBottom: '10px', paddingLeft: '22px', opacity: singingTrainingMode ? 1 : 0.7 }}>
+                        <label
+                            style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}
+                            title="Canonical 学習素材の後に、比較用の明るめ export を追加生成します。dataset input には登録しません。"
+                        >
+                            <input
+                                type="checkbox"
+                                checked={trainingBrightExport}
+                                disabled={!singingTrainingMode}
+                                onChange={(e) => setTrainingBrightExport(e.target.checked)}
+                            />
+                            Generate training_bright export
+                        </label>
+                        <label
+                            style={{ display: 'flex', alignItems: 'center', gap: '8px' }}
+                            title="Canonical 学習素材の後に、Remix/BGM 試聴向けの比較 export を追加生成します。dataset input には登録しません。"
+                        >
+                            <input
+                                type="checkbox"
+                                checked={remixClearExport}
+                                disabled={!singingTrainingMode}
+                                onChange={(e) => setRemixClearExport(e.target.checked)}
+                            />
+                            Generate remix_clear export
+                        </label>
+                    </div>
 
                     <label
                         style={{ display: 'block', fontSize: '12px', marginBottom: '6px' }}

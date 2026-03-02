@@ -62,9 +62,23 @@ export interface CharacterConversationSettings {
     user?: UserPersonaSettings;
 }
 
+export type SingingLearningExportPreset = 'training_bright' | 'remix_clear';
+
+export interface SingingLearningComparisonExportSettings {
+    trainingBright?: boolean;
+    remixClear?: boolean;
+}
+
+export interface SingingLearningComparisonExportResult {
+    preset: SingingLearningExportPreset;
+    wavPath: string;
+    warning?: string;
+}
+
 export interface CharacterLearningRequest {
     singingTrainingMode?: boolean;
     separationPreference?: 'auto' | 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    singingComparisonExports?: SingingLearningComparisonExportSettings;
     ytDlpCookiesFile?: string;
 }
 
@@ -77,6 +91,7 @@ export interface CharacterLearningResult {
     accompanimentWavPath?: string;
     datasetInputPath?: string;
     method?: 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+    comparisonExports?: SingingLearningComparisonExportResult[];
     warning?: string;
     error?: string;
 }

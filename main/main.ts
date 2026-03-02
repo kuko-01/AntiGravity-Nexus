@@ -3338,6 +3338,11 @@ const buildSingingLearningResultMessage = (result: {
     accompanimentWavPath?: string;
     datasetInputPath?: string;
     method?: 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+    comparisonExports?: Array<{
+        preset: 'training_bright' | 'remix_clear';
+        wavPath: string;
+        warning?: string;
+    }>;
     warning?: string;
     error?: string;
 }): string => {
@@ -3353,6 +3358,13 @@ const buildSingingLearningResultMessage = (result: {
     if (result.vocalWavPath) lines.push(`Vocal WAV: ${result.vocalWavPath}`);
     if (result.accompanimentWavPath) lines.push(`BGM WAV: ${result.accompanimentWavPath}`);
     if (result.datasetInputPath) lines.push(`Dataset Input: ${result.datasetInputPath}`);
+    if (Array.isArray(result.comparisonExports)) {
+        for (const entry of result.comparisonExports) {
+            if (entry?.preset && entry?.wavPath) {
+                lines.push(`Comparison Export [${entry.preset}]: ${entry.wavPath}`);
+            }
+        }
+    }
     if (result.runDir) lines.push(`Run Folder: ${result.runDir}`);
     if (result.warning) lines.push(`Warning: ${result.warning}`);
     lines.push('このボーカルWAVは学習素材として保存済みです。');
@@ -3458,10 +3470,15 @@ ipcMain.handle('character-chat-send', async (event, request: CharacterChatReques
                     message: '歌唱学習ジョブを開始しました...',
                     percent: 1,
                 });
+                const exportPresets: Array<'training_bright' | 'remix_clear'> = [
+                    request.learning?.singingComparisonExports?.trainingBright === true ? 'training_bright' : null,
+                    request.learning?.singingComparisonExports?.remixClear === true ? 'remix_clear' : null,
+                ].filter((value): value is 'training_bright' | 'remix_clear' => value !== null);
                 const ingestResult = await learningService.ingestFromYouTube({
                     characterId: request.characterId || 'default',
                     sourceUrl: youtubeUrl,
                     separationPreference: request.learning?.separationPreference,
+                    exportPresets,
                     ytDlpCookiesFile: request.learning?.ytDlpCookiesFile,
                 }, (progress) => {
                     event.sender.send('singing-learning-progress', {
@@ -3500,6 +3517,7 @@ ipcMain.handle('character-chat-send', async (event, request: CharacterChatReques
                         accompanimentWavPath: ingestResult.accompanimentWavPath,
                         datasetInputPath: ingestResult.datasetInputPath,
                         method: ingestResult.method,
+                        comparisonExports: ingestResult.comparisonExports,
                         warning: ingestResult.warning,
                         error: ingestResult.error,
                     },

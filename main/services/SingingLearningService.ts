@@ -5614,6 +5614,202 @@ print(json.dumps({
             enhancementNotes.push(`Post-cleanup high-band smoothing skipped (${error instanceof Error ? error.message : String(error)}).`);
         }
 
+        if (preparedAccMonoPath && fs.existsSync(preparedAccMonoPath) && fs.existsSync(finalEnhancedPath)) {
+            const postCleanupDebleedPath = path.join(enhancedDir, `vocal_enhanced_post_debleed_${stamp}.wav`);
+            try {
+                const beforeMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(finalEnhancedPath);
+                const beforePerceptual = SeparationQualityLibrary.analyzePerceptualQualityMonoPcm16Wav(finalEnhancedPath);
+                const beforeLeak = SeparationQualityLibrary.estimateLeakageCorrelation(
+                    finalEnhancedPath,
+                    preparedAccMonoPath,
+                );
+                const beforeLowBandLeak = SeparationQualityLibrary.estimateLowBandLeakageCorrelation(
+                    finalEnhancedPath,
+                    preparedAccMonoPath,
+                );
+                const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
+                const postCleanupBleedPressure = this.clampNumber(
+                    Math.max(0, beforeLeak - 0.075) * 2.8
+                    + Math.max(0, beforeLowBandLeak - 0.055) * 2.3
+                    + Math.max(0, beforePerceptual.artifactScore - 0.11) * 0.9
+                    - Math.max(0, beforeMetrics.speechActivityRatio - 0.70) * 0.4,
+                    0,
+                    1.8,
+                    0,
+                );
+
+                if (postCleanupBleedPressure > 0.04) {
+                    const debleedSummary = SeparationQualityLibrary.reduceBleedWithReferenceMonoPcm16Wav(
+                        finalEnhancedPath,
+                        preparedAccMonoPath,
+                        postCleanupDebleedPath,
+                    );
+                    const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(postCleanupDebleedPath);
+                    const afterPerceptual = SeparationQualityLibrary.analyzePerceptualQualityMonoPcm16Wav(postCleanupDebleedPath);
+                    const afterLeak = SeparationQualityLibrary.estimateLeakageCorrelation(
+                        postCleanupDebleedPath,
+                        preparedAccMonoPath,
+                    );
+                    const afterLowBandLeak = SeparationQualityLibrary.estimateLowBandLeakageCorrelation(
+                        postCleanupDebleedPath,
+                        preparedAccMonoPath,
+                    );
+                    const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
+                    const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+                    const artifactRise = afterPerceptual.artifactScore - beforePerceptual.artifactScore;
+                    const roughRise = afterPerceptual.highBandRoughness - beforePerceptual.highBandRoughness;
+                    const leakImprovement = beforeLeak - afterLeak;
+                    const lowLeakImprovement = beforeLowBandLeak - afterLowBandLeak;
+                    const regressionSafe = (
+                        speechDrop <= 0.02
+                        && artifactRise <= 0.020
+                        && roughRise <= 0.00075
+                        && Math.abs(afterMetrics.rmsDb - beforeMetrics.rmsDb) <= 1.2
+                    );
+                    const improved = regressionSafe && (
+                        afterScore.score >= beforeScore.score + 0.45
+                        || leakImprovement >= 0.010
+                        || lowLeakImprovement >= 0.006
+                        || (
+                            leakImprovement >= 0.006
+                            && debleedSummary.avgAbsHighLeakGain >= 0.010
+                            && artifactRise <= 0.010
+                        )
+                        || (
+                            beforePerceptual.artifactScore >= 0.12
+                            && afterPerceptual.artifactScore <= beforePerceptual.artifactScore - 0.015
+                            && leakImprovement >= 0.003
+                        )
+                    );
+
+                    if (improved) {
+                        const previousFinalPath = finalEnhancedPath;
+                        finalEnhancedPath = postCleanupDebleedPath;
+                        if (previousFinalPath !== enhancedPath && previousFinalPath !== postCleanupDebleedPath) {
+                            this.removeFileIfExists(previousFinalPath);
+                        }
+                        enhancementNotes.push(
+                            `Post-cleanup de-bleed applied (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, artifact ${beforePerceptual.artifactScore.toFixed(3)}->${afterPerceptual.artifactScore.toFixed(3)}, highGain=${debleedSummary.avgAbsHighLeakGain.toFixed(3)}).`,
+                        );
+                    } else {
+                        this.removeFileIfExists(postCleanupDebleedPath);
+                        enhancementNotes.push(
+                            `Post-cleanup de-bleed not adopted (score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, artifact ${beforePerceptual.artifactScore.toFixed(3)}->${afterPerceptual.artifactScore.toFixed(3)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}).`,
+                        );
+                    }
+                } else {
+                    enhancementNotes.push(
+                        `Post-cleanup de-bleed skipped (pressure=${postCleanupBleedPressure.toFixed(2)}, leakage=${beforeLeak.toFixed(3)}, lowLeak=${beforeLowBandLeak.toFixed(3)}).`,
+                    );
+                }
+            } catch (error) {
+                this.removeFileIfExists(postCleanupDebleedPath);
+                enhancementNotes.push(`Post-cleanup de-bleed skipped (${error instanceof Error ? error.message : String(error)}).`);
+            }
+        }
+
+        if (preparedAccMonoPath && fs.existsSync(preparedAccMonoPath) && fs.existsSync(finalEnhancedPath)) {
+            const postCleanupResidualMusicPath = path.join(enhancedDir, `vocal_enhanced_post_music_only_${stamp}.wav`);
+            try {
+                const beforeMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(finalEnhancedPath);
+                const beforePerceptual = SeparationQualityLibrary.analyzePerceptualQualityMonoPcm16Wav(finalEnhancedPath);
+                const beforeLeak = SeparationQualityLibrary.estimateLeakageCorrelation(
+                    finalEnhancedPath,
+                    preparedAccMonoPath,
+                );
+                const beforeLowBandLeak = SeparationQualityLibrary.estimateLowBandLeakageCorrelation(
+                    finalEnhancedPath,
+                    preparedAccMonoPath,
+                );
+                const beforeScore = SeparationQualityLibrary.scoreFromMetrics(beforeMetrics, beforeLeak);
+                const residualPressure = this.clampNumber(
+                    Math.max(0, beforeLeak - 0.070) * 3.0
+                    + Math.max(0, beforeLowBandLeak - 0.050) * 2.4
+                    + Math.max(0, beforeMetrics.silenceRatio - 0.34) * 0.7
+                    + Math.max(0, beforePerceptual.artifactScore - 0.10) * 0.8
+                    - Math.max(0, beforeMetrics.speechActivityRatio - 0.68) * 0.45,
+                    0,
+                    1.9,
+                    0,
+                );
+                if (residualPressure > 0.05) {
+                    const residualSuppressionGain = this.clampNumber(
+                        0.22 - (residualPressure * 0.06) + (beforeMetrics.speechActivityRatio >= 0.72 ? 0.02 : 0),
+                        0.08,
+                        0.30,
+                        0.18,
+                    );
+                    const trimSummary = SeparationQualityLibrary.removeMusicOnlySectionsWithReferenceMonoPcm16Wav(
+                        finalEnhancedPath,
+                        preparedAccMonoPath,
+                        postCleanupResidualMusicPath,
+                        { preserveTimeline: true, preserveTimelineAttenuation: residualSuppressionGain },
+                    );
+                    const afterMetrics = SeparationQualityLibrary.analyzeMonoPcm16Wav(postCleanupResidualMusicPath);
+                    const afterPerceptual = SeparationQualityLibrary.analyzePerceptualQualityMonoPcm16Wav(postCleanupResidualMusicPath);
+                    const afterLeak = SeparationQualityLibrary.estimateLeakageCorrelation(
+                        postCleanupResidualMusicPath,
+                        preparedAccMonoPath,
+                    );
+                    const afterLowBandLeak = SeparationQualityLibrary.estimateLowBandLeakageCorrelation(
+                        postCleanupResidualMusicPath,
+                        preparedAccMonoPath,
+                    );
+                    const afterScore = SeparationQualityLibrary.scoreFromMetrics(afterMetrics, afterLeak);
+                    const speechDrop = beforeMetrics.speechActivityRatio - afterMetrics.speechActivityRatio;
+                    const silenceRise = afterMetrics.silenceRatio - beforeMetrics.silenceRatio;
+                    const artifactRise = afterPerceptual.artifactScore - beforePerceptual.artifactScore;
+                    const roughRise = afterPerceptual.highBandRoughness - beforePerceptual.highBandRoughness;
+                    const leakImprovement = beforeLeak - afterLeak;
+                    const lowLeakImprovement = beforeLowBandLeak - afterLowBandLeak;
+                    const regressionSafe = (
+                        speechDrop <= 0.018
+                        && silenceRise <= 0.05
+                        && artifactRise <= 0.018
+                        && roughRise <= 0.0007
+                    );
+                    const improved = regressionSafe && (
+                        afterScore.score >= beforeScore.score + 0.35
+                        || leakImprovement >= 0.008
+                        || lowLeakImprovement >= 0.005
+                        || (
+                            trimSummary.removedDurationMs >= 120
+                            && leakImprovement >= 0.004
+                            && afterPerceptual.artifactScore <= beforePerceptual.artifactScore + 0.006
+                        )
+                        || (
+                            trimSummary.removedSegments >= 2
+                            && leakImprovement >= 0.005
+                            && speechDrop <= 0.012
+                        )
+                    );
+
+                    if (improved) {
+                        const previousFinalPath = finalEnhancedPath;
+                        finalEnhancedPath = postCleanupResidualMusicPath;
+                        if (previousFinalPath !== enhancedPath && previousFinalPath !== postCleanupResidualMusicPath) {
+                            this.removeFileIfExists(previousFinalPath);
+                        }
+                        enhancementNotes.push(
+                            `Post-cleanup residual music-only cleanup applied (suppressed ${trimSummary.removedDurationMs}ms in ${trimSummary.removedSegments} segments, gain=${residualSuppressionGain.toFixed(2)}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, artifact ${beforePerceptual.artifactScore.toFixed(3)}->${afterPerceptual.artifactScore.toFixed(3)}).`,
+                        );
+                    } else {
+                        this.removeFileIfExists(postCleanupResidualMusicPath);
+                        enhancementNotes.push(
+                            `Post-cleanup residual music-only cleanup not adopted (suppressed ${trimSummary.removedDurationMs}ms in ${trimSummary.removedSegments} segments, gain=${residualSuppressionGain.toFixed(2)}, score ${beforeScore.score.toFixed(2)}->${afterScore.score.toFixed(2)}, leakage ${beforeLeak.toFixed(3)}->${afterLeak.toFixed(3)}, lowLeak ${beforeLowBandLeak.toFixed(3)}->${afterLowBandLeak.toFixed(3)}, artifact ${beforePerceptual.artifactScore.toFixed(3)}->${afterPerceptual.artifactScore.toFixed(3)}, speech ${beforeMetrics.speechActivityRatio.toFixed(2)}->${afterMetrics.speechActivityRatio.toFixed(2)}).`,
+                        );
+                    }
+                } else {
+                    enhancementNotes.push(
+                        `Post-cleanup residual music-only cleanup skipped (pressure=${residualPressure.toFixed(2)}, leakage=${beforeLeak.toFixed(3)}, lowLeak=${beforeLowBandLeak.toFixed(3)}).`,
+                    );
+                }
+            } catch (error) {
+                this.removeFileIfExists(postCleanupResidualMusicPath);
+                enhancementNotes.push(`Post-cleanup residual music-only cleanup skipped (${error instanceof Error ? error.message : String(error)}).`);
+            }
+        }
+
         try {
             const currentQa = this.analyzeCanonicalQaMetrics(finalEnhancedPath);
             const softFail = this.evaluateCanonicalQaSoftFail(currentQa);

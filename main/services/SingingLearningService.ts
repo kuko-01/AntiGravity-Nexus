@@ -16,9 +16,45 @@ const AUDIO_SEPARATOR_TORCH_CUDA_INDEX_URL = 'https://download.pytorch.org/whl/c
 const DNSMOS_PRIMARY_MODEL_URL = 'https://raw.githubusercontent.com/microsoft/DNS-Challenge/master/DNSMOS/DNSMOS/sig_bak_ovr.onnx';
 const DNSMOS_P808_MODEL_URL = 'https://raw.githubusercontent.com/microsoft/DNS-Challenge/master/DNSMOS/DNSMOS/model_v8.onnx';
 
-type SeparationMethod = 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+type SeparationMethod = 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback' | 'custom-separator';
 type SeparationPreference = 'auto' | SeparationMethod;
 type SingingLearningExportPreset = 'training_bright' | 'remix_clear';
+
+// Phase 3–4: カスタムモデル運用モード (shadow = 評価のみ / limited-auto = auto 候補に参加)
+type CustomSeparatorMode = 'disabled' | 'shadow' | 'limited-auto';
+
+interface CustomSeparatorConfig {
+    modelVersion: string;        // 例: 'custom_sep_v0'
+    scriptPath: string;          // Python 推論スクリプトパス
+    modelWeightPath: string;     // 重みファイルパス
+    venvPythonPath: string;      // 専用 venv の python 実行ファイル
+}
+
+// Phase 0: 分離試行ごとの KPI を記録する JSONL エントリ
+interface SeparationTrialLogEntry {
+    timestamp: string;
+    characterId: string;
+    method: SeparationMethod;
+    processingTimeMs: number;
+    success: boolean;
+    wasSelected: boolean;
+    // 客観 KPI (計画書 Section 6.1)
+    finalScore: number | null;
+    baseScore: number | null;
+    stemScore: number | null;
+    leakageCorrelation: number | null;
+    lowBandResidualRatio: number | null;
+    highBandRoughness: number | null;
+    speechActivityRatio: number | null;
+    silenceRatio: number | null;
+    rmsDb: number | null;
+    artifactScore: number | null;
+    reverbTailRatio: number | null;
+    normalizedError: number | null;
+    // Phase 1: 学習データ適性フラグ
+    isTrainingCandidate: boolean;
+    error?: string;
+}
 
 export interface SingingLearningIngestParams {
     characterId: string;
@@ -129,6 +165,7 @@ interface SeparationAttempt {
 interface SeparationQualityCandidate extends Required<Pick<SeparationAttempt, 'method' | 'vocalWavPath'>> {
     accompanimentWavPath?: string;
     warning?: string;
+    processingTimeMs?: number;
 }
 
 interface ScoredSeparationCandidate {
@@ -184,9 +221,12 @@ export class SingingLearningService {
     private readonly sbv2InstallDir: string;
     private readonly ttsResourcesPath: string;
     private readonly separationProfileStorePath: string;
+    private readonly separationTrialLogPath: string;
     private readonly separationProfiles = new Map<string, PersistentCharacterSeparationProfile>();
     private separationProfilesDirty = false;
     private separationProfilesLastPersistAt = 0;
+    private customSeparatorMode: CustomSeparatorMode = 'disabled';
+    private customSeparatorConfig: CustomSeparatorConfig | null = null;
     private ytDlpRuntimeCache: {
         args: string[];
         diag: string;
@@ -200,6 +240,7 @@ export class SingingLearningService {
         this.sbv2InstallDir = path.join(localAppData, 'AntiGravity', 'tts', 'sbv2');
         this.ttsResourcesPath = ttsResourcesPath;
         this.separationProfileStorePath = path.join(this.baseDir, 'separation_quality_profiles.json');
+        this.separationTrialLogPath = path.join(this.baseDir, 'separation_trial_log.jsonl');
         fs.mkdirSync(this.baseDir, { recursive: true });
         this.loadSeparationProfiles();
     }
@@ -336,6 +377,7 @@ export class SingingLearningService {
 
         const attemptErrors: string[] = [];
         const failedMethods: SeparationMethod[] = [];
+        const failedTimings = new Map<SeparationMethod, number>();
         const methodsForInitialPass = separationPreference === 'auto'
             ? this.buildDialogueFastAutoSeparationPlan(separationPlan)
             : separationPlan;
@@ -352,13 +394,14 @@ export class SingingLearningService {
                         vocalWavPath: attempt.vocalWavPath,
                         accompanimentWavPath: attempt.accompanimentWavPath,
                         warning: attempt.warning,
+                        processingTimeMs: attempt.processingTimeMs,
                     });
                 }
                 if (separationPreference !== 'auto') { separation = attempt; break; }
                 continue;
             }
             separation = attempt;
-            if (attempt.error) { attemptErrors.push(`${method}: ${attempt.error}`); failedMethods.push(method); }
+            if (attempt.error) { attemptErrors.push(`${method}: ${attempt.error}`); failedMethods.push(method); failedTimings.set(method, attempt.processingTimeMs); }
         }
 
         if (dialogueFastAuto && successfulCandidates.length > 0) {
@@ -372,7 +415,7 @@ export class SingingLearningService {
                 const selected = await this.selectBestSeparationCandidate(successfulCandidates, runDir, characterId, sourceAudioPath);
                 separation = { success: true, method: selected.candidate.method, vocalWavPath: selected.candidate.vocalWavPath, warning: selected.warning };
                 if (selected.scoredCandidates && selected.scoredCandidates.length > 0) {
-                    this.updateSeparationProfileFromScoredCandidates(characterId, selected.scoredCandidates);
+                    this.updateSeparationProfileFromScoredCandidates(characterId, selected.scoredCandidates, selected.candidate.method);
                 } else {
                     this.updateSeparationProfileForSuccess(characterId, selected.candidate.method);
                 }
@@ -391,12 +434,12 @@ export class SingingLearningService {
                 report('separate_fallback', `音声分離中... (${fallbackMethod} fallback)`);
                 const fallback = await this.runSeparationByMethod(fallbackMethod, sourceAudioPath, vocalDir, instDir);
                 separation = fallback;
-                if (!fallback.success && fallback.error) { attemptErrors.push(`${fallbackMethod}: ${fallback.error}`); failedMethods.push(fallbackMethod); }
+                if (!fallback.success && fallback.error) { attemptErrors.push(`${fallbackMethod}: ${fallback.error}`); failedMethods.push(fallbackMethod); failedTimings.set(fallbackMethod, fallback.processingTimeMs); }
                 else if (fallback.success && fallback.method) { this.updateSeparationProfileForSuccess(characterId, fallback.method); }
             }
         }
 
-        if (failedMethods.length > 0) this.updateSeparationProfileForFailures(characterId, failedMethods);
+        if (failedMethods.length > 0) this.updateSeparationProfileForFailures(characterId, failedMethods, failedTimings);
 
         if (!separation.success || !separation.vocalWavPath) {
             const reasons = attemptErrors.length > 0 ? ` (${attemptErrors.join(' | ')})` : '';
@@ -473,7 +516,7 @@ export class SingingLearningService {
         try {
             const characterId = this.normalizeId(characterIdRaw, 'character_default');
             const profile = this.getOrCreateCharacterSeparationProfile(characterId);
-            const methods: SeparationMethod[] = ['uvr-ultimate', 'roformer', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+            const methods: SeparationMethod[] = ['uvr-ultimate', 'roformer', 'demucs', 'uvr5', 'ffmpeg-fallback', 'custom-separator'];
             const methodViews: SingingLearningSeparationMethodView[] = methods.map((method) => {
                 const methodProfile = profile.methods[method];
                 const attempts = methodProfile.successCount + methodProfile.failureCount;
@@ -517,6 +560,61 @@ export class SingingLearningService {
         this.separationProfilesDirty = true;
         this.persistSeparationProfiles(true);
         return this.getSeparationProfile(characterId);
+    }
+
+    // Phase 3–4: カスタムセパレータのモードと設定を切り替える
+    setCustomSeparatorMode(mode: CustomSeparatorMode, config?: CustomSeparatorConfig): void {
+        this.customSeparatorMode = mode;
+        this.customSeparatorConfig = config ?? null;
+    }
+
+    // Phase 0: 分離試行 KPI を JSONL ログに追記する（書き込み失敗は無視）
+    private appendSeparationTrialLog(entry: SeparationTrialLogEntry): void {
+        try {
+            fs.appendFileSync(this.separationTrialLogPath, JSON.stringify(entry) + '\n', 'utf8');
+        } catch {
+            // ログ書き込み失敗は致命的でないため無視
+        }
+    }
+
+    // Phase 0: ScoredSeparationCandidate から試行ログエントリを構築する
+    private buildTrialLogEntry(
+        characterId: string,
+        scored: ScoredSeparationCandidate,
+        wasSelected: boolean,
+    ): SeparationTrialLogEntry {
+        const m = scored.vocalMetrics;
+        const p = scored.perceptualMetrics;
+        const lc = scored.score.leakageCorrelation ?? null;
+        const lbr = scored.mixtureConsistency?.lowBandResidualRatio ?? null;
+        const ne = scored.mixtureConsistency?.normalizedError ?? null;
+        const isTrainingCandidate =
+            scored.finalScore >= 75
+            && (lc === null || lc < 0.18)
+            && m.speechActivityRatio >= 0.10
+            && m.silenceRatio < 0.60
+            && p.highBandRoughness < 0.40;
+        return {
+            timestamp: new Date().toISOString(),
+            characterId,
+            method: scored.candidate.method,
+            processingTimeMs: scored.candidate.processingTimeMs ?? 0,
+            success: true,
+            wasSelected,
+            finalScore: scored.finalScore,
+            baseScore: scored.baseScore,
+            stemScore: scored.score.score,
+            leakageCorrelation: lc,
+            lowBandResidualRatio: lbr,
+            highBandRoughness: p.highBandRoughness,
+            speechActivityRatio: m.speechActivityRatio,
+            silenceRatio: m.silenceRatio,
+            rmsDb: m.rmsDb,
+            artifactScore: p.artifactScore,
+            reverbTailRatio: p.reverbTailRatio,
+            normalizedError: ne,
+            isTrainingCandidate,
+        };
     }
 
     async ingestFromYouTube(
@@ -591,6 +689,7 @@ export class SingingLearningService {
         sourceAudioPath = prepared.audioPath;
         const attemptErrors: string[] = [];
         const failedMethods: SeparationMethod[] = [];
+        const failedTimings = new Map<SeparationMethod, number>();
         const methodsForInitialPass = separationPreference === 'auto'
             ? separationPlan.filter((method) => method !== 'ffmpeg-fallback')
             : separationPlan;
@@ -612,6 +711,7 @@ export class SingingLearningService {
                         vocalWavPath: attempt.vocalWavPath,
                         accompanimentWavPath: attempt.accompanimentWavPath,
                         warning: attempt.warning,
+                        processingTimeMs: attempt.processingTimeMs,
                     });
                 }
                 if (separationPreference !== 'auto') {
@@ -624,6 +724,7 @@ export class SingingLearningService {
             if (attempt.error) {
                 attemptErrors.push(`${method}: ${attempt.error}`);
                 failedMethods.push(method);
+                failedTimings.set(method, attempt.processingTimeMs);
             }
         }
 
@@ -649,7 +750,7 @@ export class SingingLearningService {
                             'Alternative separator candidate was unavailable after path filtering (duplicate output path suspected).',
                         ].filter(Boolean).join(' ');
                     }
-                    this.updateSeparationProfileFromScoredCandidates(characterId, selected.scoredCandidates);
+                    this.updateSeparationProfileFromScoredCandidates(characterId, selected.scoredCandidates, selected.candidate.method);
                 } else {
                     this.updateSeparationProfileForSuccess(characterId, selected.candidate.method);
                 }
@@ -680,6 +781,7 @@ export class SingingLearningService {
                 if (!fallbackAttempt.success && fallbackAttempt.error) {
                     attemptErrors.push(`${fallbackMethod}: ${fallbackAttempt.error}`);
                     failedMethods.push(fallbackMethod);
+                    failedTimings.set(fallbackMethod, fallbackAttempt.processingTimeMs);
                 } else if (fallbackAttempt.success && fallbackAttempt.method) {
                     this.updateSeparationProfileForSuccess(characterId, fallbackAttempt.method);
                 }
@@ -687,7 +789,7 @@ export class SingingLearningService {
         }
 
         if (failedMethods.length > 0) {
-            this.updateSeparationProfileForFailures(characterId, failedMethods);
+            this.updateSeparationProfileForFailures(characterId, failedMethods, failedTimings);
         }
 
         if (separation.success && separation.vocalWavPath && attemptErrors.length > 0) {
@@ -812,6 +914,7 @@ export class SingingLearningService {
             demucs: 76,
             uvr5: 72,
             'ffmpeg-fallback': 58,
+            'custom-separator': 72,  // Phase 0 ベースライン: 既存 uvr5 と同等から開始
         };
         return {
             scoreEma: initialScore[method],
@@ -834,6 +937,7 @@ export class SingingLearningService {
                 demucs: this.getDefaultMethodSeparationProfile('demucs'),
                 uvr5: this.getDefaultMethodSeparationProfile('uvr5'),
                 'ffmpeg-fallback': this.getDefaultMethodSeparationProfile('ffmpeg-fallback'),
+                'custom-separator': this.getDefaultMethodSeparationProfile('custom-separator'),
             },
             updatedAt: new Date().toISOString(),
         };
@@ -869,6 +973,7 @@ export class SingingLearningService {
                 demucs: sanitizeMethod('demucs'),
                 uvr5: sanitizeMethod('uvr5'),
                 'ffmpeg-fallback': sanitizeMethod('ffmpeg-fallback'),
+                'custom-separator': sanitizeMethod('custom-separator'),
             },
             updatedAt: String(raw.updatedAt || base.updatedAt),
         };
@@ -937,13 +1042,14 @@ export class SingingLearningService {
 
     private normalizeSeparationMethod(value: unknown): SeparationMethod | undefined {
         const normalized = String(value || '').trim().toLowerCase();
-        if (normalized === 'uvr-ultimate' || normalized === 'roformer' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback') {
+        if (normalized === 'uvr-ultimate' || normalized === 'roformer' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback' || normalized === 'custom-separator') {
             return normalized;
         }
         return undefined;
     }
 
     private resolvePreferredMethod(profile: PersistentCharacterSeparationProfile): SeparationMethod {
+        // custom-separator は preferred として表示しない（Phase 3 shadow 運用 / ロールバック対応）
         const methods: SeparationMethod[] = ['uvr-ultimate', 'roformer', 'demucs', 'uvr5', 'ffmpeg-fallback'];
         let bestMethod: SeparationMethod = methods[0];
         let bestScore = -Infinity;
@@ -973,10 +1079,16 @@ export class SingingLearningService {
     private updateSeparationProfileFromScoredCandidates(
         characterIdRaw: string,
         scoredCandidates: ScoredSeparationCandidate[],
+        selectedMethod?: SeparationMethod,
     ): void {
+        const characterId = this.normalizeId(characterIdRaw, 'character_default');
+        // 選択された method を特定（引数優先、次点は sortedCandidates[0] で shadow 除外後の winner を参照）
+        const resolvedSelected = selectedMethod
+            ?? (scoredCandidates.find((c) => c.candidate.method !== 'custom-separator') ?? scoredCandidates[0])?.candidate.method;
+
         for (const entry of scoredCandidates) {
             this.updateSeparationProfileForSuccess(
-                characterIdRaw,
+                characterId,
                 entry.candidate.method,
                 {
                     score: entry.score.score,
@@ -984,6 +1096,10 @@ export class SingingLearningService {
                     metrics: entry.vocalMetrics,
                 },
                 false,
+            );
+            // Phase 0: 全試行の KPI を JSONL に記録
+            this.appendSeparationTrialLog(
+                this.buildTrialLogEntry(characterId, entry, entry.candidate.method === resolvedSelected),
             );
         }
         this.persistSeparationProfiles();
@@ -1047,11 +1163,16 @@ export class SingingLearningService {
         }
     }
 
-    private updateSeparationProfileForFailures(characterIdRaw: string, methods: SeparationMethod[]): void {
+    private updateSeparationProfileForFailures(
+        characterIdRaw: string,
+        methods: SeparationMethod[],
+        failedTimings?: Map<SeparationMethod, number>,
+    ): void {
         if (methods.length === 0) {
             return;
         }
-        const profile = this.getOrCreateCharacterSeparationProfile(characterIdRaw);
+        const characterId = this.normalizeId(characterIdRaw, 'character_default');
+        const profile = this.getOrCreateCharacterSeparationProfile(characterId);
         const uniqueMethods = Array.from(new Set(methods));
         const now = new Date().toISOString();
         for (const method of uniqueMethods) {
@@ -1064,6 +1185,28 @@ export class SingingLearningService {
                 methodProfile.scoreEma,
             );
             methodProfile.updatedAt = now;
+            // Phase 0: 失敗試行もログに記録
+            this.appendSeparationTrialLog({
+                timestamp: now,
+                characterId,
+                method,
+                processingTimeMs: failedTimings?.get(method) ?? 0,
+                success: false,
+                wasSelected: false,
+                finalScore: null,
+                baseScore: null,
+                stemScore: null,
+                leakageCorrelation: null,
+                lowBandResidualRatio: null,
+                highBandRoughness: null,
+                speechActivityRatio: null,
+                silenceRatio: null,
+                rmsDb: null,
+                artifactScore: null,
+                reverbTailRatio: null,
+                normalizedError: null,
+                isTrainingCandidate: false,
+            });
         }
         profile.preferredMethod = this.resolvePreferredMethod(profile);
         profile.updatedAt = now;
@@ -1073,7 +1216,7 @@ export class SingingLearningService {
 
     private normalizeSeparationPreference(value: string | undefined): SeparationPreference {
         const normalized = String(value || '').trim().toLowerCase();
-        if (normalized === 'uvr-ultimate' || normalized === 'roformer' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback') {
+        if (normalized === 'uvr-ultimate' || normalized === 'roformer' || normalized === 'demucs' || normalized === 'uvr5' || normalized === 'ffmpeg-fallback' || normalized === 'custom-separator') {
             return normalized;
         }
         return 'auto';
@@ -1094,7 +1237,11 @@ export class SingingLearningService {
     }
 
     private buildSeparationPlan(preference: SeparationPreference, characterId: string): SeparationMethod[] {
-        const defaultPlan: SeparationMethod[] = ['uvr-ultimate', 'roformer', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+        const coreMethods: SeparationMethod[] = ['uvr-ultimate', 'roformer', 'demucs', 'uvr5', 'ffmpeg-fallback'];
+        // shadow / limited-auto 時は custom-separator を候補リストに追加
+        const allMethods: SeparationMethod[] = this.customSeparatorMode !== 'disabled'
+            ? [...coreMethods, 'custom-separator']
+            : coreMethods;
         if (preference === 'auto') {
             const profile = this.getOrCreateCharacterSeparationProfile(characterId);
             const baselineBias: Record<SeparationMethod, number> = {
@@ -1103,8 +1250,10 @@ export class SingingLearningService {
                 demucs: 2,
                 uvr5: 1,
                 'ffmpeg-fallback': -10,
+                // shadow: 評価・ログのみ、winner 選択は selectBest で除外。limited-auto: 既存と競合参加
+                'custom-separator': this.customSeparatorMode === 'limited-auto' ? 2.0 : -999,
             };
-            const ranked = [...defaultPlan].sort((a, b) => {
+            return [...allMethods].sort((a, b) => {
                 const aMethod = profile.methods[a];
                 const bMethod = profile.methods[b];
                 const aAttempts = aMethod.successCount + aMethod.failureCount;
@@ -1115,9 +1264,8 @@ export class SingingLearningService {
                 const bPriority = bMethod.scoreEma + (bSuccessRate - 0.5) * 8 + baselineBias[b];
                 return bPriority - aPriority;
             });
-            return ranked;
         }
-        return [preference, ...defaultPlan.filter((method) => method !== preference)];
+        return [preference, ...allMethods.filter((method) => method !== preference)];
     }
 
     private buildEnhancementAlternativeCandidates(
@@ -1279,22 +1427,33 @@ export class SingingLearningService {
         method?: SeparationMethod;
         vocalWavPath?: string;
         accompanimentWavPath?: string;
+        processingTimeMs: number;
         warning?: string;
         error?: string;
     }> {
+        const t0 = Date.now();
+        if (method === 'custom-separator') {
+            const r = await this.trySeparateWithCustomSeparator(sourceAudioPath, vocalDir, accompanimentDir);
+            return { ...r, processingTimeMs: Date.now() - t0 };
+        }
         if (method === 'uvr-ultimate') {
-            return this.trySeparateWithUvrUltimate(sourceAudioPath, vocalDir, accompanimentDir);
+            const r = await this.trySeparateWithUvrUltimate(sourceAudioPath, vocalDir, accompanimentDir);
+            return { ...r, processingTimeMs: Date.now() - t0 };
         }
         if (method === 'roformer') {
-            return this.trySeparateWithRoformer(sourceAudioPath, vocalDir, accompanimentDir);
+            const r = await this.trySeparateWithRoformer(sourceAudioPath, vocalDir, accompanimentDir);
+            return { ...r, processingTimeMs: Date.now() - t0 };
         }
         if (method === 'demucs') {
-            return this.trySeparateWithDemucs(sourceAudioPath, vocalDir, accompanimentDir);
+            const r = await this.trySeparateWithDemucs(sourceAudioPath, vocalDir, accompanimentDir);
+            return { ...r, processingTimeMs: Date.now() - t0 };
         }
         if (method === 'uvr5') {
-            return this.trySeparateWithUvr(sourceAudioPath, vocalDir, accompanimentDir);
+            const r = await this.trySeparateWithUvr(sourceAudioPath, vocalDir, accompanimentDir);
+            return { ...r, processingTimeMs: Date.now() - t0 };
         }
-        return this.trySeparateWithFfmpegFallback(sourceAudioPath, vocalDir, accompanimentDir);
+        const r = await this.trySeparateWithFfmpegFallback(sourceAudioPath, vocalDir, accompanimentDir);
+        return { ...r, processingTimeMs: Date.now() - t0 };
     }
 
     private async selectBestSeparationCandidate(
@@ -1549,7 +1708,11 @@ export class SingingLearningService {
 
             return finalScoreDiff;
         });
-        const best = scoredCandidates[0];
+        // Phase 3 shadow モード: custom-separator をスコアリングするが winner 選択から除外
+        const winnableCandidates = this.customSeparatorMode === 'shadow'
+            ? scoredCandidates.filter((c) => c.candidate.method !== 'custom-separator')
+            : scoredCandidates;
+        const best = (winnableCandidates.length > 0 ? winnableCandidates : scoredCandidates)[0];
         const ranking = scoredCandidates
             .map((entry) => `${entry.candidate.method}:${entry.finalScore.toFixed(2)}(raw=${entry.score.score.toFixed(2)},mixAdj=${entry.mixAdjustment.toFixed(2)},percAdj=${entry.perceptualAdjustment.toFixed(2)},dnsAdj=${entry.dnsmosAdjustment.toFixed(2)},presAdj=${entry.preservationAdjustment.toFixed(2)},leak=${(entry.score.leakageCorrelation ?? 0).toFixed(3)},reverb=${entry.perceptualMetrics.reverbTailRatio.toFixed(3)},artifact=${entry.perceptualMetrics.artifactScore.toFixed(3)},flux=${entry.perceptualMetrics.highBandFluxVariance.toFixed(4)},low=${entry.vocalMetrics.lowBandRatio.toFixed(2)},mx=${entry.mixtureConsistency?.normalizedError?.toFixed(3) ?? 'n/a'},mlx=${entry.mixtureConsistency?.lowBandResidualRatio?.toFixed(3) ?? 'n/a'},speech=${entry.vocalMetrics.speechActivityRatio.toFixed(2)},sil=${entry.vocalMetrics.silenceRatio.toFixed(2)},dnsmos=${entry.dnsmos ? `${entry.dnsmos.ovrl.toFixed(2)}/${entry.dnsmos.sig.toFixed(2)}/${entry.dnsmos.p808.toFixed(2)}` : 'n/a'})`)
             .join(', ');
@@ -4522,6 +4685,38 @@ print(json.dumps({
             success: false,
             error: errors.filter(Boolean).join(' | ') || 'No available Python runtime could create venv.',
         };
+    }
+
+    // Phase 3: カスタム分離モデル推論スタブ。cfg.scriptPath に実装が用意され次第 spawn 実行に切り替える。
+    private async trySeparateWithCustomSeparator(
+        sourceAudioPath: string,
+        vocalDir: string,
+        _accompanimentDir: string,
+    ): Promise<{
+        success: boolean;
+        method?: SeparationMethod;
+        vocalWavPath?: string;
+        accompanimentWavPath?: string;
+        warning?: string;
+        error?: string;
+    }> {
+        const cfg = this.customSeparatorConfig;
+        if (!cfg) {
+            return { success: false, method: 'custom-separator', error: 'custom separator not configured' };
+        }
+        if (!fs.existsSync(cfg.venvPythonPath)) {
+            return { success: false, method: 'custom-separator', error: `custom separator venv not found: ${cfg.venvPythonPath}` };
+        }
+        if (!fs.existsSync(cfg.scriptPath)) {
+            return { success: false, method: 'custom-separator', error: `custom separator script not found: ${cfg.scriptPath}` };
+        }
+        if (!fs.existsSync(cfg.modelWeightPath)) {
+            return { success: false, method: 'custom-separator', error: `custom separator weight not found: ${cfg.modelWeightPath}` };
+        }
+        // v0 実装時: spawn(cfg.venvPythonPath, [cfg.scriptPath, '--input', sourceAudioPath, '--vocal-out', vocalOut, '--model', cfg.modelWeightPath])
+        // 出力ファイルを検索して { success: true, method: 'custom-separator', vocalWavPath, accompanimentWavPath } を返す
+        void sourceAudioPath; void vocalDir;
+        return { success: false, method: 'custom-separator', error: `custom separator runtime not yet implemented (model=${cfg.modelVersion})` };
     }
 
     private async trySeparateWithFfmpegFallback(

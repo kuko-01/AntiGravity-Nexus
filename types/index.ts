@@ -58,7 +58,7 @@ export interface AppState {
 }
 
 export interface CharacterLearningSeparationMethodProfile {
-    method: 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    method: 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback' | 'custom-separator';
     scoreEma: number;
     successCount: number;
     failureCount: number;
@@ -72,7 +72,7 @@ export interface CharacterLearningSeparationMethodProfile {
 export interface CharacterLearningSeparationProfileResponse {
     success: boolean;
     characterId: string;
-    preferredMethod: 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    preferredMethod: 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback' | 'custom-separator';
     updatedAt: string;
     methods: CharacterLearningSeparationMethodProfile[];
     profilePath: string;

@@ -3337,7 +3337,7 @@ const buildSingingLearningResultMessage = (result: {
     vocalWavPath?: string;
     accompanimentWavPath?: string;
     datasetInputPath?: string;
-    method?: 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+    method?: 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback' | 'custom-separator';
     comparisonExports?: Array<{
         preset: 'training_bright' | 'remix_clear';
         wavPath: string;

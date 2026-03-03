@@ -2237,9 +2237,38 @@ export class SingingLearningService {
         const artifactImprovement = currentMetrics.perceptualMetrics.artifactScore - fallbackMetrics.perceptualMetrics.artifactScore;
         const reverbImprovement = currentMetrics.perceptualMetrics.reverbTailRatio - fallbackMetrics.perceptualMetrics.reverbTailRatio;
         const roughnessImprovement = currentMetrics.perceptualMetrics.highBandRoughness - fallbackMetrics.perceptualMetrics.highBandRoughness;
+        const currentArtifact = currentMetrics.perceptualMetrics.artifactScore;
+        const fallbackArtifact = fallbackMetrics.perceptualMetrics.artifactScore;
+        const currentReverb = currentMetrics.perceptualMetrics.reverbTailRatio;
+        const fallbackReverb = fallbackMetrics.perceptualMetrics.reverbTailRatio;
 
         const regressionSafe = speechDrop <= 0.028 && silenceRise <= 0.045;
-        if (!regressionSafe) {
+        const catastrophicCurrent = currentArtifact >= 0.92 || currentReverb >= 0.60;
+        const catastrophicRescue = (
+            catastrophicCurrent
+            && speechDrop <= 0.065
+            && silenceRise <= 0.080
+            && (
+                (artifactImprovement >= 0.22 && reverbImprovement >= 0.10)
+                || (artifactImprovement >= 0.26 && roughnessImprovement >= 0.0010)
+                || (reverbImprovement >= 0.16 && artifactImprovement >= 0.10)
+            )
+        );
+        if (!regressionSafe && !catastrophicRescue) {
+            return false;
+        }
+
+        if (currentReverb >= 0.40 && fallbackReverb >= 0.40 && reverbImprovement < 0.035) {
+            return false;
+        }
+        if (
+            currentArtifact >= 0.80
+            && currentReverb >= 0.40
+            && fallbackArtifact > 0.66
+            && fallbackReverb > 0.40
+            && artifactImprovement < 0.20
+            && reverbImprovement < 0.05
+        ) {
             return false;
         }
 
@@ -2248,6 +2277,7 @@ export class SingingLearningService {
             || reverbImprovement >= 0.07
             || (artifactImprovement >= 0.05 && reverbImprovement >= 0.03)
             || (roughnessImprovement >= 0.0006 && artifactImprovement >= 0.03)
+            || catastrophicRescue
         );
     }
 
@@ -2981,15 +3011,24 @@ raise SystemExit(0)
 
         const workDir = path.join(runDir, 'dereverb_work');
         const outputDir = path.join(workDir, 'output');
-        const modelFileDir = path.join(this.baseDir, 'runtime', 'uvr_ultimate_models');
+        const dedicatedModelFileDir = path.join(this.baseDir, 'runtime', 'uvr_ultimate_models');
+        const sharedModelFileDir = path.join(this.baseDir, 'runtime', 'uvr_models');
         fs.mkdirSync(workDir, { recursive: true });
         fs.mkdirSync(outputDir, { recursive: true });
-        fs.mkdirSync(modelFileDir, { recursive: true });
+        fs.mkdirSync(dedicatedModelFileDir, { recursive: true });
+        fs.mkdirSync(sharedModelFileDir, { recursive: true });
 
         const script = `
 import json
 import os
 import onnxruntime as ort
+ffmpeg_binary = r'''${ffmpegTools.ffmpegPath.replace(/\\/g, '\\\\')}'''
+ffprobe_binary = r'''${(ffmpegTools.ffprobePath || '').replace(/\\/g, '\\\\')}'''
+ffmpeg_dir = os.path.dirname(ffmpeg_binary)
+os.environ['FFMPEG_BINARY'] = ffmpeg_binary
+if ffprobe_binary:
+    os.environ['FFPROBE_BINARY'] = ffprobe_binary
+os.environ['PATH'] = ffmpeg_dir + os.pathsep + os.environ.get('PATH', '')
 preload = getattr(ort, "preload_dlls", None)
 if preload:
     preload()
@@ -2997,8 +3036,13 @@ from audio_separator.separator import Separator
 
 input_path = r'''${inputVocalPath.replace(/\\/g, '\\\\')}'''
 output_dir = r'''${outputDir.replace(/\\/g, '\\\\')}'''
-model_file_dir = r'''${modelFileDir.replace(/\\/g, '\\\\')}'''
+model_dir_candidates = [
+    r'''${dedicatedModelFileDir.replace(/\\/g, '\\\\')}''',
+    r'''${sharedModelFileDir.replace(/\\/g, '\\\\')}''',
+]
 os.makedirs(output_dir, exist_ok=True)
+for model_dir in model_dir_candidates:
+    os.makedirs(model_dir, exist_ok=True)
 
 def resolve_output_path(file_path, base_dir):
     if not file_path:
@@ -3017,6 +3061,12 @@ def resolve_output_path(file_path, base_dir):
     fallback_name = os.path.basename(file_path)
     return os.path.abspath(os.path.join(base_dir, fallback_name))
 
+def resolve_model_dir(model_name):
+    for model_dir in model_dir_candidates:
+        if os.path.exists(os.path.join(model_dir, model_name)):
+            return model_dir
+    return model_dir_candidates[0]
+
 model_candidates = [
     'Reverb_HQ_By_FoxJoy.onnx',
     'UVR-De-Echo-Normal.pth',
@@ -3031,6 +3081,7 @@ errors = []
 
 for model_name in model_candidates:
     try:
+        model_file_dir = resolve_model_dir(model_name)
         sep = Separator(
             log_level=30,
             model_file_dir=model_file_dir,
@@ -3050,6 +3101,7 @@ for model_name in model_candidates:
             print(json.dumps({
                 'ok': True,
                 'model': model_name,
+                'model_dir': model_file_dir,
                 'output_file': best_output,
                 **runtime_info,
             }, ensure_ascii=False))
@@ -3069,7 +3121,13 @@ raise SystemExit(1)
 
         const result = await this.runCommand(runner.pythonExe, ['-c', script], {
             cwd: workDir,
-            env: runner.env || process.env,
+            env: this.buildEnvWithAdditionalPath(path.dirname(ffmpegTools.ffmpegPath), {
+                ...(runner.env || process.env),
+                PYTHONUTF8: '1',
+                PYTHONIOENCODING: 'utf-8',
+                FFMPEG_BINARY: ffmpegTools.ffmpegPath,
+                ...(ffmpegTools.ffprobePath ? { FFPROBE_BINARY: ffmpegTools.ffprobePath } : {}),
+            }),
             timeoutMs: 90 * 60 * 1000,
         });
 
@@ -3092,6 +3150,7 @@ raise SystemExit(1)
         const report = this.tryParseLastJsonLine<{
             ok?: boolean;
             model?: string;
+            model_dir?: string;
             output_file?: string;
             torch_cuda?: boolean;
             ort_providers?: string[];
@@ -3137,6 +3196,7 @@ raise SystemExit(1)
         const warnings: string[] = [];
         if (runner.warning) warnings.push(runner.warning);
         if (ffmpegTools.warning) warnings.push(ffmpegTools.warning);
+        if (report?.model_dir) warnings.push(`De-reverb model dir: ${report.model_dir}`);
         const runtimeInfo = this.formatAudioSeparatorRuntimeInfo(report);
         if (runtimeInfo) warnings.push(runtimeInfo);
         if (!result.success) warnings.push(`De-reverb exited with code ${result.code}, but output stem was reused.`);

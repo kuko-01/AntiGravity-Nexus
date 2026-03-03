@@ -77,7 +77,7 @@ export interface SingingLearningComparisonExportResult {
 
 export interface CharacterLearningRequest {
     singingTrainingMode?: boolean;
-    separationPreference?: 'auto' | 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback';
+    separationPreference?: 'auto' | 'uvr-ultimate' | 'roformer' | 'demucs' | 'uvr5' | 'ffmpeg-fallback' | 'custom-separator';
     singingComparisonExports?: SingingLearningComparisonExportSettings;
     ytDlpCookiesFile?: string;
 }
@@ -90,7 +90,7 @@ export interface CharacterLearningResult {
     vocalWavPath?: string;
     accompanimentWavPath?: string;
     datasetInputPath?: string;
-    method?: 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback';
+    method?: 'uvr-ultimate' | 'roformer' | 'uvr5' | 'demucs' | 'ffmpeg-fallback' | 'custom-separator';
     comparisonExports?: SingingLearningComparisonExportResult[];
     warning?: string;
     error?: string;
